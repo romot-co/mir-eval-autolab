@@ -45,7 +45,6 @@ ENV/
 data/*
 !data/.gitkeep
 # algos ディレクトリの中身をignore
-algos/*
 !algos/.gitkeep
 # evaluation_results ディレクトリの中身をignore
 evaluation_results/*
