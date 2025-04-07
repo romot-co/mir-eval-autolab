@@ -1,4 +1,4 @@
-# Music Information Retrieval Evaluation Framework
+# MIR Algorithm Automatic Improvement Experience
 
 ## 1. プロジェクト概要
 
