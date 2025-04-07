@@ -6,10 +6,23 @@
 
 合成データセットの生成機能と、複数の検出アルゴリズムを一括で評価するスクリプトが含まれています。
 
+### 1.1 実験的機能：AI駆動自動改善システム
+
+**注意: この機能は実験的段階にあり、安定性は保証されていません。**
+
+本プロジェクトには、Claude AIと連携してアルゴリズムの継続的な改善を試みる「全自動改善研究室」機能が含まれています。この実験的機能は以下を提供します：
+
+- アルゴリズムの自動読み込みと分析
+- 合成音声データを使用した評価の自動実行
+- AIを活用したコード改善
+- パラメータの自動最適化
+- 改善度合いの評価と版管理
+
 ## 2. ディレクトリ構成
 
 - `src/`: 主要なソースコード
   - `detectors/`: 各種検出アルゴリズムの実装
+    - `improved_versions/`: AI改善による検出器の保存先（実験的）
   - `evaluation/`: 評価ロジック（`mir_eval` を利用）
   - `data_generation/`: 合成データ生成スクリプト
   - `utils/`: 共通ユーティリティ関数
@@ -20,6 +33,7 @@
 - `configs/`: 検出器のパラメータ設定ファイル (`.yaml`)
 - `evaluation_results/`: 評価スクリプトの出力結果（JSON、プロット画像）
 - `grid_search_results/`: パラメータグリッドサーチ結果
+- `mcp_workspace/`: AI自動改善用ワークスペース（実験的）
 
 ## 3. セットアップと実行方法
 
@@ -106,9 +120,7 @@ python run_evaluate.py --audio-dir data/synthesized/audio \
     - オフセット許容誤差: ノート長の20% または 50ミリ秒 の大きい方 (`offset_ratio=0.2`, `offset_min_tolerance=0.05`)
   - ポリフォニーの評価では、`mir_eval.transcription` の関数群を使用し、参照ノートリストと推定ノートリスト間の最適なマッチングを行います。
 
-### 4.4. 生成されるファイル一覧 (一部)
-
-(ここに今後追加するテストケースを含むファイルリストと簡単な説明を追記予定)
+### 4.4. 生成されるファイル一覧
 
 - `1_basic_sine.wav`: 基本的なサイン波シーケンス。
 - `2_harmonic_tone.wav`: 複数の倍音を含む音のシーケンス。
@@ -121,36 +133,34 @@ python run_evaluate.py --audio-dir data/synthesized/audio \
 - `9_10_percussion_only.wav`: キック、スネア、ハイハットのみのシーケンス（ピッチは0）。
 - `11_mixed_melody_perc.wav`: メロディとパーカッションのミックス。
 - `12_complex_mix.wav`: ポリフォニー、パーカッション、ノイズ、リバーブを含む複雑なミックス。
-- **`13_smooth_vibrato.wav`**: 滑らかなサイン波ビブラート（周期的なピッチ変動）を持つ単一ノート。
-- **`14_portamento.wav`**: あるピッチから別のピッチへ滑らかに線形移行する（ポルタメント）単一ノート。
-- **`15_slow_attack.wav`**: 非常に遅いアタックを持つ単一ノート（ストリングス風）。
-- **`16_staccato.wav`**: 非常に短い発音長のノート（スタッカート）のシーケンス。
-- **`17_pianissimo.wav`**: 非常に小さい音量のノートシーケンス（正規化なし）。
-- **`18_octave_errors.wav`**: オクターブ違いの同じ音名が連続するシーケンス（オクターブエラー誘発）。
-- **`19_inharmonicity.wav`**: 倍音周波数がわずかにずれる単一ノート（ピアノのインハーモニシティ模倣）。
-- **`20_legato.wav`**: ノート間がわずかに重なり滑らかに繋がる（レガート/クロスフェード）シーケンス。
-- **`21_vocal_imitation.wav`**: ピッチの揺らぎと簡易的なフォルマントを持つボーカル模倣音。
-- **`22_clicks.wav`**: 基本的なメロディにランダムなクリックノイズが付加されたシーケンス。
+- `13_smooth_vibrato.wav`: 滑らかなサイン波ビブラート（周期的なピッチ変動）を持つ単一ノート。
+- `14_portamento.wav`: あるピッチから別のピッチへ滑らかに線形移行する（ポルタメント）単一ノート。
+- `15_slow_attack.wav`: 非常に遅いアタックを持つ単一ノート（ストリングス風）。
+- `16_staccato.wav`: 非常に短い発音長のノート（スタッカート）のシーケンス。
+- `17_pianissimo.wav`: 非常に小さい音量のノートシーケンス（正規化なし）。
+- `18_octave_errors.wav`: オクターブ違いの同じ音名が連続するシーケンス（オクターブエラー誘発）。
+- `19_inharmonicity.wav`: 倍音周波数がわずかにずれる単一ノート（ピアノのインハーモニシティ模倣）。
+- `20_legato.wav`: ノート間がわずかに重なり滑らかに繋がる（レガート/クロスフェード）シーケンス。
+- `21_vocal_imitation.wav`: ピッチの揺らぎと簡易的なフォルマントを持つボーカル模倣音。
+- `22_clicks.wav`: 基本的なメロディにランダムなクリックノイズが付加されたシーケンス。
 
-## 5. 評価指標
+## 5. パラメータグリッドサーチ
 
-## Parameter Grid Search
+検出器のパラメータを最適化するためのグリッドサーチツールを提供します。
 
-This project includes a tool for performing grid search to optimize detector parameters.
+### 5.1. グリッド設定ファイルの生成
 
-### 1. Generate Grid Configuration File
+`run_grid_search.py create-config` コマンドを使用して、パラメータ候補値を指定するYAMLファイル（`grid_config.yaml`）を生成します。
 
-Use the `run_grid_search.py create-config` command to generate a YAML file (`grid_config.yaml`) specifying the parameters and their candidate values for the search.
+**必須引数:**
 
-**Required Arguments:**
+*   `--detector`: 最適化対象の検出器名（例：`PZSTDDetector`）
+*   `--audio-dir`: 評価用音声ファイルのディレクトリ（例：`data/synthesized/audio`）
+*   `--reference-dir`: 正解ラベルファイルのディレクトリ（例：`data/synthesized/labels`）
+*   `--output`: 生成するグリッド設定ファイルのパス（例：`grid_config.yaml`）
+*   `--param`: パラメータ名とその候補値（複数回指定可能）
 
-*   `--detector`: Name of the detector to optimize (e.g., `PZSTDDetector`).
-*   `--audio-dir`: Path to the directory containing audio files for evaluation (e.g., `data/synthesized/audio`).
-*   `--reference-dir`: Path to the directory containing reference label files (e.g., `data/synthesized/labels`).
-*   `--output`: Path for the generated grid configuration file (e.g., `grid_config.yaml`).
-*   `--param`: Parameter name followed by its candidate values (can be used multiple times).
-
-**Example:**
+**例:**
 
 ```bash
 python run_grid_search.py create-config \
@@ -165,22 +175,22 @@ python run_grid_search.py create-config \
 --param harmonic_match_tolerance_cents 30.0 40.0
 ```
 
-### 2. Run Grid Search
+### 5.2. グリッドサーチの実行
 
-Use the `run_grid_search.py run` command to execute the grid search using the generated configuration.
+`run_grid_search.py run` コマンドを使用して、生成した設定に基づきグリッドサーチを実行します。
 
-**Required Arguments:**
+**必須引数:**
 
-*   `--config`: Path to the base configuration file (e.g., `config.yaml`).
-*   `--grid-config`: Path to the grid configuration file generated in step 1 (e.g., `grid_config.yaml`).
-*   `--output-dir`: Path to the directory where results will be saved (e.g., `results/grid_search`).
+*   `--config`: 基本設定ファイルのパス（例：`config.yaml`）
+*   `--grid-config`: ステップ1で生成したグリッド設定ファイルのパス（例：`grid_config.yaml`）
+*   `--output-dir`: 結果を保存するディレクトリのパス（例：`results/grid_search`）
 
-**Optional Arguments:**
+**オプション引数:**
 
-*   `--best-metric`: Metric to optimize (default: `note.f_measure`).
-*   `--save-plots`: Save evaluation plots for each parameter combination.
+*   `--best-metric`: 最適化する指標（デフォルト：`note.f_measure`）
+*   `--save-plots`: 各パラメータ組み合わせの評価プロットを保存
 
-**Example:**
+**例:**
 
 ```bash
 python run_grid_search.py run \
@@ -189,5 +199,76 @@ python run_grid_search.py run \
 --output-dir results/grid_search
 ```
 
-The results, including evaluation metrics for each parameter combination and the best performing parameters, will be saved in the specified output directory.
+各パラメータ組み合わせの評価指標と最適なパラメータが指定された出力ディレクトリに保存されます。
+
+## 6. 実験的機能：AI駆動自動改善システム
+
+**注意: この機能は実験的段階にあり、安定性は保証されていません。**
+
+### 6.1. セットアップ（実験的機能）
+
+Claude AIとの連携を設定します：
+
+```bash
+# 必須ライブラリ
+pip install mcp requests pandas numpy waitress
+
+# オプション（可視化用）
+pip install matplotlib seaborn
+
+# Claude Desktop設定
+python setup_claude_integration.py --open-claude
+```
+
+### 6.2. 自動改善の実行（実験的機能）
+
+コマンドラインから改善プロセスを実行：
+
+```bash
+python auto_improver.py --detector PZSTDDetector --goal "ノイズ耐性を向上させる" --iterations 3
+```
+
+オプション:
+- `--detector`: 改善対象の検出器名
+- `--goal`: 改善目標を自然言語で記述
+- `--iterations`: 改善サイクルの繰り返し回数（デフォルト: 3）
+
+### 6.3. 実験的機能のトラブルシューティング
+
+#### ファイルシステム権限エラー
+```
+OSError: [Errno 30] Read-only file system: 'mcp_workspace'
+```
+**解決策**: システムは自動的に書き込み可能なディレクトリに切り替わります。
+
+#### ポート競合
+```
+OSError: Address already in use
+```
+**解決策**: 
+```bash
+export MCP_PORT=5003
+```
+
+#### LLM API呼び出しエラー
+```
+LLM API request error
+```
+**解決策**: 
+- APIキーの設定を確認
+- インターネット接続を確認
+- API制限を確認
+
+### 6.4. 実験的機能の使用例
+
+```bash
+# ノイズ耐性改善
+python auto_improver.py --detector PZSTDDetector --goal "ノイズが存在する環境でも正確に音符を検出できるよう改善する。特に5_noisy系列のファイルでの性能向上を目指す" --iterations 3
+
+# リバーブ対応強化
+python auto_improver.py --detector PZSTDDetector --goal "リバーブが長い環境での検出精度を高める。特に6_reverb_long.wavでの性能を優先的に向上させる" --iterations 3
+
+# 和音検出改善
+python auto_improver.py --detector PZSTDDetector --goal "和音検出の精度を向上させる。特に7_chords.wavと8_polyphony.wavでの検出漏れを減らす" --iterations 3
+```
 
