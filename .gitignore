@@ -1,0 +1,75 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# env
+.env
+
+# Virtualenv
+venv/
+env/
+ENV/
+
+# IDEs and editors
+.idea/
+.vscode/
+.cursor/
+*.swp
+*.swo
+.DS_Store
+
+# Project specific
+# data ディレクトリの中身をignore
+data/*
+!data/.gitkeep
+# algos ディレクトリの中身をignore
+algos/*
+!algos/.gitkeep
+# evaluation_results ディレクトリの中身をignore
+evaluation_results/*
+!evaluation_results/.gitkeep
+# grid_search_results ディレクトリの中身をignore
+grid_search_results/*
+!grid_search_results/.gitkeep
+# mcp_workspace ディレクトリの中身をignore
+mcp_workspace/*
+!mcp_workspace/.gitkeep
+# src/detectors ディレクトリで特定ファイル以外をignore
+src/detectors/**/*.*
+!src/detectors/__init__.py
+!src/detectors/base_detector.py
+!src/detectors/criteria_detector.py
+!src/detectors/pzstd_detector.py
+# testsディレクトリで最低限必要なもの以外をignore
+tests/**/*.*
+!tests/conftest.py
+!tests/test_detectors.py
+.pytest_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version 
