@@ -538,22 +538,13 @@ def run_evaluation(
                 errors.append(error_msg)
                 continue
             
-            # フレーム評価（オプション）
-            if detection_result.is_frame_based():
-                frame_eval_result = frame_evaluate_wrapper(
-                    detection_result={
-                        'frame_times': detection_result.frame_times,
-                        'frame_frequencies': detection_result.frame_frequencies
-                    },
-                    reference_data={
-                        'frame_times': [], # ノートデータからフレームデータに変換する必要がある場合は別途処理
-                        'frame_frequencies': [],
-                        'intervals': ref_intervals,
-                        'note_pitches': ref_pitches
-                    }
-                )
-                evaluation_result['frame'] = frame_eval_result
-            
+            # フレーム評価結果のキー名を標準化
+            if 'frame' in evaluation_result:
+                # 古いキー名を削除（もし存在すれば）
+                for old_key in ['precision', 'recall', 'f_measure', 'accuracy']:
+                    if old_key in evaluation_result['frame']:
+                        del evaluation_result['frame'][old_key]
+
             # 結果の整理
             result = {
                 'file': audio_path,
@@ -957,32 +948,25 @@ def evaluate_detector(detector_name, detector_params, audio_file, ref_file, outp
     # 評価を実行
     try:
         logger.info("検出結果を正規化しました")
-        evaluation_result = evaluate_detection_result(
-            detected_intervals=est_intervals,
-            detected_pitches=est_pitches,
-            reference_intervals=ref_intervals,
-            reference_pitches=ref_pitches,
-            evaluator_config={
-                'tolerance_onset': 0.05,
-                'tolerance_pitch': 50.0,
-                'offset_ratio': 0.2,
-                'offset_min_tolerance': 0.05
-            }
+        evaluation_result = evaluate_notes_mirex(
+            ref_intervals=ref_intervals,
+            ref_pitches=ref_pitches,
+            est_intervals=est_intervals,
+            est_pitches=est_pitches,
+            onset_tolerance=0.05,
+            pitch_tolerance=50.0,
+            offset_ratio=0.2,
+            offset_min_tolerance=0.05
         )
         
         # フレーム評価（オプション）
         if detection_result.is_frame_based():
-            frame_eval_result = frame_evaluate_wrapper(
-                detection_result={
-                    'frame_times': detection_result.frame_times,
-                    'frame_frequencies': detection_result.frame_frequencies
-                },
-                reference_data={
-                    'frame_times': [], # ノートデータからフレームデータに変換する必要がある場合は別途処理
-                    'frame_frequencies': [],
-                    'intervals': ref_intervals,
-                    'note_pitches': ref_pitches
-                }
+            frame_eval_result = evaluate_frames(
+                ref_intervals=ref_intervals,
+                ref_pitches=ref_pitches,
+                est_times=detection_result.frame_times,
+                est_freqs=detection_result.frame_frequencies,
+                sample_rate=sr
             )
             evaluation_result['frame'] = frame_eval_result
         

@@ -91,42 +91,56 @@ def parse_arguments():
 
 def format_results(results):
     """評価結果を見やすい形式にフォーマット"""
-    if results['status'] != 'success':
-        return f"評価に失敗しました: {results.get('error', '不明なエラー')}"
+    if results.get('status') not in ['success', 'partial_success']:
+        return f"評価に失敗しました: {results.get('error', results.get('errors', '不明なエラー'))}"
     
+    summary = results.get('summary', {})
+    if not summary:
+        return "評価サマリーが見つかりません。"
+        
     # 結果からデータフレームを作成
     rows = []
     
-    for detector_name, detector_results in results['detector_results'].items():
-        for params_key, metrics in detector_results.items():
-            # パラメータキーからパラメータを抽出
-            param_str = "default" if params_key == "default" else params_key
-            
-            # 評価指標を行に追加
-            rows.append({
-                "検出器": detector_name,
-                "パラメータ": param_str,
-                "適合率": metrics.get('precision', 0),
-                "再現率": metrics.get('recall', 0),
-                "F値": metrics.get('f_measure', 0),
-                "精度": metrics.get('accuracy', 0),
-            })
+    # detector_results の代わりに summary を使用
+    for detector_name, detector_summary in summary.items():
+        # 主要な評価指標を抽出 (例: noteカテゴリ)
+        note_metrics = detector_summary.get('note', {})
+        onset_metrics = detector_summary.get('onset', {})
+        frame_metrics = detector_summary.get('frame', {}) # フレーム指標を取得
+        
+        # 評価指標を行に追加
+        rows.append({
+            "検出器": detector_name,
+            "Note Precision": note_metrics.get('precision', 0),
+            "Note Recall": note_metrics.get('recall', 0),
+            "Note F-measure": note_metrics.get('f_measure', 0),
+            "Onset F-measure": onset_metrics.get('f_measure', 0),
+            "Frame Accuracy": frame_metrics.get('accuracy', 0), # フレーム指標を追加
+            "Voicing Recall": frame_metrics.get('voicing_recall', 0),
+            "Voicing FA": frame_metrics.get('voicing_false_alarm', 0),
+        })
     
+    if not rows:
+        return "表示する評価結果がありません。"
+        
     # データフレームに変換
     df = pd.DataFrame(rows)
     
     # 結果をテーブル形式でフォーマット
-    headers = ["検出器", "パラメータ", "適合率", "再現率", "F値", "精度"]
+    headers = ["検出器", "Note Precision", "Note Recall", "Note F-measure", "Onset F-measure", 
+               "Frame Accuracy", "Voicing Recall", "Voicing FA"] # ヘッダーに追加
     table_data = []
     
     for _, row in df.iterrows():
         formatted_row = [
             Fore.CYAN + str(row["検出器"]) + Style.RESET_ALL,
-            Fore.YELLOW + str(row["パラメータ"]) + Style.RESET_ALL,
-            f"{float(row['適合率']):.4f}",
-            f"{float(row['再現率']):.4f}",
-            Fore.GREEN + f"{float(row['F値']):.4f}" + Style.RESET_ALL,
-            f"{float(row['精度']):.4f}"
+            f"{float(row['Note Precision']):.4f}",
+            f"{float(row['Note Recall']):.4f}",
+            Fore.GREEN + f"{float(row['Note F-measure']):.4f}" + Style.RESET_ALL,
+            f"{float(row['Onset F-measure']):.4f}",
+            f"{float(row['Frame Accuracy']):.4f}", # フォーマットされた行に追加
+            f"{float(row['Voicing Recall']):.4f}",
+            f"{float(row['Voicing FA']):.4f}",
         ]
         table_data.append(formatted_row)
     
@@ -161,9 +175,12 @@ def main():
                 logger.error("evaluate_cli.pyが見つかりません")
                 return 1
         
-        # evaluate_cli.pyを実行
+        # evaluate_cli.pyをモジュールとして実行するためのモジュールパス
+        cli_module_path = "src.cli.evaluate_cli"
+        
+        # evaluate_cli.pyを実行 (モジュールとして実行するよう変更)
         logger.info(f"評価を開始します...")
-        exit_code = os.system(f"python {cli_path} {' '.join(cmd_args)}")
+        exit_code = os.system(f"python -m {cli_module_path} {' '.join(cmd_args)}")
         
         if exit_code != 0:
             logger.error(f"evaluate_cliの実行に失敗しました（終了コード: {exit_code}）")
