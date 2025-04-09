@@ -31,9 +31,13 @@ result = safe_execute(
 
 import traceback
 import logging
-from typing import Dict, Any, Optional, Callable, TypeVar, Union, List
+from typing import Dict, Any, Optional, Callable, TypeVar, Union, List, Tuple, Type
 import numpy as np
 import datetime
+import tenacity
+import requests
+import time
+from functools import wraps
 
 T = TypeVar('T')
 
@@ -71,6 +75,40 @@ class GridSearchError(MirexError):
 class VisualizationError(MirexError):
     """可視化処理中に発生するエラー"""
     pass
+
+
+class LLMError(MirexError):
+    """LLM API呼び出しや応答処理に関するエラー"""
+    pass
+
+
+class StateManagementError(MirexError):
+    """セッションやジョブの状態管理（DBアクセスなど）に関するエラー"""
+    pass
+
+
+class SynthesizerError(MirexError):
+    """音声合成処理中に発生するエラー"""
+    pass
+
+
+class SubprocessError(MirexError):
+    """サブプロセス実行に関するエラー"""
+    def __init__(self, message: str, returncode: Optional[int] = None, stdout: Optional[str] = None, stderr: Optional[str] = None):
+        super().__init__(message)
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+    def __str__(self):
+        msg = super().__str__()
+        if self.returncode is not None:
+            msg += f" (Return Code: {self.returncode})"
+        if self.stderr:
+            msg += f"\nStderr: {self.stderr[:500]}..." # 長すぎる場合に切り詰め
+        if self.stdout:
+            msg += f"\nStdout: {self.stdout[:500]}..." # 長すぎる場合に切り詰め
+        return msg
 
 
 def log_exception(logger: logging.Logger, e: Exception, 
@@ -241,6 +279,82 @@ def format_exception_message(e: Exception, context: str = "") -> str:
     if context:
         return f"{context}: {str(e)}"
     return str(e)
+
+
+def retry_on_exception(
+    max_attempts: int = 3,
+    initial_delay: float = 1.0,
+    backoff_factor: float = 2.0,
+    max_delay: float = 10.0,
+    retry_exceptions: Optional[Union[Type[Exception], Tuple[Type[Exception], ...]]] = (
+        requests.exceptions.RequestException,
+        requests.Timeout,
+        LLMError, # LLM関連の一時的なエラーも対象とする場合
+        TimeoutError # tenacity.RetryError が TimeoutError をラップすることがあるため
+    ),
+    logger: Optional[logging.Logger] = None,
+    log_message_prefix: str = "リトライ試行"
+) -> Callable:
+    """
+    指定された例外が発生した場合に関数をリトライするデコレータ。
+
+    指数バックオフと最大リトライ回数を設定できます。
+
+    Parameters
+    ----------
+    max_attempts : int, optional
+        最大リトライ回数, by default 3
+    initial_delay : float, optional
+        最初のリトライまでの待機時間（秒）, by default 1.0
+    backoff_factor : float, optional
+        リトライごとに待機時間を乗算する係数, by default 2.0
+    max_delay : float, optional
+        最大待機時間（秒）, by default 10.0
+    retry_exceptions : Optional[Union[Type[Exception], Tuple[Type[Exception], ...]]], optional
+        リトライ対象とする例外クラス（またはタプル）, by default (requests.exceptions.RequestException, requests.Timeout, LLMError, TimeoutError)
+    logger : Optional[logging.Logger], optional
+        リトライ試行をログ記録するためのロガー, by default None
+    log_message_prefix : str, optional
+        リトライ時のログメッセージの接頭辞, by default "リトライ試行"
+
+    Returns
+    -------
+    Callable
+        デコレータ関数
+
+    Raises
+    ------
+    tenacity.RetryError
+        最大リトライ回数に達しても例外が解消されなかった場合
+    """
+    def before_sleep_log(retry_state: tenacity.RetryCallState):
+        """リトライ前にログを出力するコールバック関数"""
+        if logger:
+            exception = retry_state.outcome.exception()
+            logger.warning(
+                f"{log_message_prefix} {retry_state.attempt_number}/{max_attempts} 回目。"
+                f" 例外: {type(exception).__name__}: {exception}."
+                f" 次のリトライまで {retry_state.next_action.sleep:.2f} 秒待機します。"
+            )
+
+    # リトライ設定
+    retry_config = tenacity.retry(
+        stop=tenacity.stop_after_attempt(max_attempts),
+        wait=tenacity.wait_exponential(
+            multiplier=initial_delay,
+            exp_base=backoff_factor,
+            max=max_delay
+        ),
+        retry=tenacity.retry_if_exception_type(retry_exceptions) if retry_exceptions else tenacity.retry_if_exception_type(Exception),
+        before_sleep=before_sleep_log if logger else None,
+        reraise=True # tenacity.RetryErrorを発生させる
+    )
+
+    # デコレータを適用
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        return retry_config(func)
+
+    return decorator
 
 
 def wrap_exceptions(

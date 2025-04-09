@@ -12,7 +12,7 @@ import glob
 import logging
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Tuple
 
 # .envファイルのサポートを追加（利用可能な場合）
 try:
@@ -146,6 +146,10 @@ def get_absolute_path(relative_path: Union[str, Path]) -> Path:
     
     return get_project_root() / relative_path
 
+def ensure_dir(dir_path: Path):
+    """指定されたパスのディレクトリが存在することを確認し、なければ作成する"""
+    dir_path.mkdir(parents=True, exist_ok=True)
+
 def get_workspace_dir() -> Path:
     """
     ワークスペースディレクトリのパスを取得する
@@ -158,37 +162,74 @@ def get_workspace_dir() -> Path:
     Path
         ワークスペースディレクトリのパス
     """
-    # 環境変数からワークスペースパスを取得
+    # 環境変数 MIREX_WORKSPACE を優先
     env_workspace = os.environ.get('MIREX_WORKSPACE')
     if env_workspace:
-        workspace_dir = Path(env_workspace)
-        logger.debug(f"環境変数からワークスペースを取得: {workspace_dir}")
-    else:
-        # デフォルトパスの設定（優先順位: プロジェクトルート > ホームディレクトリ > 一時ディレクトリ）
-        project_workspace = get_project_root() / 'mcp_workspace'
-        home_workspace = Path.home() / '.mirex_workspace'
-        
-        if project_workspace.exists() or project_workspace.parent.exists():
-            workspace_dir = project_workspace
-        elif home_workspace.exists() or home_workspace.parent.exists():
-            workspace_dir = home_workspace
-        else:
-            # 最終手段として一時ディレクトリを使用
-            workspace_dir = Path(tempfile.gettempdir()) / 'mirex_workspace'
-            logger.warning(f"ワークスペースディレクトリが見つかりません。一時ディレクトリを使用: {workspace_dir}")
+        workspace_dir = Path(env_workspace).resolve()
+        logger.debug(f"環境変数 MIREX_WORKSPACE からワークスペースを取得: {workspace_dir}")
+        ensure_dir(workspace_dir)
+        return workspace_dir
     
-    # ディレクトリが存在しない場合は作成
-    workspace_dir.mkdir(parents=True, exist_ok=True)
-    logger.debug(f"ワークスペースディレクトリ: {workspace_dir}")
-    
-    return workspace_dir
+    # .envファイル読み込み後に再度確認
+    load_environment_variables()
+    env_workspace = os.environ.get('MIREX_WORKSPACE')
+    if env_workspace:
+        workspace_dir = Path(env_workspace).resolve()
+        logger.debug(f"環境変数 MIREX_WORKSPACE (.env読み込み後) からワークスペースを取得: {workspace_dir}")
+        ensure_dir(workspace_dir)
+        return workspace_dir
+
+    # デフォルトパスの設定（プロジェクトルート > ホームディレクトリ > 一時ディレクトリ）
+    project_root = get_project_root()
+    default_paths = [
+        project_root / 'mcp_workspace',
+        Path.home() / '.mirex_workspace'
+    ]
+
+    for path in default_paths:
+        try:
+            # 存在確認と書き込みテスト
+            if path.exists() or path.parent.exists():
+                ensure_dir(path)
+                # 書き込みテスト
+                test_file = path / f".write_test_{os.urandom(4).hex()}"
+                test_file.touch()
+                test_file.unlink()
+                logger.debug(f"デフォルトワークスペースとして使用: {path}")
+                return path
+        except (PermissionError, OSError) as e:
+            logger.warning(f"デフォルトワークスペース候補への書き込み不可: {path} ({e})")
+            continue
+
+    # 最終手段: 一時ディレクトリ
+    temp_workspace = Path(tempfile.gettempdir()) / f"mirex_workspace_{os.urandom(4).hex()}"
+    try:
+        ensure_dir(temp_workspace)
+        # 書き込みテスト
+        test_file = temp_workspace / f".write_test_{os.urandom(4).hex()}"
+        test_file.touch()
+        test_file.unlink()
+        logger.warning(f"デフォルトワークスペースが見つからない/書き込めないため、一時ディレクトリを使用: {temp_workspace}")
+        return temp_workspace
+    except (PermissionError, OSError) as e:
+         logger.critical(f"一時ワークスペースディレクトリへの書き込みも失敗: {temp_workspace} ({e})")
+         # ここでエラーを発生させるか、より安全なフォールバックを検討
+         # 例: プロジェクトルート直下にフォールバック
+         fallback_workspace = project_root / '_fallback_workspace'
+         try:
+             ensure_dir(fallback_workspace)
+             logger.warning(f"最終フォールバックとしてプロジェクトルート直下を使用: {fallback_workspace}")
+             return fallback_workspace
+         except Exception as final_e:
+             logger.critical(f"最終フォールバックワークスペースの作成も失敗: {final_e}")
+             raise RuntimeError("書き込み可能なワークスペースディレクトリを確保できませんでした")
 
 def get_evaluation_results_dir() -> Path:
     """
     評価結果ディレクトリのパスを取得する
     
     環境変数 MIREX_OUTPUT_DIR が設定されている場合はその値を使用し、
-    設定されていない場合はデフォルトパスを使用します。
+    設定されていない場合はデフォルトパス (ワークスペース内) を使用します。
     
     Returns
     -------
@@ -197,11 +238,12 @@ def get_evaluation_results_dir() -> Path:
     """
     env_output_dir = os.environ.get('MIREX_OUTPUT_DIR')
     if env_output_dir:
-        results_dir = Path(env_output_dir)
+        results_dir = Path(env_output_dir).resolve()
     else:
-        results_dir = get_project_root() / 'evaluation_results'
+        # デフォルトはワークスペース内の evaluation_results
+        results_dir = get_workspace_dir() / 'evaluation_results'
     
-    results_dir.mkdir(parents=True, exist_ok=True)
+    ensure_dir(results_dir)
     return results_dir
 
 def get_grid_search_results_dir() -> Path:
@@ -213,8 +255,14 @@ def get_grid_search_results_dir() -> Path:
     Path
         グリッドサーチ結果ディレクトリのパス
     """
-    results_dir = get_project_root() / 'grid_search_results'
-    results_dir.mkdir(parents=True, exist_ok=True)
+    # 環境変数 MIREX_GRID_SEARCH_DIR を優先
+    env_grid_dir = os.environ.get('MIREX_GRID_SEARCH_DIR')
+    if env_grid_dir:
+        results_dir = Path(env_grid_dir).resolve()
+    else:
+        # デフォルトはワークスペース内の grid_search_results
+        results_dir = get_workspace_dir() / 'grid_search_results'
+    ensure_dir(results_dir)
     return results_dir
 
 def get_improved_versions_dir() -> Path:
@@ -226,8 +274,14 @@ def get_improved_versions_dir() -> Path:
     Path
         改善バージョンディレクトリのパス
     """
-    versions_dir = get_workspace_dir() / 'improved_versions'
-    versions_dir.mkdir(parents=True, exist_ok=True)
+    # 環境変数 MIREX_VERSIONS_DIR を優先
+    env_versions_dir = os.environ.get('MIREX_VERSIONS_DIR')
+    if env_versions_dir:
+        versions_dir = Path(env_versions_dir).resolve()
+    else:
+        # デフォルトはワークスペース内の improved_versions
+        versions_dir = get_workspace_dir() / 'improved_versions'
+    ensure_dir(versions_dir)
     return versions_dir
 
 def get_session_dir(session_id: str) -> Path:
@@ -244,8 +298,15 @@ def get_session_dir(session_id: str) -> Path:
     Path
         セッションディレクトリのパス
     """
-    session_dir = get_workspace_dir() / 'sessions' / session_id
-    session_dir.mkdir(parents=True, exist_ok=True)
+    # 環境変数 MIREX_SESSION_DIR を優先 (パターンとして)
+    env_session_base = os.environ.get('MIREX_SESSION_DIR')
+    if env_session_base:
+        session_base_dir = Path(env_session_base).resolve()
+    else:
+        # デフォルトはワークスペース内の sessions
+        session_base_dir = get_workspace_dir() / 'sessions'
+    session_dir = session_base_dir / session_id
+    ensure_dir(session_dir)
     return session_dir
 
 def get_audio_dir() -> Path:
@@ -262,12 +323,15 @@ def get_audio_dir() -> Path:
     """
     env_audio_dir = os.environ.get('MIREX_AUDIO_DIR')
     if env_audio_dir:
-        audio_dir = Path(env_audio_dir)
+        audio_dir = Path(env_audio_dir).resolve()
     else:
-        audio_dir = get_project_root() / 'data' / 'synthesized' / 'audio'
+        # デフォルトはプロジェクトルート下の datasets/synthesized/audio
+        audio_dir = get_project_root() / 'datasets' / 'synthesized' / 'audio'
     
+    # 存在しない場合もパスは返すが、警告を出す
     if not audio_dir.exists():
         logger.warning(f"音声ディレクトリが存在しません: {audio_dir}")
+    # 読み取り可能かどうかのチェックは呼び出し元で行うべき
     
     return audio_dir
 
@@ -285,14 +349,39 @@ def get_label_dir() -> Path:
     """
     env_label_dir = os.environ.get('MIREX_LABEL_DIR')
     if env_label_dir:
-        label_dir = Path(env_label_dir)
+        label_dir = Path(env_label_dir).resolve()
     else:
-        label_dir = get_project_root() / 'data' / 'synthesized' / 'labels'
-    
+        # デフォルトはプロジェクトルート下の datasets/synthesized/labels
+        label_dir = get_project_root() / 'datasets' / 'synthesized' / 'labels'
+
+    # 存在しない場合もパスは返すが、警告を出す
     if not label_dir.exists():
         logger.warning(f"ラベルディレクトリが存在しません: {label_dir}")
-    
+    # 読み取り可能かどうかのチェックは呼び出し元で行うべき
+
     return label_dir
+
+def get_state_dir() -> Path:
+    """
+    状態保存ディレクトリのパスを取得する
+
+    環境変数 MCP_STATE_DIR が設定されている場合はその値を使用し、
+    設定されていない場合はデフォルトパス (ワークスペース内) を使用します。
+
+    Returns
+    ------
+    Path
+        状態保存ディレクトリのパス
+    """
+    # 環境変数 MCP_STATE_DIR を優先
+    env_state_dir = os.environ.get('MCP_STATE_DIR')
+    if env_state_dir:
+        state_dir = Path(env_state_dir).resolve()
+    else:
+        # デフォルトはワークスペース内の improvement_states
+        state_dir = get_workspace_dir() / 'improvement_states'
+    ensure_dir(state_dir)
+    return state_dir
 
 def get_detector_path(detector_name: str, use_improved: bool = False) -> Optional[Path]:
     """
@@ -313,45 +402,131 @@ def get_detector_path(detector_name: str, use_improved: bool = False) -> Optiona
     # 改善バージョンを確認
     if use_improved:
         improved_dir = get_improved_versions_dir()
-        detector_versions_dir = improved_dir / detector_name
-        
-        if detector_versions_dir.exists():
-            # 最新バージョンを検索
-            version_files = list(detector_versions_dir.glob(f'**/{detector_name}_v*.py'))
-            if version_files:
-                version_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                logger.debug(f"改善バージョンを使用: {version_files[0]}")
-                return version_files[0]
+        # バージョン管理を単純化: 検出器名がバージョンを含む場合（例: MyDetector_v123）
+        if '_' in detector_name:
+            possible_path = improved_dir / f"{detector_name}.py"
+            if possible_path.exists():
+                logger.debug(f"改善バージョンを使用 (直接指定): {possible_path}")
+                return possible_path
+            
+            # ベース名での検索も試みる (例: MyDetector_v123 -> MyDetector)
+            base_name = detector_name.split('_')[0]
+            detector_files = list(improved_dir.glob(f'{base_name}_v*.py'))
+        else:
+            detector_files = list(improved_dir.glob(f'{detector_name}_v*.py'))
+            
+        if detector_files:
+            # 最新バージョン (ファイル名でソート、または更新日時)
+            # version_pattern = re.compile(rf'{re.escape(detector_name)}_v(\d+)\.py')
+            # versions = []
+            # for f in detector_files:
+            #     match = version_pattern.search(f.name)
+            #     if match:
+            #         versions.append((int(match.group(1)), f))
+            # if versions:
+            #     versions.sort(key=lambda x: x[0], reverse=True)
+            #     latest_version_path = versions[0][1]
+            #     logger.debug(f"改善バージョンを使用 (最新): {latest_version_path}")
+            #     return latest_version_path
+            
+            # 更新日時でソート (より堅牢)
+            detector_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            latest_version_path = detector_files[0]
+            logger.debug(f"改善バージョンを使用 (最新更新日時): {latest_version_path}")
+            return latest_version_path
     
-    # 標準の検出器ディレクトリをチェック
-    detector_path = get_project_root() / 'src' / 'detectors' / f'{detector_name}.py'
+    # 標準の検出器ディレクトリをチェック (src/detectors)
+    detectors_base_dir = get_project_root() / 'src' / 'detectors'
+    detector_path = detectors_base_dir / f'{detector_name}.py'
     if detector_path.exists():
         return detector_path
     
     # 小文字でファイル名を試す
-    detector_path = get_project_root() / 'src' / 'detectors' / f'{detector_name.lower()}.py'
-    if detector_path.exists():
-        return detector_path
+    detector_path_lower = detectors_base_dir / f'{detector_name.lower()}.py'
+    if detector_path_lower.exists():
+        return detector_path_lower
     
-    # クラス名から検索
-    detectors_dir = get_project_root() / 'src' / 'detectors'
+    # ファイル名が一致しない場合、クラス名としてファイルを探索
     try:
-        for file_path in detectors_dir.glob('*.py'):
-            if file_path.is_file():
+        for file_path in detectors_base_dir.glob('*.py'):
+            if file_path.is_file() and file_path.name != '__init__.py':
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         content = f.read()
-                        if f'class {detector_name}' in content and ('Detector' in detector_name or 'detector' in content.lower()):
-                            logger.debug(f"検出器ファイルを見つけました: {file_path}")
-                            return file_path
+                        # ASTを使ってクラス定義を検出（より正確）
+                        import ast
+                        tree = ast.parse(content)
+                        for node in ast.walk(tree):
+                            if isinstance(node, ast.ClassDef) and node.name == detector_name:
+                                # BaseDetector を継承しているかなどのチェックも可能
+                                logger.debug(f"検出器クラス '{detector_name}' をファイル内で発見: {file_path}")
+                                return file_path
+                except FileNotFoundError:
+                    continue # ファイルが見つからない場合はスキップ
+                except SyntaxError:
+                     logger.warning(f"構文エラーのためスキップ: {file_path}")
                 except Exception as e:
-                    logger.warning(f"ファイル読み込み中にエラーが発生しました: {file_path}, {str(e)}")
+                    logger.warning(f"ファイル読み込み/解析中にエラーが発生しました: {file_path}, {str(e)}")
     except Exception as e:
         logger.error(f"検出器の検索中にエラーが発生しました: {e}")
     
     # 見つからない場合はNoneを返す
     logger.warning(f"検出器が見つかりませんでした: {detector_name}")
     return None
+
+def get_dataset_paths(audio_dir: Path, ref_dir: Path, ref_pattern: str) -> Tuple[List[Path], List[Path]]:
+    """指定されたディレクトリから音声ファイルと対応する参照ファイルのパスリストを取得する"""
+    if not audio_dir.exists() or not audio_dir.is_dir():
+        raise FileNotFoundError(f"音声ディレクトリが見つかりません: {audio_dir}")
+    if not ref_dir.exists() or not ref_dir.is_dir():
+        raise FileNotFoundError(f"参照ディレクトリが見つかりません: {ref_dir}")
+
+    audio_paths = sorted(list(audio_dir.glob('*.wav')) + 
+                         list(audio_dir.glob('*.mp3')) + 
+                         list(audio_dir.glob('*.flac')))
+    ref_paths_found = sorted(list(ref_dir.glob(ref_pattern)))
+
+    if not audio_paths:
+        raise FileNotFoundError(f"音声ファイルがディレクトリ内に見つかりません: {audio_dir}")
+    if not ref_paths_found:
+        raise FileNotFoundError(f"参照ファイルがパターン '{ref_pattern}' で見つかりません: {ref_dir}")
+
+    # ファイル名のベースでマッチング
+    audio_basenames = {p.stem: p for p in audio_paths}
+    ref_basenames = {p.stem: p for p in ref_paths_found}
+
+    matched_audio = []
+    matched_ref = []
+    missing_refs = []
+    missing_audios = []
+
+    for basename, audio_path in audio_basenames.items():
+        if basename in ref_basenames:
+            matched_audio.append(audio_path)
+            matched_ref.append(ref_basenames[basename])
+        else:
+            missing_refs.append(basename)
+
+    for basename in ref_basenames:
+        if basename not in audio_basenames:
+            missing_audios.append(basename)
+
+    if missing_refs:
+        logger.warning(f"参照ファイルが見つからない音声ファイルがあります ({len(missing_refs)}件): {missing_refs[:5]}...")
+    if missing_audios:
+        logger.warning(f"音声ファイルが見つからない参照ファイルがあります ({len(missing_audios)}件): {missing_audios[:5]}...")
+
+    if not matched_audio:
+        raise FileNotFoundError(f"対応する音声ファイルと参照ファイルが見つかりませんでした。")
+
+    logger.info(f"{len(matched_audio)} 組の音声/参照ファイルを検出しました。")
+    return matched_audio, matched_ref
+
+def get_output_dir(base_dir: Path, unique_suffix: str) -> Path:
+    """一意のサフィックスを持つ出力ディレクトリパスを生成する"""
+    output_dir = base_dir / unique_suffix
+    ensure_dir(output_dir)
+    return output_dir
 
 def setup_python_path() -> None:
     """

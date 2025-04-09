@@ -1,408 +1,212 @@
-# MIR アルゴリズム自動改善研究室
+# MIR アルゴリズム自動改善 (MCP/AutoImprover 詳細)
 
-## 1. システム概要
+**注意:** ここで説明する機能は**実験的**であり、活発な開発下にあります。安定性や結果の品質は保証されません。基本的な評価フレームワークの使い方については、メインの `README.md` を参照してください。
 
-本システムは音楽情報検索（MIR）アルゴリズムの開発、評価、改善を完全に自動化する「全自動改善研究室」です。Claude AIと連携し、アルゴリズムの継続的な改善サイクルを実現します。
+## 1. システム概要 (AI駆動自動改善)
 
-### 1.1 主要機能
+本システムは、音楽情報検索 (MIR) アルゴリズムの開発、評価、改善のプロセスにAI (大規模言語モデル、LLM) を組み込み、**アルゴリズム自体の自動的な発見と進化**を目指す実験的な研究プラットフォームです。
 
-- アルゴリズムの自動読み込みと分析
-- 合成音声データを使用した評価の自動実行
-- AIを活用したコード改善
-- パラメータの自動最適化
-- 改善度合いの評価と版管理
+**コアコンポーネント:**
 
-### 1.2 動作フロー
+*   **MCPサーバー (`mcp_server.py`):** ModelContextProtocol (MCP) に準拠したAPIサーバー。アルゴリズムのコード操作、評価実行、パラメータ探索、LLM連携などの「ツール」を提供します。非同期ジョブ管理、セッション管理（DB使用）も行います。
+*   **AutoImprover クライアント (`auto_improver.py`):** MCPサーバーのツールを利用して、AI駆動の自動改善サイクル（評価→分析→戦略決定→コード改善/パラメータ調整→評価…）を実行するクライアントアプリケーション。
+*   **LLM (例: Anthropic Claude):** サーバー側のツールから呼び出され、コード改善案の生成、評価結果の分析、次の改善戦略の提案など、インテリジェントなタスクを担当します。
+*   **Claude Desktop (オプション):** MCPサーバーのツールを対話的に呼び出し、改善プロセスをステップバイステップで実行・監視するためのインターフェース。
 
-1. 指定された検出器アルゴリズムのコードを読み込み
-2. 初期評価を実行し、基準となるF値を記録
-3. LLMにコードと評価結果を送信して改善案を取得
-4. 改善されたコードを保存して再評価
-5. パラメータ最適化を実行（改善が有望な場合）
-6. 旧版と新版のF値を比較して採用/破棄を決定
-7. 指定された回数だけこのサイクルを繰り返す
+**目指す動作フロー:**
 
-## 2. セットアップ手順
+1.  ユーザーがベースアルゴリズムと目標を指定して `auto_improver.py` を起動。
+2.  AutoImproverがMCPサーバーでセッションを開始。
+3.  AutoImproverが初期評価 (`run_evaluation`) を実行。
+4.  AutoImproverが評価結果を分析 (`analyze_evaluation_results` - 内部でLLM呼び出し) させる。
+5.  AutoImproverが分析結果と履歴から次の戦略を提案 (`suggest_exploration_strategy` - 内部でLLM呼び出し) させる。
+6.  提案された戦略に基づき、AutoImproverが対応するツール（`improve_code`, `optimize_parameters` など）を呼び出す。`improve_code` の場合は分析結果や仮説もプロンプトに含める。
+7.  改善/最適化されたアルゴリズムをAutoImproverが評価 (`run_evaluation`)。
+8.  結果を比較し、最良版を更新。
+9.  ループを指定回数または収束するまで繰り返す。
 
-### 2.1 依存ライブラリのインストール
+## 2. セットアップ手順 (AI自動改善機能向け)
 
-```bash
-# 必須ライブラリ
-pip install mcp requests pandas numpy waitress
+基本的なセットアップ (Python環境、`requirements.txt`) はメインの `README.md` を参照してください。AI自動改善機能には追加のステップが必要です。
 
-# オプション（可視化用）
-pip install matplotlib seaborn
-```
+### 2.1 依存ライブラリの確認
 
-### 2.2 ワークスペースの準備
+`requirements.txt` に以下のライブラリが含まれていることを確認してください。
 
-本システムは以下のディレクトリ構造で動作します：
+*   `mcp-fastmcp`: MCPサーバー/クライアントの基盤ライブラリ。
+*   `requests`: MCPサーバーへのHTTPリクエスト用。
+*   `pyyaml`: 設定ファイル (`config.yaml`) の読み込み用。
+*   `numpy`, `pandas`: データ処理用。
+*   `tenacity`: リトライ処理用 (LLM API呼び出しなど)。
+*   `python-dotenv`: `.env` ファイルからの環境変数読み込み用。
+*   (オプション) `matplotlib`, `seaborn`: 可視化機能用。
+*   (オプション) `pillow`: 画像処理 (サムネイル生成など) 用。
 
-```
-<workspace>/
-  ├── src/detectors/              # 検出器アルゴリズム
-  │   └── improved_versions/      # 改善版検出器保存先
-  ├── data/                       # テストデータ
-  │   ├── synthesized/            # 合成テストデータ
-  │   │   ├── audio/              # 音声ファイル
-  │   │   └── labels/             # 正解ラベル
-  ├── evaluation_results/         # 評価結果格納先
-  └── grid_search_results/        # パラメータ探索結果
-```
+### 2.2 ワークスペースと設定
 
-設定に従って、自動的に必要なディレクトリが作成されます。
+*   **ワークスペース:** スクリプト実行時に `mcp_workspace` ディレクトリが自動生成されます (場所は環境変数 `MIREX_WORKSPACE` または `config.yaml` で指定可能)。この中にセッション状態、改善版コード、ログなどが保存されます。
+*   **設定ファイル (`config.yaml`):** プロジェクトルートの `config.yaml` で、データセットパス、各種タイムアウト値、クリーンアップ設定などを構成できます。
+*   **環境変数 (`.env`):** プロジェクトルートに `.env` ファイルを作成 (または `.env.example` をコピー) し、以下の**必須**またはオプションの変数を設定します。
+    *   `ANTHROPIC_API_KEY`: (必須、モック以外の場合) Anthropic Claude APIキー。
+    *   `CLAUDE_MODEL`: (オプション) 使用するClaudeモデル名 (デフォルト: `claude-3-opus-20240229`)。
+    *   `MCP_SERVER_URL`: (オプション) MCPサーバーのURL (デフォルト: `http://localhost:5002`)。
+    *   `MIREX_WORKSPACE`: (オプション) ワークスペースディレクトリのパス。
+    *   `MCP_PORT`: (オプション) MCPサーバーが使用するポート番号 (デフォルト: 5002)。
+    *   その他、`config.yaml` の値を上書きするための環境変数 (例: `MCP_LLM_TIMEOUT`, `MCP_CLEANUP_INTERVAL_SECONDS`)。
 
-### 2.3 API設定（オプション）
+### 2.3 Claude Desktop用設定 (オプション)
 
-Anthropic Claude APIを使用する場合は、環境変数に設定します：
-
-```bash
-export ANTHROPIC_API_KEY="your-api-key-here"
-```
-
-API設定がない場合、システムはモック応答で動作します。
-
-### 2.4 Claude Desktop用設定
-
-Claude Desktopと連携するための設定を自動生成します：
+Claude DesktopアプリからMCPサーバーのツールを直接操作したい場合、以下のコマンドで連携設定を行います。
 
 ```bash
 python setup_claude_integration.py --open-claude
 ```
 
-このコマンドは:
-- Claude Desktop設定ファイルを生成/更新
-- サンプル検出器ファイルを作成（存在しない場合）
-- 一時作業ディレクトリを準備
-- Claude Desktopアプリを起動（--open-claudeオプション指定時）
+*   `--open-claude`: 設定適用後にClaude Desktopアプリを起動します。
+*   `--config-path`: (オプション) Claude Desktopの設定ファイルパスを指定します。
 
-## 3. 利用方法
+このコマンドは `~/Library/Application Support/Claude/storage/config.json` (macOSの場合) を更新し、MCPサーバー情報、ツール定義、プロンプトテンプレートなどを追加します。
 
-### 3.1 MCPサーバーの起動
+## 3. 利用方法 (AI自動改善)
 
-直接サーバーを起動する場合（通常はClaude Desktopが自動的に起動します）：
+### 3.1 MCPサーバーの起動 (必須)
 
-```bash
-python mcp_server.py
-```
-
-別のポートを使用する場合：
+AI自動改善機能を利用するには、まずMCPサーバーが起動している必要があります。
 
 ```bash
-export MCP_PORT=5003
-python mcp_server.py
+python mcp_server.py [--port <ポート番号>] [--log-level <レベル>] [--workspace <パス>] [--num-workers <数>]
 ```
 
-### 3.2 コマンドラインからの自動改善サイクル実行
+*   サーバーはAPIリクエストを待ち受け、非同期ジョブを実行します。
+*   Claude Desktopから使用する場合、通常はDesktopアプリがサーバーを自動的に起動・管理します (`setup_claude_integration.py` で設定した場合)。
 
-改善プロセスを完全自動化する場合：
+### 3.2 自動改善サイクルの実行 (`auto_improver.py`)
+
+コマンドラインから自動改善プロセス全体を開始します。
 
 ```bash
-python auto_improver.py --detector PZSTDDetector --goal "ノイズ耐性を向上させる" --iterations 3
+python auto_improver.py --detector <検出器名> [--goal <目標>] [--iterations <回数>] [--server-url <URL>] [--config <設定ファイル>]
 ```
 
-オプション:
-- `--detector`: 改善対象の検出器名（`src/detectors/`内のファイル名から.pyを除いたもの）
-- `--goal`: 改善目標を自然言語で記述
-- `--iterations`: 改善サイクルの繰り返し回数（デフォルト: 3）
-- `--server-url`: MCPサーバーのURL（デフォルト: http://localhost:5002）
+*   `--detector`: 改善対象のベースとなる検出器名 (例: `PZSTDDetector`)。
+*   `--goal`: (オプション) 自然言語での初期改善目標。
+*   `--iterations`: (オプション) 実行する改善サイクルの最大回数。
+*   `--server-url`: (オプション) 起動中のMCPサーバーのURL。
+*   `--config`: (オプション) `auto_improver.py` 固有の設定ファイル (現在は未使用)。
 
-### 3.3 Claude Desktopでの対話的操作
+実行すると、`auto_improver.py` がクライアントとして動作し、MCPサーバーの各種ツールを呼び出しながら改善サイクルを進めます。進捗はログに出力され、セッション状態は `mcp_workspace/improvement_states/` に保存されます。
 
-1. Claude Desktopを起動
-2. ハンマーアイコン(🔨)をクリックして利用可能なツールを確認
-3. 以下のようなプロンプトを入力：
+### 3.3 Claude Desktopでの対話的操作 (オプション)
 
-```
-PZSTDDetectorのリバーブ環境での精度を向上させてください。
-以下のステップで改善を行ってください：
-1. まずstart_sessionでセッションを開始し
-2. run_evaluationで現状の性能を評価し
-3. improve_codeでコードを改善して
-4. 再度評価を行って改善度を確認してください
-```
+`setup_claude_integration.py` で設定後、Claude DesktopからMCPツールを個別に呼び出して、対話的に改善プロセスを進めることも可能です。
 
-### 3.4 利用可能なMCPツール一覧
+1.  Claude Desktopを起動します。
+2.  ハンマーアイコン (🔨) をクリックし、「mirex-auto-improver」サーバーを選択してツールを有効化します。
+3.  チャット入力欄で `@tool <ツール名>(引数=値, ...)` の形式でツールを呼び出します。
+    ```
+    # 例: セッション開始
+    @tool start_session(base_algorithm="PZSTDDetector")
 
-MCPサーバーは以下のツールを提供します：
+    # 例: 評価実行 (ジョブIDが返る)
+    @tool run_evaluation(detector_name="PZSTDDetector", dataset_name="synthesized_v1")
 
-1. `health_check`: サーバー動作確認
-2. `start_session`: 改善セッション開始（検出器名指定）
-3. `get_session_info`: セッション情報取得
-4. `add_session_history`: セッション履歴追加
-5. `get_job_status`: 非同期ジョブ状態確認
-6. `improve_code`: コード改善依頼
-7. `run_evaluation`: 検出器評価実行
-8. `run_grid_search`: パラメータ探索実行 (F値向上時に自動実行)
-9. `analyze_code_segment`: コード分析
-10. `suggest_parameters`: パラメータ提案
+    # 例: ジョブステータス確認
+    @tool get_job_status(job_id="返ってきたジョブID")
+    ```
+4.  ワークフローについては `@prompt workflow-guide` でガイドを表示できます。
 
-## 4. 新機能：堅牢化と高度な自動化
+### 3.4 利用可能なMCPツール一覧 (`mcp_server.py` 提供)
 
-### 4.1 パス整合性の強化
+*   `health_check`: サーバー動作確認。
+*   `start_session`: 改善セッション開始。
+*   `get_session_info`: セッション情報取得。
+*   `add_session_history`: セッション履歴追加（主に内部/クライアントが使用）。
+*   `get_job_status`: 非同期ジョブ状態確認。
+*   `get_code`: 検出器コード取得。
+*   `save_code`: 改善コード保存。
+*   `improve_code`: (LLM) コード改善依頼 (非同期ジョブ)。
+*   `run_evaluation`: 検出器評価実行 (非同期ジョブ)。
+*   `run_grid_search`: 設定ファイルに基づくグリッドサーチ実行 (非同期ジョブ)。
+*   `analyze_evaluation_results`: (LLM) 評価結果分析 (非同期ジョブ)。
+*   `generate_hypotheses`: (LLM) 科学的仮説生成 (非同期ジョブ)。
+*   `analyze_code_segment`: (LLM) コード断片分析 (非同期ジョブ)。
+*   `suggest_parameters`: (LLM) パラメータ調整範囲提案 (非同期ジョブ)。
+*   `optimize_parameters`: (LLM+GridSearch) パラメータ自動提案と最適化 (非同期ジョブ)。
+*   `suggest_exploration_strategy`: (LLM) 次の改善戦略提案 (非同期ジョブ)。
+*   `visualize_improvement_trajectory`: 改善軌跡グラフ生成 (非同期ジョブ)。
+*   `create_thumbnail`: 画像サムネイル生成。
+*   `visualize_spectrogram`: スペクトログラム画像生成。
+*   `process_audio_files`: 複数音声ファイル処理 (Context使用例)。
+*   **(拡張機能)** `visualize_code_impact`, `generate_performance_heatmap`, `generate_scientific_outputs`: 可視化・科学的成果物生成ツール (`mcp_server_extensions.py` が存在する場合)。
 
-異なる環境でも正しく動作するよう、パス管理が強化されました：
+## 4. 自動改善プロセスの詳細 (AutoImprover)
 
-- プロジェクトルートを絶対パスで特定するロジックの追加
-- 作業ディレクトリの柔軟な設定（環境変数、ホームディレクトリ、一時ディレクトリの順で試行）
-- 権限エラー時の自動フォールバック機能
+`auto_improver.py` 内の `run_improvement_cycle` メソッドが中心となり、以下のステップを繰り返します。
 
-### 4.2 動的ロードの堅牢性向上
+1.  **戦略決定:** `suggest_exploration_strategy` を呼び出し、現在の状況（パフォーマンス、停滞具合、履歴）に基づいて次のアクション（`improve_code`, `optimize_parameters`, `generate_hypothesis` など）を決定します。
+2.  **アクション実行:** 決定されたアクションに対応するMCPツールを呼び出します。
+    *   **コード改善の場合:** `analyze_evaluation_results` で得られた弱点や、`generate_hypotheses` で得られた仮説をプロンプトに含めて `improve_code` を呼び出します。
+    *   **パラメータ最適化の場合:** `optimize_parameters` を呼び出します。
+    *   **仮説生成の場合:** `generate_hypotheses` を呼び出し、得られた仮説を次の改善の指針とします。
+3.  **評価:** コード改善やパラメータ最適化が行われた場合、`run_evaluation` を呼び出して新しいバージョンの性能を評価します。
+4.  **状態更新:** 評価結果を比較し、性能が向上していれば最良バージョン情報を更新します。改善履歴や戦略履歴も記録します。
+5.  **状態保存:** 現在のサイクル状態 (`self.cycle_state`) をファイルに保存し、中断・再開を可能にします。
 
-検出器モジュールのロード機能が強化されました：
+## 5. トラブルシューティング
 
-- `DETECTOR_CLASS_NAME` メタデータによる明示的なクラス指定機能追加
-- 改良コード生成時にメタデータを自動挿入
-- 複数クラス存在時の曖昧さ解消
+*   **サーバーが起動しない:**
+    *   ポート番号が競合していないか確認 (`netstat` や `lsof` コマンド）。`--port` オプションで変更できます。
+    *   依存ライブラリが正しくインストールされているか確認 (`pip install -r requirements.txt`)。
+    *   Pythonのバージョンが適合しているか確認 (`pyproject.toml` の `requires-python`)。
+    *   ログファイル (`mcp_server.log` など) を確認して詳細なエラーメッセージを探します。
+*   **LLM APIエラー:**
+    *   `.env` ファイルに正しいAPIキーが設定されているか確認。
+    *   インターネット接続を確認。
+    *   AnthropicなどのAPIサービス側で障害が発生していないか確認。
+    *   APIの使用量制限に達していないか確認。
+*   **ジョブが `pending` または `queued` のまま進まない:**
+    *   MCPサーバーのログを確認し、ワーカースレッドでエラーが発生していないか確認。
+    *   `MAX_CONCURRENT_JOBS` の設定値に対して、実行中のジョブが多すぎないか確認。
+    *   DB (`mcp_state.db`) の状態を確認（破損など）。
+*   **ファイル権限エラー:**
+    *   サーバープロセスがワークスペースディレクトリ (`mcp_workspace` など) への書き込み権限を持っているか確認。環境変数 `MIREX_WORKSPACE` で書き込み可能な場所を指定することも検討してください。
 
-### 4.3 自動パラメータ最適化
+**ログファイルの場所:**
 
-改善サイクルに自動グリッドサーチが統合されました：
+*   **MCPサーバーログ:** 通常、サーバーを起動したディレクトリに `mcp_server.log` (または設定による) が生成されます。
+*   **AutoImproverログ:** `auto_improver.py` の実行時にコンソールに出力されます (ファイル出力は未実装)。
+*   **Claude Desktop連携ログ:** `~/Library/Logs/Claude/mcp*.log` (macOSの場合)。
 
-- F値が5%以上向上した場合に自動実行
-- 主要パラメータの最適化を実行
-- 最適化結果を自動的に評価し採用
+## 6. まとめ
 
-### 4.4 セッション管理とエラーハンドリング
+このプロジェクトは、MIRアルゴリズムの評価基盤と、AIを活用した自動改善のための実験的プラットフォームを提供します。基本的な評価機能は安定していますが、AI自動改善機能は開発途上です。フィードバックを歓迎します。
 
-安定性と継続性を高めるため、セッション管理が強化されました：
-
-- 古いセッションとジョブの自動クリーンアップ
-- タイムアウト設定による資源の効率的管理
-- 連続失敗検出による無限ループ防止
-- 詳細なエラーログ記録
-
-## 5. 自動改善プロセスの詳細
-
-### 5.1 検出器コードの読み込み
-
-```python
-detector_path = f"src/detectors/{detector_name}.py"
-with open(detector_path, "r") as f:
-    original_code = f.read()
-```
-
-対象となる検出器のコードを`src/detectors/`ディレクトリから読み込みます。
-
-### 5.2 初期評価の実行
-
-```python
-base_eval = self.run_evaluation(detector_name)
-if base_eval:
-    best_f_measure = base_eval.get("overall_metrics", {}).get("note", {}).get("f_measure", 0)
-    logger.info(f"ベースライン F-measure: {best_f_measure:.4f}")
-```
-
-`run_evaluate.py`を内部的に呼び出し、検出器の初期性能を評価します。ここでは:
-- 検出器クラスをインポート
-- 合成テストデータに対して検出処理実行
-- F値、適合率、再現率などの評価指標を算出
-- 問題があるファイルの分析
-
-### 5.3 LLMによるコード改善
-
-```python
-improved_code = self.request_code_improvement(current_code, improvement_goal)
-improved_file = self.save_improved_code(improved_code, detector_name, version)
-```
-
-1. 現在のコードと改善目標をLLMに送信
-2. LLMがコード分析と改善提案を生成
-3. 改善されたコードを取得
-4. メタデータを追加して保存
-
-### 5.4 改善コードの評価と自動グリッドサーチ
-
-```python
-eval_result = self.run_evaluation(detector_name)
-current_f_measure = eval_result.get("overall_metrics", {}).get("note", {}).get("f_measure", 0)
-
-# 改善が一定以上の場合、自動的にグリッドサーチを実行
-if current_f_measure > best_f_measure:
-    improvement_percentage = ((current_f_measure - best_f_measure) / best_f_measure * 100)
-    if improvement_percentage >= 5.0:
-        logger.info(f"有望な改善を検出 (+{improvement_percentage:.2f}%) - グリッドサーチを実行中...")
-        grid_search_result = self.run_grid_search(detector_name, json.dumps(default_grid_params))
-```
-
-### 5.5 最終判断と保存
-
-```python
-if current_f_measure > best_f_measure:
-    logger.info(f"改善を検出: {best_f_measure:.4f} -> {current_f_measure:.4f}")
-    best_f_measure = current_f_measure
-    best_code = improved_code
-else:
-    logger.info(f"改善なし: {best_f_measure:.4f} -> {current_f_measure:.4f}")
-    current_code = best_code  # 最良のコードを維持
-```
-
-## 6. 評価データセット
-
-`data/synthesized/` ディレクトリには以下のテストデータが含まれています：
-
-### 6.1 音声ファイル (`audio/`)
-
-様々な音響特性を持つ合成波形：
-- 基本波形（サイン波など）
-- ノイズ付き音声（SNR比の異なるもの）
-- リバーブ付き音声（短い/長いリバーブ）
-- 和音、ポリフォニー音声
-- パーカッション音声
-- ビブラート、ポルタメントなどの表現技法
-
-### 6.2 正解ラベル (`labels/`)
-
-各音声ファイルに対応するCSV形式の正解データ：
-- 1列目: オンセット（音符開始時間、秒単位）
-- 2列目: オフセット（音符終了時間、秒単位）
-- 3列目: 周波数（Hz単位、パーカッションなどピッチなしの場合は0）
-
-例：
-```
-0.500,1.000,440.00
-1.200,1.700,523.25
-2.000,2.500,587.33
-```
-
-## 7. 実装詳細
-
-### 7.1 MCPサーバー (`mcp_server.py`)
-
-- Flask/MCPベースのRESTful APIサーバー
-- 非同期ジョブ管理機能
-- セッション管理機能とクリーンアップ
-- パス整合性を保証する機能
-- Claude API連携（コード改善）
-- 評価スクリプト実行
-
-### 7.2 自動改善ツール (`auto_improver.py`)
-
-- 改善サイクル全体の制御
-- 自動パラメータ最適化の実行
-- MCPサーバーAPI呼び出し
-- 結果比較ロジック
-- エラー検出と再試行機能
-- 履歴管理
-
-### 7.3 Claude Desktop設定ツール (`setup_claude_integration.py`)
-
-- Claude Desktop用設定ファイルの生成
-- サンプル検出器の作成
-- 一時作業ディレクトリの設定
-- 環境変数設定
-
-## 8. トラブルシューティング
-
-### 8.1 一般的な問題と解決策
-
-#### ファイルシステム権限エラー
-```
-OSError: [Errno 30] Read-only file system: 'mcp_workspace'
-```
-**解決策**: システムは自動的に書き込み可能なディレクトリ（ホームディレクトリまたは一時ディレクトリ）に切り替わります。ログを確認してください。
-
-#### ポート競合
-```
-OSError: Address already in use
-```
-**解決策**: 環境変数で別のポートを指定します。
-```bash
-export MCP_PORT=5003
-```
-
-#### LLM API呼び出しエラー
-```
-LLM API request error
-```
-**解決策**: 
-- APIキーが正しく設定されているか確認
-- インターネット接続を確認
-- API制限に達していないか確認
-
-### 8.2 ログ確認方法
+## インストール
 
 ```bash
-# MCPサーバーログ
-cat mcp_server.log
+# 1. リポジトリをクローン
+git clone <this_repository_url>
+cd <repository_directory>
 
-# Claude Desktop連携ログ
-tail -n 20 -f ~/Library/Logs/Claude/mcp*.log
+# 2. (推奨) 仮想環境を作成・有効化
+python -m venv venv
+source venv/bin/activate # Linux/macOS
+# venv\Scripts\activate # Windows
 
-# 設定ツールログ
-cat claude_setup.log
+# 3. 必要なライブラリをインストール
+pip install -r requirements.txt
+# poetry を使用する場合:
+# poetry install
+
+# 4. CREPE のインストール (ピッチ推定評価で使用する場合)
+pip install crepe
+# 注意: TensorFlow のバージョン互換性により問題が発生する場合があります。
+# 詳細は CREPE のドキュメントを参照してください: https://github.com/marl/crepe
+
+# 5. (オプション) 開発用ツールをインストール
+pip install -r requirements-dev.txt
+# poetry を使用する場合:
+# poetry install --with dev
 ```
 
-## 9. 実際の使用例
-
-### 9.1 ノイズ耐性改善
-
-```bash
-python auto_improver.py --detector PZSTDDetector --goal "ノイズが存在する環境でも正確に音符を検出できるよう改善する。特に5_noisy系列のファイルでの性能向上を目指す" --iterations 3
-```
-
-### 9.2 リバーブ対応強化
-
-```bash
-python auto_improver.py --detector PZSTDDetector --goal "リバーブが長い環境での検出精度を高める。特に6_reverb_long.wavでの性能を優先的に向上させる" --iterations 3
-```
-
-### 9.3 和音検出改善
-
-```bash
-python auto_improver.py --detector PZSTDDetector --goal "和音検出の精度を向上させる。特に7_chords.wavと8_polyphony.wavでの検出漏れを減らす" --iterations 3
-```
-
-## 10. ファイル名と実行順序
-
-システムのファイル構成は以下の通りです：
-
-1. `setup_claude_integration.py`（旧: run_auto_improver.py）
-   - Claude Desktop設定を準備
-   - サンプル検出器を作成
-   - 実行順序: 最初に実行
-
-2. `mcp_server.py`
-   - MCP対応APIサーバー
-   - Claude Desktopからは自動起動
-   - 手動実行する場合は独立して起動
-
-3. `auto_improver.py`
-   - 自動改善サイクルを実行
-   - コマンドラインから直接実行
-
-4. `src/detectors/__init__.py`
-   - 検出器の動的読み込みと登録
-   - システムの一部として自動的に使用
-
-5. `run_evaluate.py` と `run_grid_search.py`
-   - 評価とパラメータ探索を実行
-   - MCPサーバーから呼び出される
-
-## 11. まとめ
-
-本システムは「全自動改善研究室」として以下を実現します：
-
-1. ✅ **改善対象アルゴリズムの読み込みと分析**
-   - 検出器コードを自動的に読み込み
-   - コード構造と目的を分析
-
-2. ✅ **旧版と評価結果の保存**
-   - 初期バージョンを保存
-   - 評価指標のベースラインを記録
-
-3. ✅ **LLMによる実際のコード修正と実行**
-   - Claude APIでコード改善を取得
-   - メタデータを追加して実行可能なコードを生成
-   - 実際に動作確認を行う
-
-4. ✅ **有望な場合の自動パラメータサーチ**
-   - 改善が5%以上の場合に自動実行
-   - 最適化されたパラメータを特定
-
-5. ✅ **旧版と比較して改善判断**
-   - F値による定量的比較
-   - 改善した場合は採用、さもなければ破棄
-   - 最終的な最良バージョンを選定
-
-これで「全自動改善研究室」として必要な全機能が強化された堅牢なシステムが実現されています。
+## 設定

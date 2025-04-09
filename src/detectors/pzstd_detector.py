@@ -10,6 +10,7 @@ import logging
 from collections import defaultdict
 import numba # Numbaをインポート
 from scipy.interpolate import interp1d # 線形補間用
+from src.detectors import register_detector # <-- 絶対インポートに変更
 
 from src.detectors.base_detector import BaseDetector # BaseDetectorは別途定義されていると仮定
 
@@ -447,6 +448,13 @@ def _calculate_hcf_maps_numba(
 
 # --- PZSTDDetector Class ---
 
+@register_detector(
+    name="pzstd_detector",
+    description="SPOD-based multi-pitch detector with HCF enhancements and Numba optimization.",
+    version="1.0.0"
+)
+# --- PZSTDDetector Class ---
+
 class PZSTDDetector(BaseDetector):
     """
     Refined PZSTD-based multi-pitch detector using Numba optimization.
@@ -498,9 +506,6 @@ class PZSTDDetector(BaseDetector):
     # 倍音重み付けのデフォルトパラメータを最適値に更新
     DEFAULT_HARMONIC_WEIGHT_OFFSET = 0.0  # グリッドサーチで最適化された値（0.5→0.0）
     DEFAULT_HARMONIC_WEIGHT_EXPONENT = 1.0
-    DEFAULT_HCF_SPOD_ONSET_THRESH = 0.3 # <<< 新しいデフォルト値
-    DEFAULT_HCF_SCORE_WEIGHT_C = 0.5
-    DEFAULT_HCF_SCORE_WEIGHT_SPOD = 0.5
 
     def __init__(self,
                  # --- PZSTD Base Fixed Params (Now configurable) ---
@@ -540,7 +545,6 @@ class PZSTDDetector(BaseDetector):
                  hcf_onset_peak_prominence: float = DEFAULT_HCF_ONSET_PEAK_PROMINENCE,
                  hcf_coherence_offset_thresh: float = DEFAULT_HCF_COHERENCE_OFFSET_THRESH,
                  hcf_note_start_flux_thresh: float = DEFAULT_HCF_NOTE_START_FLUX_THRESH,
-                 hcf_spod_onset_thresh: float = DEFAULT_HCF_SPOD_ONSET_THRESH, # <<< パラメータ追加
                  # --- 倍音重み付けのパラメータを追加 ---
                  harmonic_weight_offset: float = DEFAULT_HARMONIC_WEIGHT_OFFSET,
                  harmonic_weight_exponent: float = DEFAULT_HARMONIC_WEIGHT_EXPONENT,
@@ -553,7 +557,7 @@ class PZSTDDetector(BaseDetector):
         Initializes the detector, including HCF parameters.
         Moved fixed PZSTD parameters to __init__ arguments for potential configuration.
         """
-        super().__init__(**kwargs) # <<< super() を最初に移動
+        super().__init__(**kwargs)
 
         # --- Assign Fixed PZSTD Params as Instance Variables ---
         self.n_fft = n_fft
@@ -595,7 +599,6 @@ class PZSTDDetector(BaseDetector):
         self.hcf_onset_peak_prominence = max(0.0, hcf_onset_peak_prominence)
         self.hcf_coherence_offset_thresh = max(0.0, min(1.0, hcf_coherence_offset_thresh))
         self.hcf_note_start_flux_thresh = max(0.0, hcf_note_start_flux_thresh)
-        self.hcf_spod_onset_thresh = max(0.0, min(1.0, hcf_spod_onset_thresh)) # <<< パラメータ割り当てとバリデーション
 
         # Assign Other Params
         self.min_silence_duration_sec = max(0.0, min_silence_duration_sec)
@@ -665,7 +668,6 @@ class PZSTDDetector(BaseDetector):
             'hcf_onset_peak_prominence': self.hcf_onset_peak_prominence,
             'hcf_coherence_offset_thresh': self.hcf_coherence_offset_thresh,
             'hcf_note_start_flux_thresh': self.hcf_note_start_flux_thresh,
-            'hcf_spod_onset_thresh': self.hcf_spod_onset_thresh, # <<< パラメータ追加
             
             # 倍音重み付けのパラメータを追加
             'harmonic_weight_offset': self.harmonic_weight_offset,
@@ -824,22 +826,17 @@ class PZSTDDetector(BaseDetector):
         f0_candidates_hz = f0_candidates_hz[(f0_candidates_hz >= min_f) & (f0_candidates_hz <= max_f)]
         return f0_candidates_hz
 
-    def _estimate_f0s_from_peaks(self,
-                                 peaks_per_frame: List[List[Tuple[float, float, float]]],
-                                 C_map: Optional[np.ndarray],
-                                 AvgHarmonicSPOD_map: Optional[np.ndarray]
-                                 ) -> List[List[float]]:
-        """
-        Estimates multiple F0s per frame. (Weighted scoring logic removed)
-        """
+    def _estimate_f0s_from_peaks(self, peaks_per_frame: List[List[Tuple[float, float, float]]]) -> List[List[float]]:
+        """Estimates multiple F0s per frame using tunable parameters and Numba scoring."""
         n_frames = len(peaks_per_frame)
         multi_f0_per_frame: List[List[float]] = [[] for _ in range(n_frames)]
         if self._f0_candidates_hz is None or len(self._f0_candidates_hz) == 0:
             logger.warning("No F0 candidates available for estimation.")
             return multi_f0_per_frame
 
+        # Convert previous F0s to cents array for Numba function
         previous_f0s_cents = np.array([], dtype=np.float64)
-        f0_candidates = self._f0_candidates_hz
+        f0_candidates = self._f0_candidates_hz # Use cached candidates
         max_f_analysis = self._max_f_analysis
 
         for t in range(n_frames):
@@ -860,7 +857,7 @@ class PZSTDDetector(BaseDetector):
             detected_f0s_t: List[float] = []
             iteration_count = 0
 
-            while len(available_peak_indices) > 0 and iteration_count < self.max_f0_iterations:
+            while len(available_peak_indices) > 0 and iteration_count < self.max_f0_iterations: # Use instance var
                 iteration_count += 1
                 num_available = len(available_peak_indices)
                 if num_available == 0: break
@@ -873,25 +870,19 @@ class PZSTDDetector(BaseDetector):
                 matched_masks = np.zeros((len(f0_candidates), num_available), dtype=np.bool_)
 
                 for i, f0_cand in enumerate(f0_candidates):
-                    # Call Numba scoring function - 引数リストを修正
+                    # Call Numba scoring function with tunable parameters
                     score_i, matched_mask_i = _score_f0_candidate_numba(
                         f0_cand,
                         current_peak_freqs_cents,
                         current_peak_amps,
                         current_peak_spods,
                         previous_f0s_cents,
-                        self.max_harmonics,
-                        self.inharmonicity_factor,
+                        self.max_harmonics, # Use instance var
+                        self.inharmonicity_factor, # Use instance var
                         max_f_analysis,
                         self.harmonic_match_tolerance_cents,
                         self.pitch_continuity_tolerance_cents,
-                        self.continuity_bonus,
-                        # <<< マップと重み関連の引数削除 >>>
-                        # C_map_t,
-                        # AvgHarmonicSPOD_map_t,
-                        # self.hcf_score_weight_c if use_weighted_scoring else 0.0,
-                        # self.hcf_score_weight_spod if use_weighted_scoring else 0.0,
-                        # <<< ------------------- >>>
+                        self.continuity_bonus, # Use instance var
                         harmonic_weight_offset=self.harmonic_weight_offset,
                         harmonic_weight_exponent=self.harmonic_weight_exponent,
                     )
@@ -910,11 +901,8 @@ class PZSTDDetector(BaseDetector):
                         detected_f0s_t.append(best_f0_hz)
                         available_peak_indices = np.delete(available_peak_indices, explained_relative_indices)
                     else:
-                        # Avoid infinite loop if best F0 is invalid or explains no peaks
-                        logger.debug(f"Frame {t}: Best F0 candidate {best_f0_hz:.2f} Hz (score {best_score:.3f}) was invalid or explained no peaks. Stopping iteration.")
                         break
                 else:
-                     # No candidate meets the threshold
                     break
 
             multi_f0_per_frame[t] = sorted(detected_f0s_t)
@@ -980,12 +968,11 @@ class PZSTDDetector(BaseDetector):
                                     # spod_map: np.ndarray, # Removed as SPOD offset is disabled
                                     allowed_onset_frames: Optional[set],
                                     C_map: Optional[np.ndarray],
-                                    Phi_comb_map: Optional[np.ndarray],
-                                    AvgHarmonicSPOD_map: Optional[np.ndarray] # <<< 引数追加
+                                    Phi_comb_map: Optional[np.ndarray]
                                     ) -> List[Dict[str, Any]]:
         """
         Converts frame-wise F0s into notes using optimal assignment,
-        HCF+SPOD-based onset check, and HCF/SPOD-based offset checks.
+        HCF-based onset check, and HCF/SPOD-based offset checks.
         """
         # --- 初期化、状態チェック --- (略)
         # ...
@@ -993,18 +980,15 @@ class PZSTDDetector(BaseDetector):
             logger.error("Detector state not fully initialized for note tracking.")
             return []
         # Verify HCF maps are available if needed
-        # <<< AvgHarmonicSPOD_mapのチェックも追加
-        hcf_available = C_map is not None and Phi_comb_map is not None and self._f0_candidates_hz is not None and AvgHarmonicSPOD_map is not None
+        hcf_available = C_map is not None and Phi_comb_map is not None and self._f0_candidates_hz is not None
         if not hcf_available:
-            logger.warning("HCF/SPOD maps not available, HCF+SPOD-based onset checks will be skipped.")
+            logger.warning("HCF maps not available, HCF-based onset/offset checks will be skipped.")
         # Ensure allowed_onset_frames is a set, even if None was passed
         if allowed_onset_frames is None:
              allowed_onset_frames = set()
 
         # --- Verification Counters --- (SPOD関連削除)
-        onset_suppressed_hcf_flux_count = 0 # HCF Flux不足で抑制
-        onset_suppressed_spod_count = 0     # SPOD不足で抑制
-        onset_suppressed_not_peak_count = 0 # O_vecピークでないため抑制
+        onset_suppressed_count = 0
         offset_advanced_count = 0
         offset_advanced_coherence_low_count = 0
 
@@ -1091,7 +1075,6 @@ class PZSTDDetector(BaseDetector):
                     f0_cents = current_f0s_cents_np[c]
 
                     current_coherence = 0.0
-                    current_avg_spod = 0.0 # <<< 追加
                     closest_f0_cand_idx = -1
                     if hcf_available and len(f0_cand_hz_list) > 0:
                         diffs = np.abs(np.array(f0_cand_hz_list) - f0_hz)
@@ -1100,18 +1083,14 @@ class PZSTDDetector(BaseDetector):
                     if hcf_available and 0 <= closest_f0_cand_idx < C_map.shape[0]:
                          f0_map_idx = closest_f0_cand_idx
                          current_coherence = C_map[f0_map_idx, frame_idx]
-                         current_avg_spod = AvgHarmonicSPOD_map[f0_map_idx, frame_idx] # <<< AvgHarmonicSPOD取得
 
                     if 'coherence_history' not in active_notes[track_id]:
                          active_notes[track_id]['coherence_history'] = []
-                    if 'avg_spod_history' not in active_notes[track_id]: # <<< 追加
-                        active_notes[track_id]['avg_spod_history'] = [] # <<< 追加
 
                     active_notes[track_id]['pitches_hz'].append(f0_hz)
                     active_notes[track_id]['pitches_cents'].append(f0_cents)
                     active_notes[track_id]['last_update_frame'] = frame_idx
                     active_notes[track_id]['coherence_history'].append(current_coherence)
-                    active_notes[track_id]['avg_spod_history'].append(current_avg_spod) # <<< 追加
                     # --- SPOD履歴更新を削除 ---
 
                     matched_track_indices.add(r)
@@ -1127,7 +1106,6 @@ class PZSTDDetector(BaseDetector):
 
                     last_pitch_hz = note_info['pitches_hz'][-1] if note_info['pitches_hz'] else 0.0
                     current_coherence = 0.0
-                    current_avg_spod = 0.0 # <<< 追加
                     closest_f0_cand_idx_unmatched = -1
                     if hcf_available and len(f0_cand_hz_list) > 0 and last_pitch_hz > 0:
                         diffs = np.abs(np.array(f0_cand_hz_list) - last_pitch_hz)
@@ -1136,12 +1114,9 @@ class PZSTDDetector(BaseDetector):
                     if hcf_available and 0 <= closest_f0_cand_idx_unmatched < C_map.shape[0]:
                          f0_map_idx = closest_f0_cand_idx_unmatched
                          current_coherence = C_map[f0_map_idx, frame_idx]
-                         current_avg_spod = AvgHarmonicSPOD_map[f0_map_idx, frame_idx] # <<< AvgHarmonicSPOD取得
 
                     if 'coherence_history' not in note_info: note_info['coherence_history'] = []
-                    if 'avg_spod_history' not in note_info: note_info['avg_spod_history'] = [] # <<< 追加
                     note_info['coherence_history'].append(current_coherence)
-                    note_info['avg_spod_history'].append(current_avg_spod) # <<< 追加
                     # --- SPOD履歴更新を削除 ---
 
                     coherence_too_low = hcf_available and current_coherence < self.hcf_coherence_offset_thresh
@@ -1203,47 +1178,25 @@ class PZSTDDetector(BaseDetector):
             for c, f0_hz in enumerate(current_f0s_hz):
                 if c not in matched_f0_indices:
                     is_onset = False
-                    reason = "N/A"
+                    if frame_idx in allowed_onset_frames:
+                        flux_value = 0.0
+                        closest_f0_cand_idx_new = -1
+                        if hcf_available and len(f0_cand_hz_list) > 0:
+                             diffs = np.abs(np.array(f0_cand_hz_list) - f0_hz)
+                             closest_f0_cand_idx_new = np.argmin(diffs)
 
-                    # Find closest F0 candidate index for maps
-                    closest_f0_cand_idx_new = -1
-                    if hcf_available and len(f0_cand_hz_list) > 0:
-                         diffs = np.abs(np.array(f0_cand_hz_list) - f0_hz)
-                         closest_f0_cand_idx_new = np.argmin(diffs)
+                        if hcf_available and 0 <= closest_f0_cand_idx_new < Phi_comb_map.shape[0]:
+                             f0_map_idx = closest_f0_cand_idx_new
+                             flux_value = Phi_comb_map[f0_map_idx, frame_idx]
 
-                    # Check conditions only if HCF maps are available and index is valid
-                    if hcf_available and 0 <= closest_f0_cand_idx_new < Phi_comb_map.shape[0]:
-                        f0_map_idx = closest_f0_cand_idx_new
-                        flux_value = Phi_comb_map[f0_map_idx, frame_idx]
-                        avg_spod_value = AvgHarmonicSPOD_map[f0_map_idx, frame_idx] # <<< SPOD値取得
-
-                        # Apply the combined HCF+SPOD onset check
-                        is_peak_frame = frame_idx in allowed_onset_frames
-                        flux_ok = flux_value >= self.hcf_note_start_flux_thresh
-                        spod_ok = avg_spod_value >= self.hcf_spod_onset_thresh # <<< SPODチェック
-
-                        if is_peak_frame and flux_ok and spod_ok:
+                        if flux_value >= self.hcf_note_start_flux_thresh:
                             is_onset = True
-                            reason = f"HCF Peak + Flux OK ({flux_value:.3f}) + SPOD OK ({avg_spod_value:.3f})"
-                        elif not is_peak_frame:
-                            onset_suppressed_not_peak_count += 1
-                            reason = "Not HCF O_vec Peak"
-                        elif not flux_ok:
-                             onset_suppressed_hcf_flux_count += 1
-                             reason = f"HCF Flux too low ({flux_value:.3f} < {self.hcf_note_start_flux_thresh:.3f})"
-                        elif not spod_ok:
-                            onset_suppressed_spod_count += 1
-                            reason = f"Avg SPOD too low ({avg_spod_value:.3f} < {self.hcf_spod_onset_thresh:.3f})"
-
-                    else: # HCF/SPOD maps not available or invalid index
-                        if frame_idx in allowed_onset_frames: # Fallback if only peak info is somewhat reliable
-                           is_onset = True # Or False, depending on desired fallback behavior
-                           reason = "HCF/SPOD maps unavailable, using peak frame only"
+                            logger.debug(f"Frame {frame_idx}: HCF onset condition met for F0={f0_hz:.1f}Hz (O(n) peak AND Phi_comb={flux_value:.3f} >= {self.hcf_note_start_flux_thresh:.3f}).")
                         else:
-                           is_onset = False
-                           reason = "HCF/SPOD maps unavailable and not peak frame"
-                           onset_suppressed_not_peak_count += 1 # Count as suppressed if not peak
-
+                             onset_suppressed_count += 1
+                             logger.debug(f"Frame {frame_idx}: Onset suppressed for F0={f0_hz:.1f}Hz (O(n) peak but Phi_comb={flux_value:.3f} < {self.hcf_note_start_flux_thresh:.3f}).")
+                    else: # Not an overall onset frame according to HCF O(n)
+                        onset_suppressed_count += 1
 
                     if is_onset:
                         # --- 精密なオンセット時刻の補間計算 (既存のまま) ---
@@ -1261,11 +1214,9 @@ class PZSTDDetector(BaseDetector):
 
                         # --- SPOD履歴初期化削除 ---
                         initial_coherence = 0.0
-                        initial_avg_spod = 0.0 # <<< 追加
                         if hcf_available and 0 <= closest_f0_cand_idx_new < C_map.shape[0]:
                              f0_map_idx = closest_f0_cand_idx_new
                              initial_coherence = C_map[f0_map_idx, frame_idx]
-                             initial_avg_spod = AvgHarmonicSPOD_map[f0_map_idx, frame_idx] # <<< 初期SPOD取得
 
                         f0_cents = current_f0s_cents_np[c]
                         active_notes[track_id_counter] = {
@@ -1274,13 +1225,10 @@ class PZSTDDetector(BaseDetector):
                             'pitches_cents': [f0_cents],
                             'last_update_frame': frame_idx,
                             'coherence_history': [initial_coherence],
-                            'avg_spod_history': [initial_avg_spod], # <<< 追加
                             # 'spod_history': [initial_spod]
                         }
-                        logger.debug(f"Frame {frame_idx}: Started new track {track_id_counter} for F0={f0_hz:.1f}Hz. Reason: {reason}.")
+                        logger.debug(f"Frame {frame_idx}: Started new track {track_id_counter} for F0={f0_hz:.1f}Hz (Method: HCF).")
                         track_id_counter += 1
-                    else: # is_onset is False
-                        logger.debug(f"Frame {frame_idx}: Onset suppressed for F0={f0_hz:.1f}Hz. Reason: {reason}.")
 
         # --- Process Remaining Active Notes at End (uses self.min_note_duration_sec) ---
         # ... (既存のまま)
@@ -1307,8 +1255,7 @@ class PZSTDDetector(BaseDetector):
                      })
 
         # --- Verification Logging (SPOD関連削除) ---
-        logger.info(f"Onset Check Verification: Suppressed (Not Peak Frame) = {onset_suppressed_not_peak_count}, Suppressed (HCF Flux Low) = {onset_suppressed_hcf_flux_count}, Suppressed (SPOD Low) = {onset_suppressed_spod_count}")
-        # logger.info(f"Offset Check Verification: Offsets advanced = {offset_advanced_count} (Coherence low = {offset_advanced_coherence_low_count})") # Offset part unchanged
+        logger.info(f"HCF Check Verification: Onsets suppressed = {onset_suppressed_count}, Offsets advanced = {offset_advanced_count} (Coherence low = {offset_advanced_coherence_low_count})")
 
         logger.debug(f"Note tracking yielded {len(notes_list)} raw notes.")
         return notes_list
@@ -1501,9 +1448,8 @@ class PZSTDDetector(BaseDetector):
             if spod_map.shape != A_lin.shape: raise ValueError("SPOD map shape mismatch.")
 
             # --- HCF Calculation Step ---
-            logger.debug("2.5. Calculating HCF Maps (C, Phi_comb, O, AvgHarmonicSPOD)...") # <<< ログ更新
-            # <<< AvgHarmonicSPOD_map を受け取るように修正
-            C_map, Phi_comb_map, O_vec, AvgHarmonicSPOD_map = self._calculate_hcf_maps(spod_map, A_lin)
+            logger.debug("2.5. Calculating HCF Maps (C, Phi_comb, O)...")
+            C_map, Phi_comb_map, O_vec = self._calculate_hcf_maps(spod_map, A_lin)
             hcf_onset_frames = None
             if O_vec is not None:
                  logger.debug("Detecting onset peaks from HCF O_vec...")
@@ -1532,21 +1478,16 @@ class PZSTDDetector(BaseDetector):
             logger.debug("3. Detecting peaks per frame (Numba interp)...")
             peaks_per_frame = self._detect_peaks_per_frame(A_lin, S_db, spod_map)
 
-            logger.debug("4. Estimating F0s from peaks (HCF/SPOD weighted scoring)...") # <<< ログ更新
-            multi_f0_per_frame = self._estimate_f0s_from_peaks(
-                peaks_per_frame,
-                C_map, # <<< C_map を渡す
-                AvgHarmonicSPOD_map # <<< AvgHarmonicSPOD_map を渡す
-            )
+            logger.debug("4. Estimating F0s from peaks (Numba scoring)...")
+            multi_f0_per_frame = self._estimate_f0s_from_peaks(peaks_per_frame)
 
-            logger.debug("5. Performing note segmentation (using HCF+SPOD onset/offset)...") # <<< ログ更新
+            logger.debug("5. Performing note segmentation (using HCF onset/offset)...")
             raw_notes_list = self._frames_to_notes_multipitch(
                 multi_f0_per_frame=multi_f0_per_frame,
                 # spod_map=spod_map, # Removed
                 allowed_onset_frames=allowed_onset_frames,
                 C_map=C_map,
-                Phi_comb_map=Phi_comb_map,
-                AvgHarmonicSPOD_map=AvgHarmonicSPOD_map # <<< AvgHarmonicSPOD_mapを渡す
+                Phi_comb_map=Phi_comb_map
             )
 
             logger.debug("6. Post-processing notes...")
@@ -1642,24 +1583,23 @@ class PZSTDDetector(BaseDetector):
         )
         return C, AmpSum
 
-    def _calculate_hcf_maps(self, spod_map: np.ndarray, A_lin: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]: # <<< 戻り値の型ヒント更新
+    def _calculate_hcf_maps(self, spod_map: np.ndarray, A_lin: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
         """
-        Calculates HCF maps: C_map, Phi_comb_map, O_vec, and AvgHarmonicSPOD_map.
+        Calculates HCF maps: C_map, Phi_comb_map, and O_vec.
         Returns None for maps if calculation fails.
         """
         if self._f0_candidates_hz is None or len(self._f0_candidates_hz) == 0:
             logger.warning("No F0 candidates available for HCF calculation.")
-            return None, None, None, None # <<< Noneの数を増やす
+            return None, None, None
         if self._sr is None or self._freq_resolution_hz is None or self._freq_resolution_hz <= 0:
              logger.error("Detector not properly initialized for HCF calculation.")
-             return None, None, None, None # <<< Noneの数を増やす
+             return None, None, None
 
         f0_candidates_hz_np = np.array(self._f0_candidates_hz, dtype=np.float64)
 
         try:
-            logger.debug("Calculating HCF maps including AvgHarmonicSPOD (Numba)...") # <<< ログ更新
-            # <<< AvgHarmonicSPOD_map を受け取るように修正
-            C_map, _, _, _, Phi_comb_map, O_vec, AvgHarmonicSPOD_map = _calculate_hcf_maps_numba(
+            logger.debug("Calculating HCF maps (Numba)...")
+            C_map, _, _, _, Phi_comb_map, O_vec = _calculate_hcf_maps_numba(
                 spod_map,
                 A_lin,
                 f0_candidates_hz_np,
@@ -1690,11 +1630,10 @@ class PZSTDDetector(BaseDetector):
             if max_O > 1e-9:
                  O_vec /= max_O
 
-            # <<< 戻り値に AvgHarmonicSPOD_map を追加
-            return C_map, Phi_comb_map, O_vec, AvgHarmonicSPOD_map
+            return C_map, Phi_comb_map, O_vec
 
         except Exception as e:
             logger.error(f"Error calculating HCF maps: {e}", exc_info=True)
-            return None, None, None, None # <<< Noneの数を増やす
+            return None, None, None
 
 # Helper Numba functions remain unchanged...

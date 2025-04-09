@@ -6,6 +6,7 @@ import csv
 import logging
 from typing import List, Tuple, Optional, Union
 from scipy.signal import butter, filtfilt, fftconvolve
+from src.utils.exception_utils import SynthesizerError
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -39,6 +40,12 @@ def midi_to_hz(midi_note: int) -> float:
     return 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
 
 def generate_adsr_envelope(duration_samples: int, attack: float, decay: float, sustain_level: float, release: float, sr: int = SR) -> np.ndarray:
+    assert attack >= 0, "Attack time must be non-negative"
+    assert decay >= 0, "Decay time must be non-negative"
+    assert 0.0 <= sustain_level <= 1.0, "Sustain level must be between 0.0 and 1.0"
+    assert release >= 0, "Release time must be non-negative"
+    assert duration_samples >= 0, "Duration must be non-negative"
+
     attack_samples = int(attack * sr)
     decay_samples = int(decay * sr)
     release_samples = int(release * sr)
@@ -54,15 +61,23 @@ def generate_adsr_envelope(duration_samples: int, attack: float, decay: float, s
     return envelope
 
 def generate_sine_wave(freq: float, duration_samples: int, amp: float = 1.0, sr: int = SR) -> np.ndarray:
-    if freq <= 0: return np.zeros(duration_samples)
+    if freq <= 0:
+        logging.debug(f"Frequency {freq:.2f} <= 0, returning zeros for {duration_samples} samples.")
+        return np.zeros(duration_samples)
+    assert duration_samples >= 0, "Duration must be non-negative"
     t = np.linspace(0., duration_samples / sr, duration_samples, endpoint=False)
     return amp * np.sin(2 * np.pi * freq * t)
 
 def generate_harmonic_tone(base_freq: float, duration_samples: int, harmonics: List[Tuple[int, float]], amp: float = 1.0, sr: int = SR) -> np.ndarray:
     tone = np.zeros(duration_samples)
-    if base_freq <= 0: return tone
+    if base_freq <= 0:
+        logging.debug(f"Base frequency {base_freq:.2f} <= 0, returning zeros for {duration_samples} samples.")
+        return tone
+    assert duration_samples >= 0, "Duration must be non-negative"
     total_harmonic_amp = 0
     for harmonic_num, harmonic_amp in harmonics:
+        assert harmonic_num > 0, f"Harmonic number must be positive: {harmonic_num}"
+        assert harmonic_amp >= 0, f"Harmonic amplitude must be non-negative: {harmonic_amp}"
         freq = base_freq * harmonic_num
         tone += generate_sine_wave(freq, duration_samples, harmonic_amp, sr)
         total_harmonic_amp += harmonic_amp
@@ -70,89 +85,109 @@ def generate_harmonic_tone(base_freq: float, duration_samples: int, harmonics: L
     return amp * tone
 
 def save_audio_and_label(filename_base: str, audio_data: np.ndarray, labels: List[Label], include_header: bool = False, sr: int = SR):
-    # --- Start Debugging ---
-    try:
-        # Check for NaN or Inf in audio data
-        if not np.all(np.isfinite(audio_data)):
-            logging.error(f"INVALID AUDIO DATA for {filename_base}: Contains NaN or Inf.")
-            # Optionally return here or replace invalid values
-            # return 
-            audio_data = np.nan_to_num(audio_data) # Replace NaN with 0, Inf with large numbers
+    # Check for NaN or Inf in audio data more robustly
+    if not np.all(np.isfinite(audio_data)):
+        logging.error(f"音声データに NaN または Inf が含まれています: {filename_base}。0に置換します。")
+        audio_data = np.nan_to_num(audio_data) # Replace NaN with 0, Inf with large finite numbers
 
-        if audio_data.size == 0:
-            logging.error(f"EMPTY AUDIO DATA for {filename_base}. Skipping save.")
-            return
+    # Check for empty audio data
+    if audio_data.size == 0:
+        logging.error(f"音声データが空です: {filename_base}。保存をスキップします。")
+        return # Skip saving empty audio
 
-        logging.debug(f"Saving {filename_base}: Audio shape={audio_data.shape}, Size={audio_data.size}, Min={np.min(audio_data):.4f}, Max={np.max(audio_data):.4f}, Mean={np.mean(audio_data):.4f}")
-        logging.debug(f"Saving {filename_base}: Labels={labels}")
-    except Exception as debug_e:
-        logging.error(f"Error during pre-save debug logging for {filename_base}: {debug_e}")
-    # --- End Debugging ---
+    # Log basic stats (optional, keep at DEBUG level)
+    # logging.debug(f"Saving {filename_base}: Audio shape={audio_data.shape}, Size={audio_data.size}, Min={np.min(audio_data):.4f}, Max={np.max(audio_data):.4f}, Mean={np.mean(audio_data):.4f}")
+    # logging.debug(f"Saving {filename_base}: Labels={labels}")
 
+    # --- Normalization --- #
     peak_amp = np.max(np.abs(audio_data))
-    # Avoid division by zero or near-zero, ensure data is valid before division
-    normalized_audio = audio_data * (AMP_MAX / peak_amp) if peak_amp > 1e-9 and np.all(np.isfinite(audio_data)) else audio_data
+    if peak_amp > 1e-9:
+        normalized_audio = audio_data * (AMP_MAX / peak_amp)
+    else:
+        # Avoid division by zero if signal is silent
+        normalized_audio = audio_data
+        logging.warning(f"オーディオ信号のピーク振幅が非常に小さいです: {filename_base}。正規化はスキップされました。")
 
     audio_path = os.path.join(OUTPUT_AUDIO_DIR, f"{filename_base}.wav")
     label_path = os.path.join(OUTPUT_LABEL_DIR, f"{filename_base}.csv")
 
-    # --- Audio Saving ---
+    # --- Audio Saving --- #
+    audio_saved_successfully = False
     try:
-        logging.debug(f"Attempting to write audio to: {audio_path}")
+        logging.debug(f"音声書き込み試行: {audio_path}")
         sf.write(audio_path, normalized_audio.astype(np.float32), sr)
         logging.info(f"音声を保存しました: {audio_path}")
-        # --- Start Debugging ---
-        # Verify immediately after write attempt
-        if os.path.exists(audio_path):
-            file_size = os.path.getsize(audio_path)
-            logging.debug(f"VERIFIED: Audio file exists immediately after saving: {audio_path}, Size: {file_size} bytes")
-            if file_size == 0:
-                logging.warning(f"WARNING: Audio file {audio_path} was created but is empty (0 bytes).")
-        else:
-            logging.error(f"FAILED VERIFICATION: Audio file DOES NOT exist after saving attempt: {audio_path}")
-        # --- End Debugging ---
+        audio_saved_successfully = True
     except Exception as e:
-        logging.error(f"音声ファイルの保存に失敗しました {audio_path}: {e}")
-        # --- Start Debugging ---
-        logging.exception(f"Exception details during audio save for {filename_base}:") # Log stack trace
-        # --- End Debugging ---
+        logging.error(f"音声ファイルの保存に失敗しました {audio_path}: {e}", exc_info=True)
 
-    # --- Label Saving ---
+    # --- Audio Save Verification (Error log if failed) --- #
     try:
-        logging.debug(f"Attempting to write labels to: {label_path}")
+        if audio_saved_successfully and os.path.exists(audio_path):
+            file_size = os.path.getsize(audio_path)
+            if file_size == 0:
+                logging.error(f"音声ファイルは作成されましたが空です (0 バイト): {audio_path}")
+            else:
+                logging.debug(f"音声ファイル保存確認OK: {audio_path}, サイズ: {file_size} バイト")
+        elif audio_saved_successfully:
+             logging.error(f"音声保存関数は成功しましたが、ファイルが存在しません: {audio_path}")
+        # else: # If save failed, error was already logged
+    except Exception as ve:
+         logging.error(f"音声ファイルの存在確認中にエラー: {audio_path}: {ve}", exc_info=True)
+
+    # --- Label Saving --- #
+    label_saved_successfully = False
+    try:
+        logging.debug(f"ラベル書き込み試行: {label_path}")
         with open(label_path, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             if include_header:
                 writer.writerow(['onset', 'offset', 'frequency'])
-            # Ensure labels list is not empty before proceeding
             if not labels:
-                 logging.warning(f"No labels provided for {filename_base}. CSV file will be empty or header-only.")
+                 logging.warning(f"{filename_base} にラベルがありません。CSVは空またはヘッダーのみになります。")
             for onset, offset, freq_or_marker in labels:
-                # Format frequency carefully, handle potential non-float markers
                 freq_str = f"{freq_or_marker:.3f}" if isinstance(freq_or_marker, (float, np.floating)) else str(freq_or_marker)
                 writer.writerow([f"{onset:.6f}", f"{offset:.6f}", freq_str])
         logging.info(f"ラベルを保存しました: {label_path}")
-        # --- Start Debugging ---
-        # Verify immediately after write attempt
-        if os.path.exists(label_path):
-             file_size = os.path.getsize(label_path)
-             logging.debug(f"VERIFIED: Label file exists immediately after saving: {label_path}, Size: {file_size} bytes")
-             if file_size == 0 and labels: # Check if empty despite having labels
-                 logging.warning(f"WARNING: Label file {label_path} was created but is empty (0 bytes), despite having labels.")
-        else:
-            logging.error(f"FAILED VERIFICATION: Label file DOES NOT exist after saving attempt: {label_path}")
-        # --- End Debugging ---
+        label_saved_successfully = True
     except Exception as e:
-        logging.error(f"ラベルファイルの保存に失敗しました {label_path}: {e}")
-        # --- Start Debugging ---
-        logging.exception(f"Exception details during label save for {filename_base}:") # Log stack trace
-        # --- End Debugging ---
+        logging.error(f"ラベルファイルの保存に失敗しました {label_path}: {e}", exc_info=True)
+
+    # --- Label Save Verification (Error log if failed) --- #
+    try:
+        if label_saved_successfully and os.path.exists(label_path):
+            file_size = os.path.getsize(label_path)
+            if file_size == 0 and labels: # Check if empty despite having labels
+                 logging.error(f"ラベルファイルは作成されましたが空です (0 バイト): {label_path} (ラベル数: {len(labels)})")
+            elif file_size == 0 and not labels:
+                 logging.debug(f"ラベルファイルは空ですが、ラベルデータもありません: {label_path}") # OK
+            else:
+                 logging.debug(f"ラベルファイル保存確認OK: {label_path}, サイズ: {file_size} バイト")
+        elif label_saved_successfully:
+            logging.error(f"ラベル保存関数は成功しましたが、ファイルが存在しません: {label_path}")
+        # else: # If save failed, error was already logged
+    except Exception as ve:
+        logging.error(f"ラベルファイルの存在確認中にエラー: {label_path}: {ve}", exc_info=True)
 
 def add_white_noise(audio_data: np.ndarray, snr_db: float) -> np.ndarray:
     signal_power = np.mean(audio_data ** 2)
-    if signal_power < 1e-9: return audio_data
+    if signal_power < 1e-9:
+        logging.debug("Signal power is near zero, skipping noise addition.")
+        return audio_data
+
     snr_linear = 10 ** (snr_db / 10.0)
+    # Avoid division by zero or adding excessive noise for very low SNR
+    if snr_linear < 1e-9: # Corresponds to SNR < -90dB, effectively infinite noise
+        logging.warning(f"SNR {snr_db}dB is very low (linear {snr_linear:.2e}). Noise might dominate or cause issues. Returning original signal.")
+        # Optionally return noise scaled to AMP_MAX? Or just return original? Returning original for safety.
+        return audio_data
+
     noise_power = signal_power / snr_linear
+    # Add check for potentially huge noise power if snr_linear is extremely small but non-zero
+    if noise_power > 1e6 * signal_power: # Heuristic check: if noise power is million times signal power
+        logging.warning(f"Calculated noise power ({noise_power:.2e}) is extremely high relative to signal power ({signal_power:.2e}) for SNR {snr_db}dB. Clipping noise or returning original signal might be needed.")
+        # For now, proceed but this indicates potential issues.
+
     noise = np.random.randn(len(audio_data)) * np.sqrt(noise_power)
     return audio_data + noise
 
@@ -231,84 +266,92 @@ def generate_kick_sound(duration_sec: float = 0.3, freq: float = 60.0, decay_rat
     return kick * amp
 
 def generate_noise_perc_sound(duration_sec: float = 0.2, bandpass_freqs: Optional[Tuple[float, float]] = None, decay_rate: float = 25.0, amp: float = 1.0, sr: int = SR) -> np.ndarray:
+    assert duration_sec > 0, "Duration must be positive"
+    assert decay_rate >= 0, "Decay rate must be non-negative"
     duration_samples = int(duration_sec * sr)
     noise = np.random.randn(duration_samples)
     if bandpass_freqs:
         low, high = bandpass_freqs
         nyquist = 0.5 * sr
+        assert 0 < low < high < nyquist, f"Invalid bandpass frequencies: {low}, {high} for sr={sr}"
+
         low_norm = low / nyquist
         high_norm = high / nyquist
-        if low_norm <= 0: low_norm = 0.01
-        if high_norm >= 1: high_norm = 0.99
-        if low_norm >= high_norm: high_norm = low_norm + 0.01
+        # Ensure norms are valid and low < high even after potential clipping (though assert should catch)
+        low_norm = np.clip(low_norm, 1e-6, 1.0 - 1e-6)
+        high_norm = np.clip(high_norm, 1e-6, 1.0 - 1e-6)
+        if low_norm >= high_norm:
+            high_norm = low_norm + 1e-6 # Ensure high > low
+            logging.warning(f"Adjusted high norm frequency to be slightly above low norm: {low_norm=}, {high_norm=}")
+
         try:
-            b, a = butter(4, [low_norm, high_norm], btype='band')
+            # Filter order (can be adjusted)
+            order = 4
+            b, a = butter(order, [low_norm, high_norm], btype='band')
             noise = filtfilt(b, a, noise)
-        except ValueError as e:
-            logging.warning(f"Butterworth filter failed ({bandpass_freqs}): {e}. Using unfiltered noise.")
-    t = np.linspace(0., duration_sec, duration_samples, endpoint=False)
+        except Exception as e:
+            logging.error(f"Bandpass filtering failed: {e}", exc_info=True)
+            # Optionally raise SynthesizerError or return unfiltered noise
+            # raise SynthesizerError(f"Bandpass filtering failed: {e}") from e
+            pass # Continue with unfiltered noise for now
+
     envelope = np.exp(-decay_rate * t)
     perc = noise * envelope
     return perc * amp
 
-# --- Helper functions ---
-
 def generate_formant_filter(formant_freqs: List[float], bandwidths: List[float], sr: int = SR):
-    """簡易的なフォルマントフィルタ（複数のバンドパスフィルタの合成）を生成"""
-    # Note: This is a very simplified formant simulation
-    num_samples = sr # Arbitrary length for impulse response generation
-    impulse = np.zeros(num_samples)
-    impulse[0] = 1.0
-    filtered_impulse = np.zeros(num_samples)
-    nyquist = 0.5 * sr
+    assert len(formant_freqs) == len(bandwidths), "Formant frequencies and bandwidths must have the same length"
+    filter_response = np.zeros(sr // 2 + 1) # Frequency response up to Nyquist
+    freqs = np.fft.rfftfreq(sr, d=1./sr)
+    for f_formant, bw in zip(formant_freqs, bandwidths):
+        assert f_formant > 0, f"Formant frequency must be positive: {f_formant}"
+        assert bw > 0, f"Bandwidth must be positive: {bw}"
+        # Simple resonance model (adjust gain as needed)
+        gain = 1.0
+        term = (freqs - f_formant) / (bw / 2.0)
+        # Avoid division by zero if bw is extremely small? Add epsilon?
+        resonance = gain / (1.0 + term**2 + 1e-12) # Added epsilon
+        filter_response += resonance
+    # Normalize filter response
+    max_resp = np.max(filter_response)
+    if max_resp > 1e-9:
+        filter_response /= max_resp
+    return filter_response
 
-    for i, f in enumerate(formant_freqs):
-        bw = bandwidths[i]
-        f_low = f - bw / 2
-        f_high = f + bw / 2
-        # Normalize frequencies
-        low_norm = f_low / nyquist
-        high_norm = f_high / nyquist
-        if low_norm <= 0: low_norm = 0.01
-        if high_norm >= 1: high_norm = 0.99
-        if low_norm >= high_norm: high_norm = low_norm + 0.01
-        try:
-            # Design a bandpass filter for this formant
-            b, a = butter(2, [low_norm, high_norm], btype='band')
-            # Apply filter to impulse and add to the total filtered impulse
-            filtered_impulse += filtfilt(b, a, impulse)
-        except ValueError as e:
-            logging.warning(f"Butterworth filter failed for formant {f} Hz: {e}")
-            # If filter fails, add the original impulse (less ideal)
-            filtered_impulse += impulse * 0.1 # Add attenuated impulse
-
-    # Normalize the combined impulse response
-    if np.max(np.abs(filtered_impulse)) > 1e-9:
-        filtered_impulse /= np.max(np.abs(filtered_impulse))
-
-    # Trim the impulse response (heuristic)
-    non_zero_indices = np.where(np.abs(filtered_impulse) > 1e-4)[0]
-    if len(non_zero_indices) > 0:
-       last_significant = non_zero_indices[-1]
-       filtered_impulse = filtered_impulse[:last_significant + int(0.05*sr)] # Keep a small tail
+def apply_formant_filter(audio_data: np.ndarray, filter_response: np.ndarray, sr: int = SR) -> np.ndarray:
+    """Applies a pre-computed formant filter response to audio data using FFT."""
+    assert len(filter_response) == (sr // 2 + 1), "Filter response length mismatch"
+    # Ensure audio_data is float
+    audio_data_float = audio_data.astype(np.float32)
+    audio_fft = np.fft.rfft(audio_data_float)
+    # Ensure filter_response length matches audio_fft length
+    if len(audio_fft) != len(filter_response):
+        # This shouldn't happen if sr matches, but handle potential mismatch
+        logging.warning(f"FFT length ({len(audio_fft)}) and filter response length ({len(filter_response)}) mismatch. Resizing filter.")
+        # Simple zero-padding or truncation - more sophisticated resizing might be needed
+        target_len = len(audio_fft)
+        if target_len > len(filter_response):
+            filter_response = np.pad(filter_response, (0, target_len - len(filter_response)))
     else:
-       filtered_impulse = filtered_impulse[:int(0.1*sr)] # Default short length if all near zero
+            filter_response = filter_response[:target_len]
 
-    return filtered_impulse
+    filtered_fft = audio_fft * filter_response
+    filtered_audio = np.fft.irfft(filtered_fft)
+    # Ensure output length matches input length
+    if len(filtered_audio) > len(audio_data):
+        filtered_audio = filtered_audio[:len(audio_data)]
+    elif len(filtered_audio) < len(audio_data):
+        filtered_audio = np.pad(filtered_audio, (0, len(audio_data) - len(filtered_audio)))
+
+    return filtered_audio
 
 def add_click_noise(audio_data: np.ndarray, click_prob: float = 0.001, click_amp: float = 0.5, sr: int = SR) -> np.ndarray:
-    """音声データにランダムなクリックノイズを追加"""
-    clicks = np.zeros_like(audio_data)
-    num_clicks = int(len(audio_data) * click_prob)
-    click_indices = np.random.randint(0, len(audio_data), num_clicks)
-    # Clicks are short impulses (1-2 samples)
-    clicks[click_indices] = (np.random.rand(num_clicks) * 2 - 1) * click_amp
-    # Optional: make clicks slightly wider
-    if len(click_indices) > 0:
-       click_indices_plus1 = np.clip(click_indices + 1, 0, len(audio_data) - 1)
-       clicks[click_indices_plus1] += (np.random.rand(num_clicks) * 2 - 1) * click_amp * 0.5
-
-    return audio_data + clicks
+    assert 0.0 <= click_prob <= 1.0, "Click probability must be between 0.0 and 1.0"
+    assert click_amp >= 0, "Click amplitude must be non-negative"
+    num_samples = len(audio_data)
+    click_mask = np.random.rand(num_samples) < click_prob
+    click_noise = (np.random.rand(num_samples) * 2 - 1) * click_amp * click_mask
+    return audio_data + click_noise
 
 # --- 個別のデータ生成関数 --- (必要に応じて private 化 _generate_... も検討)
 
@@ -759,137 +802,125 @@ def generate_legato(filename_base: str = "20_legato", sr: int = SR):
     save_audio_and_label(filename_base, audio, labels, sr=sr)
 
 def generate_vocal_imitation(filename_base: str = "21_vocal_imitation", sr: int = SR):
-    """ピッチの揺らぎと簡易フォルマントを持つボーカル模倣音を生成"""
-    # Simple melody
-    notes = [(69, 0.8), (71, 0.6), (69, 0.8), (67, 1.0), (69, 0.6), (72, 0.8), (71, 1.2)] # A4 based melody
-    adsr_params = {'attack': 0.08, 'decay': 0.2, 'sustain_level': 0.7, 'release': 0.3}
+    logging.info(f"Generating vocal imitation: {filename_base}")
+    notes = [
+        (0.5, 1.5, 60), # C4
+        (1.7, 2.5, 62), # D4
+        (2.6, 3.8, 64), # E4
+        (4.0, 4.6, 67), # G4
+        (4.7, 5.5, 65), # F4
+        (5.7, 6.5, 64), # E4
+    ]
+    # Basic harmonics for a slightly richer tone
+    harmonics = [(1, 1.0), (2, 0.4), (3, 0.2)]
+    total_duration_sec = 7.0
+    total_samples = int(total_duration_sec * sr)
+    audio_out = np.zeros(total_samples)
+    labels = []
 
-    # Vibrato parameters
-    vibrato_rate_hz = 6.0
-    vibrato_depth_cents = 15.0
+    # LFO for vibrato/pitch variation
+    lfo_freq_pitch = 5.0 # Hz
+    lfo_amp_cents = 30.0 # Cents range for pitch vibrato
+    lfo_phase_offset_pitch = np.random.rand() * 2 * np.pi # Randomize start phase
 
-    # --- Generate base audio with pitch fluctuation ---
-    total_duration_sec = sum(dur for _, dur in notes)
-    total_duration_samples = int(total_duration_sec * sr)
-    labels: List[Label] = []
-    current_time_samples = 0
-    release_time_sec = adsr_params.get('release', 0.3) # Use the defined release time
-    # Calculate buffer needed for final release tail of the *last* note
-    buffer_samples = int(release_time_sec * sr)
-    padded_audio_len = total_duration_samples + buffer_samples
-    padded_audio = np.zeros(padded_audio_len) # Correctly initialize audio buffer
+    # LFO for amplitude variation (tremolo)
+    lfo_freq_amp = 7.0 # Hz
+    lfo_amp_level = 0.1 # Amplitude variation depth (0 to 1)
+    lfo_phase_offset_amp = np.random.rand() * 2 * np.pi
 
-    # Add slight random pitch fluctuation and vibrato per note
-    for i, (midi_note, duration_sec) in enumerate(notes):
-        base_freq = midi_to_hz(midi_note)
-        note_duration_samples = int(duration_sec * sr)
-        # Total samples needed for this note's envelope including release
-        envelope_samples_note = int((duration_sec + release_time_sec) * sr)
+    # Formant filter simulation (example values for a vowel-like sound)
+    try:
+        formant_freqs = [800, 1200, 2400]
+        formant_bandwidths = [80, 100, 150]
+        formant_filter = generate_formant_filter(formant_freqs, formant_bandwidths, sr)
+        apply_filter = True
+    except Exception as e:
+        logging.warning(f"Failed to generate formant filter: {e}. Skipping filter.")
+        apply_filter = False
 
-        t = np.linspace(0., duration_sec, note_duration_samples, endpoint=False)
+    # ADSR for each note
+    adsr_params = {'attack': 0.05, 'decay': 0.1, 'sustain_level': 0.7, 'release': 0.15}
 
-        # Subtle random walk for pitch variation within a note (+/- 15 cents max)
-        pitch_variation_cents = np.cumsum(np.random.randn(note_duration_samples) * 0.1) # Small steps
-        pitch_variation_cents = np.clip(pitch_variation_cents, -15, 15)
+    current_phase = 0.0
 
-        # Add sinusoidal vibrato
-        vibrato_cents = vibrato_depth_cents * np.sin(2 * np.pi * vibrato_rate_hz * t)
-        total_pitch_variation_cents = pitch_variation_cents + vibrato_cents
+    try: # Add try block for the main generation loop
+        for i, (onset, offset, midi_note) in enumerate(notes):
+            assert 0 <= onset < offset <= total_duration_sec, f"Invalid note timing: {onset}, {offset}"
+            assert midi_note > 0, f"Invalid MIDI note: {midi_note}"
 
-        # Apply total pitch variation
-        freq_mod = base_freq * (2**(total_pitch_variation_cents / 1200))
+            start_sample = int(onset * sr)
+            end_sample = int(offset * sr)
+            note_duration_samples = end_sample - start_sample
+            assert note_duration_samples > 0, f"Note duration must be positive: {note_duration_samples}"
 
-        # Phase calculation using modulated frequency
-        phase = np.cumsum(2 * np.pi * freq_mod / sr)
+            base_freq = midi_to_hz(midi_note)
+            labels.append((onset, offset, base_freq))
 
-        # Basic harmonics for vocal-like sound (richer than pure sine)
-        # Generate for sustain part only first
-        harmonic_tone_sustain = np.sin(phase) + 0.4 * np.sin(2*phase) + 0.2 * np.sin(3*phase)
-        harmonic_tone_sustain /= 1.6 # Normalize roughly
+            # Time vector for this note
+            t_note = np.arange(note_duration_samples) / sr
+            t_global = (start_sample + np.arange(note_duration_samples)) / sr
 
-        # Apply ADSR envelope for the note segment
-        envelope_note = generate_adsr_envelope(envelope_samples_note, **adsr_params, sr=sr)
+            # Calculate frequency with pitch LFO
+            pitch_mod_cents = lfo_amp_cents * np.sin(2 * np.pi * lfo_freq_pitch * t_global + lfo_phase_offset_pitch)
+            current_freq = base_freq * (2.0 ** (pitch_mod_cents / 1200.0))
+            # Ensure frequency is positive
+            current_freq = np.maximum(current_freq, 1e-6)
 
-        # Apply envelope to sustain part
-        note_wave_sustain = harmonic_tone_sustain * envelope_note[:note_duration_samples]
+            # Calculate phase delta and instantaneous phase
+            phase_delta = 2 * np.pi * current_freq / sr
+            instantaneous_phase = current_phase + np.cumsum(phase_delta)
+            current_phase = instantaneous_phase[-1] # Store last phase for next note (smoother transitions?)
 
-        # Generate waveform for release part separately
-        release_samples = envelope_samples_note - note_duration_samples
-        note_wave_release = np.array([]) # Initialize release wave
-        if release_samples > 0:
-            # Estimate phase continuation for release (using last frequency)
-            last_freq = freq_mod[-1] if len(freq_mod) > 0 else base_freq
-            # Start phase for release is the end phase of sustain
-            release_start_phase = phase[-1] if len(phase) > 0 else 0
-            release_phase_increment = np.cumsum(2 * np.pi * last_freq / sr * np.ones(release_samples))
-            release_phase = release_start_phase + release_phase_increment
+            # Generate base harmonic tone using instantaneous phase
+            note_wave = np.zeros(note_duration_samples)
+            total_harmonic_amp = sum(h_amp for _, h_amp in harmonics)
+            if total_harmonic_amp < 1e-9: total_harmonic_amp = 1.0 # Avoid div by zero
 
-            # Generate harmonics for release part
-            harmonic_tone_release = np.sin(release_phase) + 0.4 * np.sin(2*release_phase) + 0.2 * np.sin(3*release_phase)
-            harmonic_tone_release /= 1.6 # Normalize roughly
+            for harmonic_num, harmonic_amp in harmonics:
+                # Use instantaneous phase for each harmonic
+                note_wave += (harmonic_amp / total_harmonic_amp) * np.sin(harmonic_num * instantaneous_phase)
 
-            # Apply envelope to release part (ensure lengths match)
-            env_release_part = envelope_note[note_duration_samples:]
-            min_len_release = min(len(harmonic_tone_release), len(env_release_part))
-            # Use the sliced parts for calculation
-            note_wave_release = harmonic_tone_release[:min_len_release] * env_release_part[:min_len_release]
+            # Apply ADSR envelope
+            envelope = generate_adsr_envelope(note_duration_samples, **adsr_params, sr=sr)
+            note_wave *= envelope
 
-        # --- BUG FIX: Write generated wave parts to the main audio buffer ---
-        # Ensure indices are within bounds
-        sustain_end_idx = current_time_samples + len(note_wave_sustain)
-        if sustain_end_idx <= padded_audio_len:
-            padded_audio[current_time_samples:sustain_end_idx] += note_wave_sustain
+            # Apply amplitude LFO (tremolo)
+            amp_mod = 1.0 - lfo_amp_level * (0.5 * (1 + np.sin(2 * np.pi * lfo_freq_amp * t_global + lfo_phase_offset_amp)))
+            note_wave *= amp_mod
+
+            # Write to output buffer, clipping indices just in case
+            write_start = np.clip(start_sample, 0, total_samples)
+            write_end = np.clip(end_sample, 0, total_samples)
+            write_len = write_end - write_start
+            if write_len > 0:
+                if write_len == len(note_wave):
+                    audio_out[write_start:write_end] += note_wave
+                elif write_len < len(note_wave):
+                    logging.warning(f"Note {i} wave truncated during write ({len(note_wave)} -> {write_len})")
+                    audio_out[write_start:write_end] += note_wave[:write_len]
+                else: # write_len > len(note_wave) - should not happen with clip
+                    logging.warning(f"Note {i} wave shorter than write segment ({len(note_wave)} vs {write_len})")
+                    audio_out[write_start : write_start + len(note_wave)] += note_wave
         else:
-            # Handle boundary case if sustain part overflows
-            safe_len = padded_audio_len - current_time_samples
-            if safe_len > 0:
-                padded_audio[current_time_samples:] += note_wave_sustain[:safe_len]
+                logging.warning(f"Calculated zero write length for note {i} at {onset=}, {offset=}")
 
-        release_start_idx = sustain_end_idx
-        release_end_idx = release_start_idx + len(note_wave_release)
-        if release_end_idx <= padded_audio_len:
-             # Ensure release_start_idx is also valid before writing
-             if release_start_idx < padded_audio_len:
-                padded_audio[release_start_idx:release_end_idx] += note_wave_release
-        else:
-            # Handle boundary case if release part overflows
-             if release_start_idx < padded_audio_len:
-                safe_len = padded_audio_len - release_start_idx
-                if safe_len > 0:
-                    padded_audio[release_start_idx:] += note_wave_release[:safe_len]
-        # --- End Bug Fix ---
+        # Apply formant filter if generated successfully
+        if apply_filter:
+            audio_out = apply_formant_filter(audio_out, formant_filter, sr)
 
-        # Label generation
-        onset_time_sec = current_time_samples / sr
-        # Use the originally defined release time for offset calculation consistency
-        # perceived_release_duration_sec = adsr_params['release'] * 0.8 # Use 0.3s
-        # Let's use the _generate_melody_audio_labels calculation style for consistency
-        perceived_release_duration_sec = adsr_params.get('release', 0.1) * 0.8 # Consistent with other funcs? Let's try 0.3 * 0.8
-        perceived_release_duration_sec = 0.3 * 0.8
-        offset_time_sec = (current_time_samples + note_duration_samples) / sr + perceived_release_duration_sec
-        offset_time_sec = min(offset_time_sec, padded_audio_len / sr) # Ensure offset doesn't exceed audio length
+        # Add some noise
+        audio_out = add_white_noise(audio_out, snr_db=30)
 
-        labels.append((onset_time_sec, offset_time_sec, base_freq))
-        # Update current time based on note duration (not envelope duration)
-        current_time_samples += note_duration_samples # Move time based on sustain duration
+        save_audio_and_label(filename_base, audio_out, labels, sr=sr)
 
-    # --- Apply simplified formant filter ---
-    # Ensure audio is normalized before filtering to avoid clipping/scaling issues
-    if np.max(np.abs(padded_audio)) > 0:
-      padded_audio /= np.max(np.abs(padded_audio)) * 1.1 # Normalize with slight headroom
-
-    formant_freqs = [700, 1200, 2500]
-    bandwidths = [100, 150, 200]
-    formant_ir = generate_formant_filter(formant_freqs, bandwidths, sr)
-    # Apply formant filter via convolution
-    # Use mode='same' to keep length consistent, might have slight edge effects
-    audio_formant = fftconvolve(padded_audio, formant_ir, mode='same')
-
-    # Final normalization after filtering
-    if np.max(np.abs(audio_formant)) > 0:
-        audio_formant /= np.max(np.abs(audio_formant)) # Normalize to [-1, 1]
-
-    save_audio_and_label(filename_base, audio_formant, labels, sr=sr)
+    except AssertionError as ae:
+        logging.error(f"Assertion failed during vocal imitation generation: {ae}", exc_info=True)
+        raise SynthesizerError(f"Assertion failed: {ae}") from ae
+    except Exception as e:
+        logging.error(f"Error generating vocal imitation {filename_base}: {e}", exc_info=True)
+        # Optionally save whatever was generated before the error?
+        # save_audio_and_label(f"{filename_base}_partial", audio_out[:current_sample], labels, sr=sr)
+        raise SynthesizerError(f"Vocal imitation generation failed: {e}") from e
 
 def generate_clicks(filename_base: str = "22_clicks", sr: int = SR):
     """基本的なメロディにクリックノイズを付加"""
@@ -901,54 +932,60 @@ def generate_clicks(filename_base: str = "22_clicks", sr: int = SR):
     save_audio_and_label(filename_base, audio_with_clicks, labels, sr=sr)
 
 def generate_pitch_bend(filename_base: str = "14b_pitch_bend", midi_note: int = 60, bend_range_cents: float = 80.0, sr: int = SR):
-    """単一ノート内でピッチが滑らかに変化する（ピッチベンド）音声を生成"""
+    logging.info(f"Generating pitch bend: {filename_base}")
+    assert midi_note > 0, "MIDI note must be positive"
+    # Bend range can be positive or negative
+
     duration_sec = 3.0
     duration_samples = int(duration_sec * sr)
-    center_freq = midi_to_hz(midi_note)
+    audio_out = np.zeros(duration_samples)
+    labels = []
 
-    # セントから周波数比を計算
-    # bend_range_cents は変化の全幅。中心からの変化幅はその半分
-    half_bend_cents = bend_range_cents / 2.0
-    ratio = 2.0 ** (half_bend_cents / 1200.0)
-    start_freq = center_freq / ratio
-    end_freq = center_freq * ratio
+    base_freq = midi_to_hz(midi_note)
+    labels.append((0.0, duration_sec, base_freq)) # Label with the starting pitch
 
-    harmonics = [(1, 1.0), (3, 0.4)] # シンプルな倍音
-    adsr_params = {'attack': 0.05, 'decay': 0.1, 'sustain_level': 0.9, 'release': 0.2}
-    envelope_samples = int((duration_sec + adsr_params['release']) * sr)
-    envelope = generate_adsr_envelope(envelope_samples, **adsr_params, sr=sr)
+    # Bend curve: slow sine bend up and down
+    t = np.linspace(0, duration_sec, duration_samples, endpoint=False)
+    # Bend factor from 0 (no bend) to 1 (full bend range)
+    bend_factor = 0.5 * (1 - np.cos(2 * np.pi * (1.0 / duration_sec) * t))
+    current_bend_cents = bend_range_cents * bend_factor
 
-    # 周波数の指数的遷移 (generate_portamentoと同様)
-    bend_duration_samples = duration_samples # ここでは持続時間全体で変化
-    log_start_freq = np.log(start_freq)
-    log_end_freq = np.log(end_freq)
-    t_bend = np.linspace(0., 1., bend_duration_samples)
-    # 往復させる (例: 上がって下がる)
-    # freq_trajectory_up = np.exp(log_start_freq + (log_end_freq - log_start_freq) * t_bend)
-    # freq_trajectory_down = np.exp(log_end_freq + (log_start_freq - log_end_freq) * t_bend)
-    # freq_trajectory = np.concatenate((freq_trajectory_up[:bend_duration_samples//2], freq_trajectory_down[bend_duration_samples//2:]))
-    # 単純にstartからendへ遷移
-    freq_trajectory = np.exp(log_start_freq + (log_end_freq - log_start_freq) * t_bend)
+    # Calculate frequency with bend
+    current_freq = base_freq * (2.0 ** (current_bend_cents / 1200.0))
+    # Ensure frequency is positive
+    current_freq = np.maximum(current_freq, 1e-6)
 
-    # 位相計算
-    phase = np.zeros(envelope_samples)
-    # freq_trajectory を envelope_samples の長さに合わせる (末尾でパッド)
-    instantaneous_freq = np.pad(freq_trajectory, (0, envelope_samples - len(freq_trajectory)), 'edge') / sr
-    phase[1:] = 2 * np.pi * np.cumsum(instantaneous_freq[:-1])
+    # Calculate phase delta and instantaneous phase
+    phase_delta = 2 * np.pi * current_freq / sr
+    # Check for extreme phase delta values that might indicate instability
+    max_phase_delta = np.max(np.abs(phase_delta))
+    if max_phase_delta > np.pi: # If instantaneous freq exceeds Nyquist, can cause aliasing/instability
+        logging.warning(f"Maximum phase delta {max_phase_delta:.4f} exceeds pi. Potential instability/aliasing.")
+        # Consider clipping freq or handling differently
 
-    # 高調波も考慮した波形生成 (基本波の位相を共有)
-    tone = np.zeros(envelope_samples)
-    total_harmonic_amp = sum(amp for _, amp in harmonics)
-    for h_num, h_amp in harmonics:
-        tone += (h_amp / total_harmonic_amp) * np.sin(phase * h_num)
+    try:
+        instantaneous_phase = np.cumsum(phase_delta)
+    except Exception as e:
+        logging.error(f"Error calculating cumulative sum for phase: {e}", exc_info=True)
+        # Handle error, e.g., return zeros or raise
+        raise SynthesizerError(f"Phase calculation failed: {e}") from e
 
-    audio = tone * envelope
-    audio = audio[:duration_samples]
+    # Generate sine wave using instantaneous phase
+    audio_out = np.sin(instantaneous_phase)
 
-    # ラベル: 単一ノートとして、中心周波数を記録
-    labels: List[Label] = [(adsr_params['attack'], duration_sec, center_freq)]
+    # Apply envelope
+    envelope = generate_adsr_envelope(duration_samples, attack=0.1, decay=0.2, sustain_level=0.8, release=0.5, sr=sr)
+    # Ensure envelope length matches audio_out length
+    if len(envelope) > len(audio_out):
+        envelope = envelope[:len(audio_out)]
+    elif len(envelope) < len(audio_out):
+        envelope = np.pad(envelope, (0, len(audio_out) - len(envelope)))
+    audio_out *= envelope
 
-    save_audio_and_label(filename_base, audio, labels, sr=sr)
+    # Add noise
+    audio_out = add_white_noise(audio_out, snr_db=35)
+
+    save_audio_and_label(filename_base, audio_out, labels, sr=sr)
 
 # --- Helper functions to generate audio/labels without saving (used internally) ---
 
@@ -1000,7 +1037,7 @@ def _generate_melody_audio_labels(notes: List[Tuple[int, float]], harmonics: Lis
         labels.append((onset_time_sec, offset_time_sec, freq))
 
         # Move time marker to the start of the next note (including gap)
-        current_time_samples = end_sample + int(gap_sec * sr)
+        current_time_samples += note_duration_samples # Move time based on sustain duration
 
     # Trim the final audio, keeping the buffer for the last note's release
     # Return audio potentially longer than total_duration_sec due to final release tail

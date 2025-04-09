@@ -1,1 +1,47 @@
-{}
+# config.yaml
+
+# 評価関連のデフォルト設定
+evaluation:
+  default_dataset: synthesized_v1 # デフォルトで使用するデータセット名
+  default_metrics: ["note.*", "onset.*"] # デフォルトで計算するメトリック
+  save_plots: true
+  save_results_json: true
+
+# グリッドサーチ関連のデフォルト設定
+grid_search:
+  default_best_metric: note.f_measure
+  default_n_jobs: -1 # 利用可能な全コアを使用 (-1)
+
+# データセット定義
+datasets:
+  synthesized_v1:
+    audio_dir: datasets/synthesized/audio # path_utils で解決される相対パス or 絶対パス
+    label_dir: datasets/synthesized/labels
+    label_pattern: "*.csv"
+  # 必要に応じて他のデータセットを追加
+  # medleydb_melody:
+  #   audio_dir: /path/to/medleydb/audio
+  #   label_dir: /path/to/medleydb/annotations/melody
+  #   label_pattern: "*_MELODY1.csv"
+
+# アルゴリズム固有のデフォルトパラメータ (例)
+# detectors:
+#   MyDetector:
+#     param_a: 0.5
+#     param_b: 10
+#   AnotherDetector:
+#     threshold: 0.7
+
+# LLM settings
+llm:
+  client_type: "ClaudeClient" # 使用するクライアントクラス (例: ClaudeClient, OpenAIClient)
+  api_key: ${ANTHROPIC_API_KEY} # 環境変数から読み込むことを推奨
+  model: "claude-3-opus-20240229"
+  api_base: "https://api.anthropic.com"
+  api_version: "2023-06-01"
+  max_tokens: 4096
+  # desktop_mode: false # デスクトップモードを使う場合 (環境変数でも設定可能)
+  # desktop_url: "http://localhost:5000"
+
+# Example dataset definitions
+# ... existing code ...

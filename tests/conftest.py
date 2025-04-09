@@ -222,8 +222,8 @@ def temp_grid_config_file():
                 'onset_threshold': [0.3, 0.4],
                 'offset_threshold': [0.1, 0.2]
             },
-            'audio_dir': 'data/audio',
-            'reference_dir': 'data/references',
+            'audio_dir': 'datasets/synthesized/audio',
+            'reference_dir': 'datasets/synthesized/labels',
             'save_plots': True
         }
         

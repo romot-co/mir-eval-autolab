@@ -17,13 +17,22 @@ dependencies = [
     "mir_eval",
     "pandas",
     "scikit-learn",
-    "tensorflow",
-    "torch",
+    "tensorflow >= 2.10",
     "tqdm",
     "pydantic",
     "pyaudio",
     "soundfile",
-    "seaborn"
+    "seaborn",
+    "PyYAML",
+    "requests >= 2.31.0",
+    "fastapi",
+    "uvicorn[standard]",
+    "pillow",
+    "typer >= 0.9.0",
+    "tenacity",
+    "httpx >= 0.27.0",
+    "websockets >= 11.0",
+    "rich >= 13.7.0",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +40,7 @@ dev = [
     "pytest",
     "pytest-cov",
     "black",
+    "isort",
 ]
 
 [tool.hatch.build.targets.wheel]

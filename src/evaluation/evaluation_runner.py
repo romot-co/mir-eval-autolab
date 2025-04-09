@@ -29,6 +29,7 @@ import traceback
 import tempfile
 from pathlib import Path
 from tqdm import tqdm
+import yaml
 
 from src.utils.audio_utils import load_audio_file, load_reference_data, make_output_path
 from src.utils.exception_utils import log_exception, create_error_result
@@ -51,6 +52,25 @@ except ImportError:
     pass
 
 logger = logging.getLogger(__name__)
+
+CONFIG = {}
+def load_global_config():
+    global CONFIG
+    try:
+        from src.utils.path_utils import get_project_root
+        config_path = get_project_root() / 'config.yaml'
+        if config_path.exists():
+            with open(config_path, 'r', encoding='utf-8') as f:
+                CONFIG = yaml.safe_load(f) or {}
+            logger.info(f"Loaded config from {config_path}")
+        else:
+            logger.warning(f"Config file not found at {config_path}")
+            CONFIG = {}
+    except Exception as e:
+        logger.error(f"Failed to load config.yaml: {e}")
+        CONFIG = {}
+
+load_global_config()
 
 def evaluate_detection_result(detected_intervals, detected_pitches, 
                              reference_intervals, reference_pitches,
@@ -352,280 +372,223 @@ def create_error_result(error_msg: str) -> Dict[str, float]:
     }
 
 def run_evaluation(
-    audio_paths: Union[str, List[str]],
-    ref_paths: Union[str, List[str]],
     detector_names: Union[str, List[str]],
+    audio_paths: Optional[Union[str, List[str]]] = None,
+    ref_paths: Optional[Union[str, List[str]]] = None,
     detector_params: Optional[Dict[str, Dict[str, Any]]] = None,
     evaluator_config: Optional[Dict[str, Any]] = None,
     output_dir: Optional[str] = None,
     save_plots: bool = False,
     plot_format: str = 'png',
     save_results_json: bool = True,
-    plot_config: Optional[Dict[str, Any]] = None
+    plot_config: Optional[Dict[str, Any]] = None,
+    dataset_name: Optional[str] = None,
+    num_procs: Optional[int] = None
 ) -> Dict[str, Any]:
     """
-    音声検出アルゴリズムの評価を実行します。複数のファイルと複数の検出器に対応し、
-    MIREX準拠のオンセット/オフセット/ピッチ/ノート評価を一括で行います。
-    
-    Parameters
-    ----------
-    audio_paths : Union[str, List[str]]
-        評価する音声ファイルのパスまたはそのリスト
-    ref_paths : Union[str, List[str]]
-        参照データファイルのパスまたはそのリスト
-    detector_names : Union[str, List[str]]
-        使用する検出器の名前またはそのリスト
-    detector_params : Optional[Dict[str, Dict[str, Any]]], optional
-        検出器のパラメータ, by default None
-        {detector_name: {param_name: param_value, ...}, ...}
-    evaluator_config : Optional[Dict[str, Any]], optional
-        評価設定, by default None
-    output_dir : Optional[str], optional
-        出力ディレクトリ, by default None
-    save_plots : bool, optional
-        結果のプロットを保存するかどうか, by default False
-    plot_format : str, optional
-        プロット形式, by default 'png'
-    save_results_json : bool, optional
-        JSON形式で結果を保存するかどうか, by default True
-    plot_config : Optional[Dict[str, Any]], optional
-        プロット設定, by default None
-        {
-            'show': bool,  # プロットを表示するかどうか
-            'save_path': str,  # プロットの保存パス
-            'figsize': Tuple[int, int],  # プロットのサイズ
-            'dpi': int  # プロットの解像度
-        }
-        
-    Returns
-    -------
-    Dict[str, Any]
-        評価結果
-        {
-          "status": "success",
-          "results": [ ...各ファイル×検出器の評価結果... ],
-          "summary": { ... 全体集計 ... }
-        }
+    音声検出アルゴリズムの評価を実行します。
+
+    ファイルパスリストまたはデータセット名を指定できます。
+
+    Args:
+        detector_names (Union[str, List[str]]): 評価する検出器の名前、または名前のリスト。
+        audio_paths (Optional[Union[str, List[str]]]): 評価対象の音声ファイルパス、またはディレクトリパス。
+                                                      省略した場合、dataset_name から取得します。
+        ref_paths (Optional[Union[str, List[str]]]): 評価対象の参照ファイルパス、またはディレクトリパス。
+                                                   省略した場合、dataset_name から取得します。
+        detector_params (Optional[Dict[str, Dict[str, Any]]]): 検出器ごとのパラメータ設定。
+        evaluator_config (Optional[Dict[str, Any]]): 評価設定 (mir_eval用)。
+        output_dir (Optional[str]): 結果の出力先ディレクトリ。
+        save_plots (bool): プロットを保存するかどうか。
+        plot_format (str): プロットの保存形式 ('png', 'pdf' など)。
+        save_results_json (bool): 評価結果をJSONファイルに保存するかどうか。
+        plot_config (Optional[Dict[str, Any]]): プロット設定。
+        dataset_name (Optional[str]): 使用するデータセット名 (config.yaml で定義)。
+                                      audio_paths/ref_paths が省略された場合に必須。
+        num_procs (Optional[int]): 並列処理に使用するプロセス数 (未実装)。
+
+    Returns:
+        Dict[str, Any]: 評価結果のサマリーを含む辞書。
     """
-    # 入力パラメータの整理
-    if isinstance(audio_paths, str):
-        audio_paths = [audio_paths]
-    
-    if isinstance(ref_paths, str):
-        ref_paths = [ref_paths]
-    
+    start_time = time.time()
+    logger.info(f"評価を開始します: 検出器={detector_names}, データセット={dataset_name or '指定なし'}")
+
+    # --- パスリストの解決 ---
+    final_audio_paths = []
+    final_ref_paths = []
+
+    if audio_paths and ref_paths:
+        # 直接パスが指定された場合
+        if isinstance(audio_paths, str):
+            if Path(audio_paths).is_dir():
+                # ディレクトリの場合はファイルを検索 (例: *.wav)
+                final_audio_paths = sorted(list(Path(audio_paths).glob('*.wav')))
+                # TODO: .flacなども考慮
+            else:
+                final_audio_paths = [Path(audio_paths)]
+        elif isinstance(audio_paths, list):
+            final_audio_paths = [Path(p) for p in audio_paths]
+        else:
+            raise ValueError("audio_pathsは文字列またはリストである必要があります")
+
+        # ref_pathsも同様に処理
+        if isinstance(ref_paths, str):
+            if Path(ref_paths).is_dir():
+                # ディレクトリの場合はファイルを検索 (拡張子は仮)
+                final_ref_paths = sorted(list(Path(ref_paths).glob('*.csv')))
+            else:
+                final_ref_paths = [Path(ref_paths)]
+        elif isinstance(ref_paths, list):
+            final_ref_paths = [Path(p) for p in ref_paths]
+        else:
+            raise ValueError("ref_pathsは文字列またはリストである必要があります")
+            
+        # ファイル数のチェック
+        if len(final_audio_paths) != len(final_ref_paths):
+            logger.warning(f"音声ファイル数 ({len(final_audio_paths)}) と参照ファイル数 ({len(final_ref_paths)}) が一致しません。ファイル名のペアリングを試みます。")
+            # ファイル名ベースでのペアリングロジックをここに追加 (例: stemが一致するもの)
+            paired_paths = []
+            ref_dict = {p.stem: p for p in final_ref_paths}
+            temp_audio_paths = []
+            temp_ref_paths = []
+            for audio_p in final_audio_paths:
+                if audio_p.stem in ref_dict:
+                    temp_audio_paths.append(audio_p)
+                    temp_ref_paths.append(ref_dict[audio_p.stem])
+            if len(temp_audio_paths) == 0:
+                 raise ValueError("音声ファイルと参照ファイルのペアが見つかりません。")
+            final_audio_paths = temp_audio_paths
+            final_ref_paths = temp_ref_paths
+            logger.info(f"{len(final_audio_paths)} ペアのファイルが見つかりました。")
+            
+    elif dataset_name:
+        # データセット名が指定された場合
+        logger.info(f"データセット '{dataset_name}' のパスを取得します...")
+        dataset_config = CONFIG.get('datasets', {}).get(dataset_name)
+        if not dataset_config:
+            raise ValueError(f"設定ファイルにデータセット '{dataset_name}' の定義が見つかりません。")
+
+        audio_dir_path = Path(dataset_config.get('audio_dir'))
+        label_dir_path = Path(dataset_config.get('label_dir'))
+        label_pattern = dataset_config.get('label_pattern', '*.csv') # デフォルト *.csv
+        audio_pattern = dataset_config.get('audio_pattern', '*.wav') # デフォルト *.wav
+
+        if not audio_dir_path.is_dir():
+            raise FileNotFoundError(f"データセットの音声ディレクトリが見つかりません: {audio_dir_path}")
+        if not label_dir_path.is_dir():
+            raise FileNotFoundError(f"データセットのラベルディレクトリが見つかりません: {label_dir_path}")
+
+        # ファイルリストを取得してペアリング
+        audio_files_found = sorted(list(audio_dir_path.glob(audio_pattern)))
+        ref_files_dict = {p.stem: p for p in label_dir_path.glob(label_pattern)}
+
+        if not audio_files_found:
+            raise FileNotFoundError(f"音声ディレクトリに {audio_pattern} に一致するファイルが見つかりません: {audio_dir_path}")
+        if not ref_files_dict:
+             raise FileNotFoundError(f"ラベルディレクトリに {label_pattern} に一致するファイルが見つかりません: {label_dir_path}")
+
+        for audio_p in audio_files_found:
+            if audio_p.stem in ref_files_dict:
+                final_audio_paths.append(audio_p)
+                final_ref_paths.append(ref_files_dict[audio_p.stem])
+
+        if not final_audio_paths:
+            raise ValueError(f"データセット '{dataset_name}' で音声ファイルと参照ファイルのペアが見つかりませんでした。")
+        logger.info(f"データセット '{dataset_name}' から {len(final_audio_paths)} ペアのファイルをロードしました。")
+
+    else:
+        raise ValueError("audio_paths/ref_paths または dataset_name のいずれかを指定する必要があります。")
+
+    # --- 検出器リストの正規化 ---
     if isinstance(detector_names, str):
         detector_names = [detector_names]
-        
     if detector_params is None:
         detector_params = {}
-    
-    if evaluator_config is None:
-        evaluator_config = {}
-    
-    # 出力ディレクトリの作成
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    
-    # 結果格納用のデータ構造
-    results = []
-    errors = []
-    
-    # 検出器のインスタンス化
-    detector_instances = {}
-    for detector_name in detector_names:
-        try:
-            detector_class = get_detector_class(detector_name)
-            # 検出器特有のパラメータがあれば適用
-            params = detector_params.get(detector_name, {})
-            detector_instances[detector_name] = detector_class(**params)
-            logger.info(f"検出器 '{detector_name}' を初期化しました。パラメータ: {params}")
-        except Exception as e:
-            error_msg = f"検出器 '{detector_name}' の初期化中にエラーが発生しました: {str(e)}"
-            logger.error(error_msg)
-            errors.append(error_msg)
-    
-    if not detector_instances:
-        error_msg = "有効な検出器がありません"
-        logger.error(error_msg)
-        return {"status": "error", "error": error_msg}
-    
-    # ファイルと検出器の組み合わせをすべて評価
-    for audio_idx, (audio_path, ref_path) in enumerate(zip(audio_paths, ref_paths)):
-        file_basename = os.path.basename(audio_path)
-        logger.info(f"ファイル {audio_idx+1}/{len(audio_paths)}: {file_basename} を評価します")
-        
-        # 音声ファイルの読み込み
-        try:
-            audio_data, sr = load_audio_file(audio_path)
-            logger.info(f"音声ファイルを読み込みました: {audio_path}, サンプリングレート: {sr}Hz")
-        except Exception as e:
-            error_msg = f"音声ファイル '{audio_path}' の読み込み中にエラーが発生しました: {str(e)}"
-            logger.error(error_msg)
-            errors.append(error_msg)
-            continue
-        
-        # 参照データの読み込み
-        try:
-            reference_data = load_reference_data(ref_path)
-            logger.info(f"参照データを読み込みました: {ref_path}")
-        except Exception as e:
-            error_msg = f"参照ファイル '{ref_path}' の読み込み中にエラーが発生しました: {str(e)}"
-            logger.error(error_msg)
-            errors.append(error_msg)
-            continue
-        
-        # 各検出器で処理
-        for detector_name, detector in detector_instances.items():
-            logger.info(f"検出器 '{detector_name}' で評価を実行します")
-            
-            # ファイル・検出器ごとの出力ディレクトリ
-            if output_dir:
-                detector_output_dir = os.path.join(output_dir, detector_name)
-                os.makedirs(detector_output_dir, exist_ok=True)
-                
-                # ファイル名ベースのディレクトリ
-                file_output_dir = os.path.join(detector_output_dir, os.path.splitext(file_basename)[0])
-                os.makedirs(file_output_dir, exist_ok=True)
-            else:
-                file_output_dir = None
-            
-            # 検出実行
-            try:
-                start_time = time.time()
-                detection_result = detector.detect(audio_data, sr)
-                end_time = time.time()
-                
-                detection_time = end_time - start_time
-                logger.info(f"検出処理を完了しました。処理時間: {detection_time:.3f}秒")
-            except Exception as e:
-                error_msg = f"検出器 '{detector_name}' の実行中にエラーが発生しました: {str(e)}"
-                logger.error(error_msg)
-                errors.append(error_msg)
-                continue
-            
-            # 検出結果の正規化
-            try:
-                normalized_result = normalize_detection_result(detection_result, sr)
-                logger.info("検出結果を正規化しました")
-            except Exception as e:
-                error_msg = f"検出結果の正規化中にエラーが発生しました: {str(e)}"
-                logger.error(error_msg)
-                errors.append(error_msg)
-                continue
-            
-            # 評価の実行（オンセット・オフセット・ピッチ・ノート評価を常に実行）
-            detected_intervals = np.array(normalized_result.get('intervals', []))
-            detected_pitches = np.array(normalized_result.get('note_pitches', []))
-            
-            reference_intervals = np.array(reference_data.get('intervals', []))
-            reference_pitches = np.array(reference_data.get('note_pitches', []))
-            
-            # 評価実行
-            try:
-                evaluation_result = evaluate_detection_result(
-                    detected_intervals=detected_intervals,
-                    detected_pitches=detected_pitches,
-                    reference_intervals=reference_intervals,
-                    reference_pitches=reference_pitches,
-                    evaluator_config=evaluator_config,
-                    detector_result=detection_result
-                )
-                logger.info(f"評価が完了しました: オンセットF値={evaluation_result['onset']['f_measure']:.3f}, ノートF値={evaluation_result['note']['f_measure']:.3f}")
-            except Exception as e:
-                error_msg = f"評価処理中にエラーが発生しました: {str(e)}"
-                logger.error(error_msg)
-                errors.append(error_msg)
-                continue
-            
-            # フレーム評価結果のキー名を標準化
-            if 'frame' in evaluation_result:
-                # 古いキー名を削除（もし存在すれば）
-                for old_key in ['precision', 'recall', 'f_measure', 'accuracy']:
-                    if old_key in evaluation_result['frame']:
-                        del evaluation_result['frame'][old_key]
 
-            # 結果の整理
-            result = {
-                'file': audio_path,
-                'reference_file': ref_path,
-                'detector_name': detector_name,
-                'detection_time': detection_time,
-                'evaluation': evaluation_result,
-                'detector_params': detector_params.get(detector_name, {}),
-                'ref_note_count': len(reference_pitches),
-                'est_note_count': len(detected_pitches)
-            }
-            
-            # JSON形式で結果を保存
-            if file_output_dir and save_results_json:
-                # 評価結果の保存
-                eval_result_path = os.path.join(file_output_dir, 'evaluation_result.json')
-                with open(eval_result_path, 'w', encoding='utf-8') as f:
-                    json.dump(result, f, indent=2, cls=NumpyEncoder)
-                logger.info(f"評価結果をJSONに保存しました: {eval_result_path}")
-                
-                # 検出結果の保存
-                detection_result_path = os.path.join(file_output_dir, 'detection_result.json')
-                with open(detection_result_path, 'w', encoding='utf-8') as f:
-                    json.dump(normalized_result, f, indent=2, cls=NumpyEncoder)
-                logger.info(f"検出結果をJSONに保存しました: {detection_result_path}")
-            
-            # プロット設定の準備
-            if plot_config is None:
-                plot_config = {}
-            
-            # プロットの保存
-            if save_plots and plot_module_imported:
-                try:
-                    plot_path = plot_config.get('save_path')
-                    if not plot_path and file_output_dir:
-                        base_name = os.path.splitext(file_basename)[0]
-                        plot_path = os.path.join(file_output_dir, f'{detector_name}_{base_name}_plot.{plot_format}')
-                    
-                    plot_detection_results(
-                        audio_data=audio_data,
-                        sr=sr,
-                        detection_result=normalized_result,
-                        reference_data=reference_data,
-                        title=f"{detector_name} - {file_basename}",
-                        show=plot_config.get('show', False),
-                        save_path=plot_path,
-                        figsize=plot_config.get('figsize', (12, 8))
-                    )
-                    logger.info(f"プロットを保存しました: {plot_path}")
-                except Exception as e:
-                    error_msg = f"プロットの生成中にエラーが発生しました: {str(e)}"
-                    logger.error(error_msg)
-                    errors.append(error_msg)
-            
-            # 結果リストに追加
-            results.append(result)
-    
-    # 評価結果のサマリーを計算
-    summary = _calculate_evaluation_summary(results)
-    
-    # サマリーのJSON保存
-    if output_dir and save_results_json:
-        summary_path = os.path.join(output_dir, 'evaluation_summary.json')
-        with open(summary_path, 'w', encoding='utf-8') as f:
-            json.dump(summary, f, indent=2, cls=NumpyEncoder)
-        logger.info(f"評価サマリーを保存しました: {summary_path}")
-    
-    # 返却値の作成
-    if errors:
-        return {
-            "status": "partial_success" if results else "error",
-            "results": results,
-            "summary": summary,
-            "errors": errors
-        }
+    # --- 出力ディレクトリの準備 ---
+    if output_dir:
+        output_base_dir = Path(output_dir)
     else:
-        return {
-            "status": "success",
-            "results": results,
-            "summary": summary
+        # デフォルトの出力先 (mcp_serverのワークスペース内を想定)
+        try:
+            from src.utils.path_utils import get_evaluation_results_dir
+            output_base_dir = get_evaluation_results_dir()
+        except ImportError:
+            output_base_dir = Path("./evaluation_results")
+            logger.warning("path_utils をインポートできません。出力先: ./evaluation_results")
+
+    # 評価実行ID (一意なサブディレクトリ用)
+    eval_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_per_detector: Dict[str, List[Dict[str, Any]]] = {name: [] for name in detector_names}
+
+    # --- 評価ループ ---
+    total_files = len(final_audio_paths)
+    logger.info(f"合計 {total_files} ファイルの評価を開始します。検出器: {detector_names}")
+
+    # tqdm を使用してプログレスバーを表示
+    for i, (audio_file, ref_file) in enumerate(tqdm(zip(final_audio_paths, final_ref_paths), total=total_files, desc="Evaluating files")):
+        logger.debug(f"Processing file {i+1}/{total_files}: {audio_file.name}")
+
+        # 各検出器で処理
+        for detector_name in detector_names:
+            detector_specific_output_dir = output_base_dir / detector_name / eval_id
+            detector_specific_output_dir.mkdir(parents=True, exist_ok=True)
+
+            # evaluate_detector を呼び出す (引数を修正)
+            file_result = evaluate_detector(
+                detector_name=detector_name,
+                detector_params=detector_params.get(detector_name),
+                audio_file=str(audio_file),
+                ref_file=str(ref_file),
+                output_dir=str(detector_specific_output_dir), # 出力先を渡す
+                evaluator_config=evaluator_config,
+                save_plots=save_plots,
+                plot_format=plot_format,
+                plot_config=plot_config,
+                save_results_json=save_results_json # file ごとのjson保存も制御
+            )
+            file_result['audio_file'] = str(audio_file) # 結果にファイル名を追加
+            file_result['ref_file'] = str(ref_file)
+            results_per_detector[detector_name].append(file_result)
+
+    # --- 結果集計 ---
+    all_results = {
+        "evaluation_config": evaluator_config or {},
+        "detector_params": detector_params,
+        "dataset_name": dataset_name or "Custom",
+        "num_files": total_files,
+        "detectors": {}
+    }
+
+    for detector_name, file_results in results_per_detector.items():
+        summary = _calculate_evaluation_summary(file_results)
+        all_results["detectors"][detector_name] = {
+            "overall_metrics": summary,
+            "file_metrics": {res["audio_file"]: res for res in file_results} # ファイル名をキーに
         }
+        
+        # 概要をログとコンソールに出力
+        logger.info(f"--- 評価サマリー ({detector_name}) ---")
+        print_summary_statistics(summary, detector_name)
+
+    # 総合結果をJSONで保存
+    if save_results_json:
+        summary_output_dir = output_base_dir / "_summary" / eval_id
+        summary_output_dir.mkdir(parents=True, exist_ok=True)
+        summary_file_path = summary_output_dir / "evaluation_summary.json"
+        try:
+            with open(summary_file_path, 'w', encoding='utf-8') as f:
+                json.dump(all_results, f, cls=NumpyEncoder, indent=2, ensure_ascii=False)
+            logger.info(f"評価サマリーを保存しました: {summary_file_path}")
+        except Exception as e:
+            logger.error(f"評価サマリーのJSON保存に失敗: {e}")
+
+    elapsed_time = time.time() - start_time
+    logger.info(f"評価が完了しました (所要時間: {elapsed_time:.2f}秒)")
+
+    # MCPに返す結果（サマリー部分）
+    # ここでは主要なメトリクスだけを返すなど、調整が必要かもしれない
+    return all_results # とりあえず全結果を返す
 
 def _calculate_evaluation_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
@@ -859,151 +822,95 @@ def save_result_json(result, output_path):
     except Exception as e:
         logger.error(f"評価結果の保存中にエラーが発生しました: {str(e)}") 
 
-def evaluate_detector(detector_name, detector_params, audio_file, ref_file, output_dir):
+def evaluate_detector(
+    detector_name: str,
+    detector_params: Optional[Dict[str, Any]],
+    audio_file: str,
+    ref_file: str,
+    output_dir: str, # 具体的な出力ディレクトリを受け取る
+    evaluator_config: Optional[Dict[str, Any]],
+    save_plots: bool,
+    plot_format: str,
+    plot_config: Optional[Dict[str, Any]],
+    save_results_json: bool
+) -> Dict[str, Any]:
     """
-    検出器を使用して音声ファイルを評価し、結果を保存します。
-
-    Parameters
-    ----------
-    detector_name : str
-        検出器の名前
-    detector_params : dict
-        検出器のパラメータ
-    audio_file : str
-        評価する音声ファイルのパス
-    ref_file : str
-        参照データファイルのパス
-    output_dir : str
-        評価結果を保存するディレクトリ
-    
-    Returns
-    -------
-    dict
-        評価結果
+    単一のファイルに対して単一の検出器を評価します。
     """
-    logger = logging.getLogger(__name__)
+    output_path_base = Path(output_dir) / Path(audio_file).stem
     
-    # 検出器を初期化
+    # ... (検出器取得、音声・参照データ読み込み)
+    detection_time = 0.0 # 初期化
     try:
-        detector = get_detector_class(detector_name)(**detector_params)
-        logger.info(f"検出器 '{detector_name}' を初期化しました。パラメータ: {detector_params}")
-    except Exception as e:
-        logger.error(f"検出器 '{detector_name}' の初期化中にエラーが発生しました: {str(e)}")
-        return None
-    
-    # 音声ファイルを読み込み
-    try:
-        audio, sr = load_audio_file(audio_file)
-        logger.info(f"音声ファイルを読み込みました: {audio_file}, サンプリングレート: {sr}Hz")
-    except Exception as e:
-        logger.error(f"音声ファイルの読み込み中にエラーが発生しました: {str(e)}")
-        return None
-    
-    # 参照データを読み込み
-    try:
+        # ... (検出実行)
+        detector = get_detector_class(detector_name)
+        detector_instance = detector(**(detector_params or {}))
+        audio_data, sr = load_audio_file(audio_file)
         ref_intervals, ref_pitches = load_reference_data(ref_file)
-        logger.info(f"参照データを読み込みました: {ref_file}")
-    except Exception as e:
-        logger.error(f"参照データの読み込み中にエラーが発生しました: {str(e)}")
-        return None
-    
-    # 検出処理を実行
-    try:
-        logger.info(f"検出器 '{detector_name}' で評価を実行します")
-        start_time = time.time()
-        detection_result = detector.detect(audio, sr)
-        end_time = time.time()
-        detection_time = end_time - start_time
-        logger.info(f"検出処理を完了しました。処理時間: {detection_time:.3f}秒")
-    except Exception as e:
-        logger.error(f"検出処理中にエラーが発生しました: {str(e)}")
-        return None
-    
-    # 検出結果を正規化
-    detection_result.detector_name = detector_name
-    detection_result.detection_time = detection_time
-    
-    # フレーム形式の場合はノート形式に変換
-    if detection_result.is_frame_based():
-        try:
-            # フレーム形式からノート形式に変換
-            est_intervals, est_pitches = detection_result.to_notes()
-            logger.info(f"フレーム形式からノート形式に変換しました: {len(est_intervals)}個のノート")
-        except Exception as e:
-            logger.error(f"ノート変換中にエラーが発生しました: {str(e)}")
-            return None
-    else:
-        # 既にノート形式の場合はそのまま使用
-        est_intervals, est_pitches = detection_result.intervals, detection_result.pitches
-    
-    # 非正のピッチ値を修正（mir_evalの要件）
-    est_pitches = np.array(est_pitches)
-    nonpositive_mask = (est_pitches <= 0) | np.isinf(est_pitches) | np.isnan(est_pitches)
-    if np.any(nonpositive_mask):
-        logger.warning(f"検出結果に {np.sum(nonpositive_mask)} 個の無効なピッチ値があります - 1Hzに修正します")
-        est_pitches_copy = est_pitches.copy()
-        est_pitches_copy[nonpositive_mask] = 1.0
-        est_pitches = est_pitches_copy
-    
-    # 評価を実行
-    try:
-        logger.info("検出結果を正規化しました")
-        evaluation_result = evaluate_notes_mirex(
-            ref_intervals=ref_intervals,
-            ref_pitches=ref_pitches,
-            est_intervals=est_intervals,
-            est_pitches=est_pitches,
-            onset_tolerance=0.05,
-            pitch_tolerance=50.0,
-            offset_ratio=0.2,
-            offset_min_tolerance=0.05
+        
+        start_detect = time.time()
+        detection_result_obj = detector_instance.detect(audio_data, sr)
+        detection_time = time.time() - start_detect
+
+        # 結果を正規化
+        detected_intervals, detected_pitches = normalize_detection_result(detection_result_obj)
+        
+        # ... (評価実行: evaluate_detection_result)
+        eval_metrics = evaluate_detection_result(
+            detected_intervals, detected_pitches, 
+            ref_intervals, ref_pitches, 
+            evaluator_config,
+            # detector_result=detection_result_obj # 必要に応じてフレームデータなどを渡す
         )
+
+        # 結果辞書の作成
+        result = {
+            "audio_file": Path(audio_file).name,
+            "ref_file": Path(ref_file).name,
+            "detector_name": detector_name,
+            "params": detector_params or {},
+            "evaluation_metrics": eval_metrics,
+            "detection_time": detection_time,
+            "valid": True,
+            "error": None
+        }
         
-        # フレーム評価（オプション）
-        if detection_result.is_frame_based():
-            frame_eval_result = evaluate_frames(
-                ref_intervals=ref_intervals,
-                ref_pitches=ref_pitches,
-                est_times=detection_result.frame_times,
-                est_freqs=detection_result.frame_frequencies,
-                sample_rate=sr
-            )
-            evaluation_result['frame'] = frame_eval_result
+        # 結果の保存 (JSON)
+        if save_results_json:
+            result_json_path = output_path_base.with_suffix(".evaluation.json")
+            save_evaluation_result(result, str(result_json_path))
+
+        # プロットの保存
+        if save_plots and plot_module_imported:
+             plot_output_path = output_path_base.with_suffix(f".{plot_format}")
+             # save_detection_plot を呼び出す
+             # TODO: save_detection_plot の引数を確認・調整
+             try:
+                save_detection_plot(
+                    audio_data=audio_data,
+                    sr=sr,
+                    detection_result=detection_result_obj, # 元のDetectionResultオブジェクトを渡す
+                    reference={'intervals': ref_intervals, 'pitches': ref_pitches},
+                    output_path=str(plot_output_path),
+                    plot_format=plot_format,
+                    plot_config=plot_config
+                )
+             except Exception as plot_e:
+                 logger.warning(f"プロットの保存に失敗しました ({plot_output_path}): {plot_e}")
         
-        # オンセットとノートのF値をログに出力
-        onset_f = evaluation_result['onset']['f_measure']
-        note_f = evaluation_result['note']['f_measure']
-        logger.info(f"評価が完了しました: オンセットF値={onset_f:.3f}, ノートF値={note_f:.3f}")
-        
-        # 評価結果をJSONに保存
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # 評価結果をJSON形式で保存
-        with open(os.path.join(output_dir, 'evaluation_result.json'), 'w') as f:
-            result_dict = {
-                'audio_file': audio_file,
-                'reference_file': ref_file,
-                'detector': detector_name,
-                'parameters': detector_params,
-                'metrics': evaluation_result,
-                'reference_note_count': len(ref_intervals),
-                'estimated_note_count': len(est_intervals)
-            }
-            json.dump(result_dict, f, indent=2)
-        logger.info(f"評価結果をJSONに保存しました: {os.path.join(output_dir, 'evaluation_result.json')}")
-        
-        # 検出結果をJSON形式で保存
-        detection_result_dict = detection_result.to_dict()
-        with open(os.path.join(output_dir, 'detection_result.json'), 'w') as f:
-            json.dump(detection_result_dict, f, indent=2)
-        logger.info(f"検出結果をJSONに保存しました: {os.path.join(output_dir, 'detection_result.json')}")
-        
-        return evaluation_result
-        
+        return result
+
     except Exception as e:
-        logger.error(f"評価中にエラーが発生しました: {str(e)}")
-        traceback.print_exc()
-        return None 
+        logger.error(f"ファイル {Path(audio_file).name} の評価中にエラー: {e}")
+        # エラー結果を作成
+        error_result = create_error_result(str(e))
+        error_result['audio_file'] = Path(audio_file).name
+        error_result['ref_file'] = Path(ref_file).name
+        error_result['detector_name'] = detector_name
+        error_result['params'] = detector_params or {}
+        error_result['detection_time'] = detection_time
+        error_result['valid'] = False
+        return error_result
 
 def frame_evaluate_wrapper(detection_result, reference_data):
     """
