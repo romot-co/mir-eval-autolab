@@ -67,6 +67,7 @@ pyaudio = ["pyaudio"]
 testpaths = ["tests"]
 python_files = "test_*.py"
 plugins = ["pytest_asyncio"]
+pythonpath = [".", "src"]
 addopts = [
     "-ra",                # Show extra test summary info
     "-q",                 # Quiet mode (less verbose)
@@ -75,6 +76,15 @@ addopts = [
     "--cov-report=term-missing", # Show missing lines in the terminal report
     "--cov-report=xml"   # Generate XML report (for CI/external tools)
     # "--cov-fail-under=70" # Fail if coverage drops below 70% (adjust as needed)
+]
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s [%(levelname)8s] %(name)s: %(message)s (%(filename)s:%(lineno)s)"
+log_cli_date_format = "%Y-%m-%d %H:%M:%S"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+    "ignore::pluggy.PluggyTeardownRaisedWarning"
 ]
 
 [tool.black]
@@ -89,7 +99,7 @@ line_length = 88
 [tool.ruff]
 line-length = 88
 select = ["E", "F", "W", "I", "UP", "B", "C4", "T20"]
-ignore = []
+exclude = ["tests/data/*.json"]
 
 [tool.ruff.format]
 quote-style = "double"

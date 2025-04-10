@@ -226,101 +226,135 @@ def run_grid_search(
     for i, param_values in enumerate(param_combinations):
         params = dict(zip(param_names, param_values))
         run_id = f"run_{i+1}"
-        
+
         logger.info(f"実行 {run_id}: パラメータ = {params}")
-        
-        # 評価を実行
-        run_output_dir = os.path.join(output_dir, run_id)
-        os.makedirs(run_output_dir, exist_ok=True)
-        
+
         try:
             start_time = time.time()
-            
-            # 新しいrun_evaluation関数を使用
+
+            # 新しいrun_evaluation関数を使用 - output_dir を直接渡す
             evaluation_results = run_evaluation(
                 audio_paths=audio_files,
                 ref_paths=reference_files,
                 detector_names=[detector_name],
                 detector_params={detector_name: params},
                 evaluator_config=evaluator_config,
-                output_dir=run_output_dir,
+                output_dir=output_dir, # ここで run_output_dir ではなく output_dir を渡す
                 save_plots=grid_config.get('save_plots', True),
-                save_results_json=True,
+                save_results_json=True, # 個々の結果JSONは run_evaluation が output_dir に保存
                 plot_config={
                     'show': False,  # 非対話的な環境のため、表示はオフに
-                    'save_path': os.path.join(run_output_dir, 'detection_plot.png')
-                }
+                    'output_prefix': f"{run_id}_" # ファイル名に run_id を含める
+                },
+                dataset_name=grid_config.get('dataset'), # データセット名も渡す
+                num_procs=config.get('num_procs') # 並列処理数も渡す
             )
-            
             end_time = time.time()
-            
-            # 評価結果を取得（サマリー部分）
-            if evaluation_results.get('status') in ['success', 'partial_success'] and 'summary' in evaluation_results:
-                metrics = evaluation_results['summary'].get(detector_name, {})
-                
-                # 結果を保存
-                result = {
+            execution_time = end_time - start_time
+
+            # 結果をリストに追加
+            if evaluation_results and evaluation_results.get('status') == 'success':
+                # run_evaluation から返されるサマリー指標を取得
+                metrics = evaluation_results.get('summary', {}).get(detector_name, {}) # detector_name キーの下にあると想定
+                if not metrics:
+                    logger.warning(f"実行 {run_id}: 評価結果からメトリクスが見つかりませんでした。evaluation_results: {evaluation_results}")
+
+                results.append({
                     'run_id': run_id,
                     'params': params,
                     'metrics': metrics,
-                    'execution_time': end_time - start_time
-                }
-                
-                results.append(result)
-                
-                # グリッドサーチ結果をJSONに保存
-                grid_search_result_path = os.path.join(run_output_dir, 'grid_search_result.json')
-                with open(grid_search_result_path, 'w', encoding='utf-8') as f:
-                    json.dump(result, f, cls=NumpyEncoder, indent=2, ensure_ascii=False)
-                
+                    'execution_time': execution_time,
+                    # 'result_json_path': evaluation_results.get('summary_path') # 個々のJSONパスは不要かも
+                })
+                logger.info(f"実行 {run_id} 完了 ({execution_time:.2f}秒)")
             else:
-                logger.error(f"実行 {run_id} の評価に失敗しました")
-                
+                 logger.error(f"実行 {run_id} で評価エラーが発生しました: {evaluation_results.get('error') if evaluation_results else '不明なエラー'}")
+                 # エラーが発生した場合も記録（必要に応じて）
+                 results.append({
+                     'run_id': run_id,
+                     'params': params,
+                     'metrics': {'error': evaluation_results.get('error', 'Unknown error') if evaluation_results else 'Unknown error'},
+                     'execution_time': time.time() - start_time,
+                     'error': True
+                 })
+
         except Exception as e:
-            logger.error(f"実行 {run_id} でエラーが発生しました: {str(e)}")
-            traceback.print_exc()
-            continue
-    
-    if not results:
-        logger.error("すべての評価が失敗しました")
-        return None
-    
-    # 結果をCSVに保存
-    csv_path = os.path.join(output_dir, 'grid_search_results.csv')
-    _save_results_to_csv(results, csv_path)
-    
-    # 最適なパラメータを見つける
-    category, metric = best_metric.split('.')
-    
-    def get_metric_value(result):
-        return result.get('metrics', {}).get(category, {}).get(metric, float('-inf'))
-    
-    best_result = max(results, key=get_metric_value)
-    
-    # 最適なパラメータをJSONに保存
-    best_params_path = os.path.join(output_dir, 'best_params.json')
-    with open(best_params_path, 'w', encoding='utf-8') as f:
-        json.dump({
-            'best_metric': best_metric,
-            'best_value': get_metric_value(best_result),
-            'params': best_result['params']
-        }, f, cls=NumpyEncoder, indent=2, ensure_ascii=False)
-    
-    # 全体のサマリーを作成
-    combined_summary = {
-        'grid_search_config': {
-            'detector': detector_name,
-            'best_metric': best_metric,
-            'num_combinations': len(param_combinations),
-            'num_completed': len(results)
-        },
+            tb_str = traceback.format_exc()
+            logger.error(f"実行 {run_id}中に予期せぬエラーが発生しました: {e}\n{tb_str}")
+            results.append({
+                'run_id': run_id,
+                'params': params,
+                'metrics': {'error': f"Unexpected error: {e}"},
+                'execution_time': time.time() - start_time,
+                'error': True,
+                'traceback': tb_str # トレースバックも記録 (オプション)
+            })
+
+    # 最適な結果を見つける
+    best_result = None
+    best_score = -float('inf')
+
+    # best_metric の形式 'category.metric' を分割
+    metric_parts = best_metric.split('.')
+    if len(metric_parts) != 2:
+        logger.error(f"不正な best_metric 形式: {best_metric}。'category.metric' 形式で指定してください。デフォルトの 'note.f_measure' を使用します。")
+        best_metric = 'note.f_measure'
+        metric_category, metric_name = 'note', 'f_measure'
+    else:
+        metric_category, metric_name = metric_parts
+
+    for result in results:
+        # エラーのない結果のみを対象とする
+        if 'error' not in result.get('metrics', {}):
+            # 正しいカテゴリとメトリック名を指定してスコアを取得
+            score = result.get('metrics', {}).get(metric_category, {}).get(metric_name)
+            if score is not None:
+                # score が辞書や他の非数値型でないことを確認
+                if isinstance(score, (int, float)):
+                    if score > best_score:
+                        best_score = score
+                        best_result = result
+                else:
+                    logger.warning(f"Run {result.get('run_id')}: メトリクス '{best_metric}' の値が数値ではありません ({type(score)}): {score}")
+            # else: メトリクスが見つからない場合 (run_evaluation の結果構造が変わった場合など)
+            #     logger.warning(f"Run {result.get('run_id')}: メトリクス '{best_metric}' が結果に見つかりません。利用可能なメトリクス: {result.get('metrics', {}).keys()}")
+
+    if best_result:
+        logger.info(f"最適なパラメータが見つかりました (Metric: {best_metric}): {best_result['params']} (Score: {best_score:.4f})")
+    else:
+        logger.warning("有効な評価結果が見つからなかったため、最適なパラメータを決定できませんでした。")
+
+    # 結果をJSONとCSVに保存 (output_dir 直下に保存)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_json_path = os.path.join(output_dir, f'grid_search_results_{timestamp}.json')
+    results_csv_path = os.path.join(output_dir, f'grid_search_summary_{timestamp}.csv')
+
+    output_data = {
+        'timestamp': timestamp,
+        'detector': detector_name,
+        'param_grid': param_grid,
+        'best_metric': best_metric,
         'best_result': best_result,
         'all_results': results
     }
-    
-    # 全体サマリーを保存
-    combined_summary_path = os.path.join(output_dir, 'combined_evaluation_summary.json')
-    with open(combined_summary_path, 'w', encoding='utf-8') as f:
-        json.dump(combined_summary, f, cls=NumpyEncoder, indent=2, ensure_ascii=False)
-    
-    return best_result 
+
+    try:
+        with open(results_json_path, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, indent=2, ensure_ascii=False, cls=NumpyEncoder)
+        logger.info(f"グリッドサーチ全結果をJSONに保存しました: {results_json_path}")
+
+        # CSV保存 (_save_results_to_csv を使用)
+        if results: # 結果がある場合のみCSV保存
+            _save_results_to_csv(results, results_csv_path)
+            logger.info(f"グリッドサーチサマリーをCSVに保存しました: {results_csv_path}")
+        else:
+            logger.warning("保存するグリッドサーチ結果がありません。CSVファイルは作成されません。")
+
+    except IOError as e:
+         logger.error(f"結果ファイルの保存中にエラーが発生しました: {e}")
+         # エラーが発生しても、関数の戻り値は返す
+    except Exception as e:
+         logger.error(f"結果のシリアライズまたは保存中に予期せぬエラー: {e}", exc_info=True)
+         # 予期せぬエラーでも戻り値は返す
+
+    return output_data # best_resultだけでなく、全結果を含む辞書を返す 

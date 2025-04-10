@@ -1,4 +1,35 @@
-# Byte-compiled / optimized / DLL files
+# Created by https://www.toptal.com/developers/gitignore/api/python,macos,linux,windows,visualstudiocode,pycharm+all,sublimetext
+# Edit at https://www.toptal.com/developers/gitignore?templates=python,macos,linux,windows,visualstudiocode,pycharm+all,sublimetext
+
+# ========================================
+# ======= Generated Outputs & Data =======
+# ========================================
+/output/
+# /mcp_workspace/ # Or /.mcp_server_data/ if renamed later
+/.mcp_server_data/
+
+# ========================================
+# ======== Database, Logs & Temp ========
+# ========================================
+*.db
+*.db-journal
+*.log
+*.bak
+*.tmp
+*.swp
+*~
+.*.swp
+.*.swo
+
+# ========================================
+# ====== Environment Specific Files ======
+# ========================================
+.env # IMPORTANT: Never commit secrets!
+.env.* # Include specific .env files like .env.development if needed, but be careful!
+
+# ========================================
+# ========= Python Specific Files ========
+# ========================================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -20,57 +51,199 @@ parts/
 sdist/
 var/
 wheels/
+pip-wheel-metadata/
+share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+MANIFEST
 
-# env
-.env
+# PyInstaller
+*.manifest
+*.spec
 
-# Virtualenv
-venv/
-env/
-ENV/
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
 
-# IDEs and editors
-.idea/
-.vscode/
-.cursor/
-*.swp
-*.swo
-.DS_Store
+# Django stuff:
+# *.log # Already covered above
+local_settings.py
+# db.sqlite3 # Already covered by *.db
+# db.sqlite3-journal # Already covered by *.db-journal
 
-# Project specific
-# data ディレクトリの中身をignore
-datasets/*
-!datasets/.gitkeep
-!datasets/synthesized/
-# algos ディレクトリの中身をignore
-!algos/.gitkeep
-# evaluation_results ディレクトリの中身をignore
-evaluation_results/*
-!evaluation_results/.gitkeep
-# grid_search_results ディレクトリの中身をignore
-grid_search_results/*
-!grid_search_results/.gitkeep
-# mcp_workspace ディレクトリの中身をignore
-mcp_workspace/*
-!mcp_workspace/.gitkeep
-# src/detectors ディレクトリで特定ファイル以外をignore
-src/detectors/**/*.*
-!src/detectors/__init__.py
-!src/detectors/base_detector.py
-!src/detectors/criteria_detector.py
-!src/detectors/pzstd_detector.py
+# Flask stuff:
+instance/
+.webassets-cache
 
-# Test
-.pytest_cache/
-coverage.xml
-.coverage
-.coverage.*
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# IPython
+profile_default/
+ipython_config.py
+
 # pyenv
-.python-version 
+.python-version
+
+# pipenv
+# Pipfile.lock # Recommended to keep in version control
+
+# PEP 582; used by PDM, Flit and potentially other packaging tools.
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# ========================================
+# ======== Virtual Environments ========
+# ========================================
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ========================================
+# ======== Test & Coverage Reports =======
+# ========================================
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# ========================================
+# =========== OS Specific Files ==========
+# ========================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon # Icon must end with two \r
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Linux
+# *~ # Covered above
+.directory
+.Trash-*/
+*.pid
+*.seed
+*.sock
+
+# Windows
+Thumbs.db
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msm
+*.msp
+*.lnk
+
+# ========================================
+# =========== IDE Specific Files =========
+# ========================================
+# VisualStudioCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+.history/
+*.vsix
+
+# SublimeText
+*.tmlanguage.cache
+*.tmPreferences.cache
+*.stTheme.cache
+*.sublime-project
+*.sublime-workspace
+.sublimelinterrc
+# *.php~ # Covered above
+# *.tmp # Covered above
+*.sublime-snippet
+Package Control.last-run
+Package Control.ca-list
+Package Control.cache/
+Package Control.ca-bundle
+Package Control.system-ca-bundle
+Package Control.user-ca-bundle
+
+# PyCharm
+.idea/
+*.iws
+
+#========================================
+# Translations (add if needed)
+# *.mo
+# *.pot
+#========================================
+
+# Other specific files to ignore (add if necessary)
+
+# Backup files (already covered partially above)
+*.orig
+*.rej
+
+# End of https://www.toptal.com/developers/gitignore/api/python,macos,linux,windows,visualstudiocode,pycharm+all,sublimetext 

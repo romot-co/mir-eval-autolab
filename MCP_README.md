@@ -1,220 +1,233 @@
-# MIR アルゴリズム自動改善 (MCP/AutoImprover 詳細)
+# MCP サーバー & AI 自動改善システム (AutoImprover) 詳細README
 
-**注意:** ここで説明する機能は**実験的**であり、活発な開発下にあります。安定性や結果の品質は保証されません。基本的な評価フレームワークの使い方については、メインの `README.md` を参照してください。
+## 1. 概要
 
-## 1. システム概要 (AI駆動自動改善)
+このドキュメントは、MIRアルゴリズムのAI駆動自動改善システム、特に **MCP (Music Creation Platform) サーバー** と **AutoImprover クライアント** の詳細について説明します。これは実験的な機能であり、アルゴリズムの性能向上プロセスを自動化する可能性を探ることを目的としています。
 
-本システムは、音楽情報検索 (MIR) アルゴリズムの開発、評価、改善のプロセスにAI (大規模言語モデル、LLM) を組み込み、**アルゴリズム自体の自動的な発見と進化**を目指す実験的な研究プラットフォームです。
+**注意:** このシステムは開発途上であり、安定性や結果の品質は保証されません。
 
-**コアコンポーネント:**
+**主なコンポーネント:**
 
-*   **MCPサーバー (`mcp_server.py`):** ModelContextProtocol (MCP) に準拠したAPIサーバー。アルゴリズムのコード操作、評価実行、パラメータ探索、LLM連携などの「ツール」を提供します。非同期ジョブ管理、セッション管理（DB使用）も行います。
-*   **AutoImprover クライアント (`auto_improver.py`):** MCPサーバーのツールを利用して、AI駆動の自動改善サイクル（評価→分析→戦略決定→コード改善/パラメータ調整→評価…）を実行するクライアントアプリケーション。
-*   **LLM (例: Anthropic Claude):** サーバー側のツールから呼び出され、コード改善案の生成、評価結果の分析、次の改善戦略の提案など、インテリジェントなタスクを担当します。
-*   **Claude Desktop (オプション):** MCPサーバーのツールを対話的に呼び出し、改善プロセスをステップバイステップで実行・監視するためのインターフェース。
+*   **MCP サーバー (`src/cli/mcp_server.py`):**
+    *   FastAPI と Uvicorn をベースにしたWebサーバー。
+    *   アルゴリズム評価、グリッドサーチ、コード操作、可視化などの機能を**ツール**として提供します。
+    *   LLM (現在 Anthropic Claude を想定) と連携し、プロンプトに基づいてツールを呼び出します。
+*   **AutoImprover クライアント (`src/cli/auto_improver.py`):**
+    *   MCPサーバーに対して、アルゴリズムの自動改善サイクル（評価 → LLMによる改善提案 → 改善適用 → 再評価）を開始するCLIツール。
+    *   改善の目標や使用する検出器、データセットなどを指定します。
+*   **Claude Desktop 連携 (オプション, `src/cli/setup_claude_integration.py`):**
+    *   Claude Desktop アプリケーションとの連携を設定し、よりインタラクティブな改善プロセスを可能にします (実験的)。
 
-**目指す動作フロー:**
+## 2. システムの動作フロー
 
-1.  ユーザーがベースアルゴリズムと目標を指定して `auto_improver.py` を起動。
-2.  AutoImproverがMCPサーバーでセッションを開始。
-3.  AutoImproverが初期評価 (`run_evaluation`) を実行。
-4.  AutoImproverが評価結果を分析 (`analyze_evaluation_results` - 内部でLLM呼び出し) させる。
-5.  AutoImproverが分析結果と履歴から次の戦略を提案 (`suggest_exploration_strategy` - 内部でLLM呼び出し) させる。
-6.  提案された戦略に基づき、AutoImproverが対応するツール（`improve_code`, `optimize_parameters` など）を呼び出す。`improve_code` の場合は分析結果や仮説もプロンプトに含める。
-7.  改善/最適化されたアルゴリズムをAutoImproverが評価 (`run_evaluation`)。
-8.  結果を比較し、最良版を更新。
-9.  ループを指定回数または収束するまで繰り返す。
+1.  **MCPサーバーの起動:** `python -m src.cli.mcp_server` でサーバーを起動します。設定 (`config.yaml`, `.env`) を読み込み、データベース接続、ジョブワーカーを初期化します。
+2.  **(ユーザー) AutoImprover の実行:** `python -m src.cli.auto_improver` で改善プロセスを開始します。ターゲット検出器、データセット、目標などを指定します。
+3.  **(AutoImprover) 改善セッション開始:** AutoImprover は MCPサーバーに「改善セッションの開始」をリクエストします。
+4.  **(MCPサーバー) 初期評価:** サーバーは指定された検出器とデータセットで初期評価を実行します (非同期ジョブ)。
+5.  **(MCPサーバー) LLM への改善依頼:** 初期評価結果に基づき、LLM (Claude) に改善戦略の提案と具体的なコード変更を依頼します。この際、サーバーが提供するツール (コード取得、評価実行など) を LLM が利用できるようプロンプトを構成します。
+6.  **(LLM) 改善提案とツール利用:** LLM は改善案を考え、必要に応じてMCPサーバーのツール (例: `get_code`, `run_evaluation`) を呼び出して情報を収集・検証します。
+7.  **(MCPサーバー) ツール実行:** LLM からのリクエストに応じて、対応するツール (関数) を実行し、結果をLLMに返します (評価などは非同期ジョブとして実行)。
+8.  **(LLM) 改善コード生成:** LLM は最終的な改善コードを生成します。
+9.  **(MCPサーバー) 改善コード保存:** MCPサーバーはLLMから受け取った改善コードを `mcp_workspace/improved_versions/` 配下に保存します。
+10. **(MCPサーバー) 改善後評価:** 保存された改善コードを使って再度評価を実行します (非同期ジョブ)。
+11. **(MCPサーバー) 結果報告:** 改善前後の評価結果を比較し、AutoImprover (または直接のAPI呼び出し元) に報告します。
+12. **(繰り返し):** AutoImprover の設定に基づき、改善が見られる場合はステップ 5-11 を繰り返します。
 
-## 2. セットアップ手順 (AI自動改善機能向け)
+## 3. セットアップ (AI 自動改善機能向け)
 
-基本的なセットアップ (Python環境、`uv` の導入、仮想環境作成) はメインの `README.md` の「3. セットアップ (`uv` 使用)」を参照してください。AI自動改善機能には追加のステップが必要です。
+基本的なセットアップは `README.md` の「3. セットアップ」に従ってください。以下はAI機能に特有の追加設定です。
 
-### 2.1 依存ライブラリの確認
+1.  **依存関係の確認:**
+    *   `pyproject.toml` の `[tool.uv.sources]` または `[project.optional-dependencies]` に `mcp` や `anthropic` 関連の依存関係が含まれていることを確認します。
+    *   `uv pip install -e .[dev,numba,crepe,mcp]` や `uv pip sync requirements-lock.txt` (推奨、事前に `uv pip compile ... --all-extras`) などで関連パッケージ (`fastapi`, `uvicorn`, `anthropic`, `aiosqlite` 等) がインストールされていることを確認します。
 
-`uv` を使用して依存関係をインストールする際に、必要なライブラリが `pyproject.toml` に含まれていることを確認してください。
+2.  **環境変数と設定 (`.env`, `config.yaml`):**
+    `.env` ファイルまたは環境変数で以下を設定します。
+    *   `ANTHROPIC_API_KEY`: Anthropic Claude API キー。
+    *   `MIREX_WORKSPACE`: MCPサーバーが作業ファイル (DB、改善コード、結果、ログ) を保存する**絶対パス**。デフォルトはプロジェクトルート下の `mcp_workspace` ですが、明示的な絶対パス指定を推奨します。
+    *   **(オプション) `MCP__SERVER__HOST`, `MCP__SERVER__PORT`:** サーバーのホストとポート (デフォルト: `localhost`, `5002`)。
+    *   **(オプション) `MCP__DATABASE__PATH`:** データベースファイルのパス。デフォルトは `<MIREX_WORKSPACE>/db/mcp_server_state.db`。
+    *   **(オプション) `MCP__IMPROVED_CODE__DIR`:** 改善コード保存ディレクトリ。デフォルトは `<MIREX_WORKSPACE>/improved_versions`。
+    *   **(オプション) `MCP__RESULTS__DIR`:** 評価結果保存ディレクトリ。デフォルトは `<MIREX_WORKSPACE>/results`。
+    *   **(オプション) `MCP__LOG__DIR`:** ログ保存ディレクトリ。デフォルトは `<MIREX_WORKSPACE>/logs`。
+    *   **(オプション) `DATASETS_BASE_DIR`:** データセットディレクトリのベースパス。デフォルトはプロジェクトルート下の `datasets`。
+    *   **(オプション) `ANTHROPIC_API_MODEL`:** 使用する Claude モデル名 (デフォルト: `claude-3-opus-20240229`)。
 
-*   `mcp-fastmcp`: MCPサーバー/クライアントの基盤ライブラリ。
-*   `fastapi`, `uvicorn`: MCPサーバーのWebフレームワークとASGIサーバー。
-*   `requests`, `httpx`: クライアントからのHTTPリクエスト用。
-*   `pyyaml`: 設定ファイル (`config.yaml`) の読み込み用。
-*   `numpy`, `pandas`: データ処理用。
-*   `tenacity`: リトライ処理用 (LLM API呼び出しなど)。
-*   `python-dotenv`: `.env` ファイルからの環境変数読み込み用。
-*   必要なLLMクライアントライブラリ (例: `anthropic`, `openai`)。
+    **設定の優先順位:** 環境変数 > `.env` ファイル > `config.yaml`
+    詳細は `src/mcp_server_logic/core.py` の `load_config` 関数を参照してください。
 
-`uv pip install -e .[dev,numba,crepe]` またはロックファイル (`requirements-lock.txt` など) を使用した `uv pip sync` でインストールされます。
-
-### 2.2 ワークスペースと設定
-
-*   **ワークスペース:** スクリプト実行時に `mcp_workspace` ディレクトリが自動生成されます (場所は環境変数 `MIREX_WORKSPACE` または `config.yaml` で指定可能)。この中にセッション状態DB (`mcp_server_state.db`)、改善版コード、ログなどが保存されます。
-*   **設定ファイル (`config.yaml`):** プロジェクトルートの `config.yaml` で、サーバー設定、パス、リソース制限、クリーンアップ設定、LLMモデル、データセットなどを構成できます。構造は機能ごとに整理されています。
-*   **環境変数 (`.env`):** プロジェクトルートに `.env` ファイルを作成 (または `.env.example` をコピー) し、以下の**必須**またはオプションの変数を設定します。**環境変数は `config.yaml` の値を上書きします。**
-    *   `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`: (条件付き必須) 利用するLLMのAPIキー。
-    *   `MIREX_WORKSPACE`: (推奨) ワークスペースディレクトリのパス。指定しない場合は `./mcp_workspace` が試みられますが、書き込み権限などの問題が発生する可能性があります。
-    *   `MCP_SERVER_URL`: (任意) クライアントが接続するMCPサーバーのURL (デフォルト: `http://localhost:5002`)。
-    *   `MCP_PORT`: (任意) MCPサーバーがリッスンするポート (デフォルト: 5002)。
-    *   その他、`config.yaml` の値を上書きするための環境変数。
-        *   命名規則: `MCP__SECTION__KEY=value` (例: `MCP__LLM__MODEL=gpt-4`, `MCP__SERVER__LOG_LEVEL=DEBUG`)
-        *   詳細は `mcp_server_logic/core.py` の `load_config` 関数の Docstring を参照してください。
-
-### 2.3 Claude Desktop用設定 (オプション)
-
-Claude DesktopアプリからMCPサーバーのツールを直接操作したい場合、以下のコマンドで連携設定を行います。
-
-```bash
-python setup_claude_integration.py --open-claude
-```
-
-*   `--open-claude`: 設定適用後にClaude Desktopアプリを起動します。
-*   `--config-path`: (オプション) Claude Desktopの設定ファイルパスを指定します。
-
-このコマンドは `~/Library/Application Support/Claude/storage/config.json` (macOSの場合) を更新し、MCPサーバー情報、ツール定義、プロンプトテンプレートなどを追加します。
-
-## 3. 利用方法 (AI自動改善)
-
-### 3.1 MCPサーバーの起動 (必須)
-
-AI自動改善機能を利用するには、まずMCPサーバーが起動している必要があります。
-
-```bash
-# 仮想環境を有効化していることを確認
-python mcp_server.py [--port <ポート番号>] [--log-level <レベル>] [--config <設定ファイル>] [--workspace <パス>] [--num-workers <数>]
-```
-
-*   サーバーはAPIリクエストを待ち受け、非同期ジョブを実行します。
-*   `--config`: デフォルト (`config.yaml`) 以外の設定ファイルを指定する場合。
-*   `--workspace`: `.env` や `config.yaml` の設定を上書きする場合。
-*   サーバー起動時にデータベース (`mcp_workspace/db/mcp_server_state.db`) が初期化されます。
-*   サーバー起動時にパス検証用の許可ディレクトリリストが `config.yaml` から読み込まれます。
-
-### 3.2 自動改善サイクルの実行 (`auto_improver.py`)
-
-コマンドラインから自動改善プロセス全体を開始します。
-
-```bash
-# 仮想環境を有効化していることを確認
-python auto_improver.py --detector <検出器名> [--goal <目標>] [--iterations <回数>] [--server-url <URL>] [--config-file <設定ファイル>]
-```
-
-*   `--detector`: 改善対象のベースとなる検出器名。
-*   他オプションは以前と同様。
-*   `--config-file`: (New!) AutoImprover 固有の設定を記述したYAMLファイルのパス。
-
-実行すると、`auto_improver.py` がクライアントとして動作し、MCPサーバーの各種ツールを呼び出しながら改善サイクルを進めます。進捗はログに出力され、セッション状態はサーバーのDBに記録されます。
-
-### 3.3 Claude Desktopでの対話的操作 (オプション)
-
-`setup_claude_integration.py` で設定後、Claude DesktopからMCPツールを個別に呼び出して、対話的に改善プロセスを進めることも可能です。
-
-1.  Claude Desktopを起動します。
-2.  ハンマーアイコン (🔨) をクリックし、「mirex-auto-improver」サーバーを選択してツールを有効化します。
-3.  チャット入力欄で `@tool <ツール名>(引数=値, ...)` の形式でツールを呼び出します。
+3.  **ワークスペースディレクトリの作成:**
+    `MIREX_WORKSPACE` で指定したディレクトリが存在しない場合は作成してください。
+    ```bash
+    mkdir -p <MIREX_WORKSPACEで指定したパス>
     ```
-    # 例: セッション開始
-    @tool start_session(base_algorithm="PZSTDDetector")
+    サーバーは起動時にサブディレクトリ (`db`, `improved_versions`, `results`, `logs`) を自動生成しようとします。
 
-    # 例: 評価実行 (ジョブIDが返る)
-    @tool run_evaluation(detector_name="PZSTDDetector", dataset_name="synthesized_v1")
+## 4. 使用方法
 
-    # 例: ジョブステータス確認
-    @tool get_job_status(job_id="返ってきたジョブID")
-    ```
-4.  ワークフローについては `@prompt workflow-guide` でガイドを表示できます。
+### 4.1. MCP サーバーの起動
 
-### 3.4 利用可能なMCPツール一覧 (`mcp_server.py` 提供)
+ターミナルで以下を実行します。
 
-*   `health_check`: サーバー動作確認。
-*   `start_session`: 改善セッション開始。
-*   `get_session_info`: セッション情報取得。
-*   `add_session_history`: セッション履歴追加（主に内部/クライアントが使用）。
-*   `get_job_status`: 非同期ジョブ状態確認。
-*   `get_code`: 検出器コード取得。
-*   `save_code`: 改善コード保存。
-*   `improve_code`: (LLM) コード改善依頼 (非同期ジョブ)。
-*   `run_evaluation`: 検出器評価実行 (非同期ジョブ)。
-*   `run_grid_search`: 設定ファイルに基づくグリッドサーチ実行 (非同期ジョブ)。
-*   `analyze_evaluation_results`: (LLM) 評価結果分析 (非同期ジョブ)。
-*   `generate_hypotheses`: (LLM) 科学的仮説生成 (非同期ジョブ)。
-*   `analyze_code_segment`: (LLM) コード断片分析 (非同期ジョブ)。
-*   `suggest_parameters`: (LLM) パラメータ調整範囲提案 (非同期ジョブ)。
-*   `optimize_parameters`: (LLM+GridSearch) パラメータ自動提案と最適化 (非同期ジョブ)。
-*   `suggest_exploration_strategy`: (LLM) 次の改善戦略提案 (非同期ジョブ)。
-*   `visualize_improvement_trajectory`: 改善軌跡グラフ生成 (非同期ジョブ)。
-*   `create_thumbnail`: 画像サムネイル生成。
-*   `visualize_spectrogram`: スペクトログラム画像生成。
-*   `process_audio_files`: 複数音声ファイル処理 (Context使用例)。
-*   **(拡張機能)** `visualize_code_impact`, `generate_performance_heatmap`, `generate_scientific_outputs`: 可視化・科学的成果物生成ツール (`mcp_server_extensions.py` が存在する場合)。
-*   **注意:** パスを引数に取るツール (`run_evaluation`, `run_grid_search`, `get_code`, `save_code` など) は、入力されたパスがサーバー側で許可されたディレクトリ内にあるか検証します。
+```bash
+python -m src.cli.mcp_server --host 0.0.0.0 --port 5002
+```
 
-## 4. 自動改善プロセスの詳細 (AutoImprover)
+*   `--host`: サーバーがリッスンするホストアドレス。コンテナ環境や外部からのアクセスを許可する場合は `0.0.0.0` を指定します。
+*   `--port`: サーバーがリッスンするポート番号。
+*   設定は `config.yaml`, `.env`, 環境変数からも読み込まれます。
 
-`auto_improver.py` 内の `run_improvement_cycle` メソッドが中心となり、以下のステップを繰り返します。
+サーバーは起動ログ（設定、DBパス、利用可能なツールなど）を出力し、リクエスト待機状態になります。**Ctrl+C で停止**できます。
 
-1.  **戦略決定:** `suggest_exploration_strategy` を呼び出し、現在の状況（パフォーマンス、停滞具合、履歴）に基づいて次のアクション（`improve_code`, `optimize_parameters`, `generate_hypothesis` など）を決定します。
-2.  **アクション実行:** 決定されたアクションに対応するMCPツールを呼び出します。
-    *   **コード改善の場合:** `analyze_evaluation_results` で得られた弱点や、`generate_hypotheses` で得られた仮説をプロンプトに含めて `improve_code` を呼び出します。
-    *   **パラメータ最適化の場合:** `optimize_parameters` を呼び出します。
-    *   **仮説生成の場合:** `generate_hypotheses` を呼び出し、得られた仮説を次の改善の指針とします。
-3.  **評価:** コード改善やパラメータ最適化が行われた場合、`run_evaluation` を呼び出して新しいバージョンの性能を評価します。
-4.  **状態更新:** 評価結果を比較し、性能が向上していれば最良バージョン情報を更新します。改善履歴や戦略履歴も記録します。
-5.  **状態保存:** 現在のサイクル状態 (`self.cycle_state`) をファイルに保存し、中断・再開を可能にします。
+### 4.2. AutoImprover の実行 (改善サイクルの開始)
 
-## 5. トラブルシューティング
+別のターミナルで以下を実行します。
+
+```bash
+python -m src.cli.auto_improver \
+    --detector PZSTDDetector \
+    --dataset synthesized_v1 \
+    --metric note.f_measure \
+    --goal "Increase F-measure by improving onset accuracy" \
+    --max-iterations 3 \
+    --mcp-server-url http://localhost:5002
+```
+
+*   `--detector`: 改善対象の検出器クラス名。
+*   `--dataset`: 評価に使用するデータセット名 (`config.yaml` で定義)。
+*   `--metric`: 改善の主要評価指標 (例: `note.f_measure`, `frame.accuracy`)。
+*   `--goal`: LLM に伝える改善目標 (自由記述)。
+*   `--max-iterations`: 最大試行回数。
+*   `--mcp-server-url`: 実行中の MCP サーバーの URL。
+*   **(オプション) `--session-id`:** 既存のセッションを再開する場合に指定。
+*   **(オプション) `--output-dir`:** 結果サマリの保存先。**注意: これはクライアント側のパスです。**
+
+AutoImprover は MCP サーバーと通信し、改善プロセスを開始します。進捗はターミナルに出力されます。
+
+### 4.3. 評価とグリッドサーチ (CLI経由)
+
+`README.md` の「4. 基本的な使用方法」で説明されている `evaluate` および `grid-search` コマンドは、内部的に実行中の MCP サーバーの API を呼び出します。
+
+**例:**
+
+```bash
+# MCPサーバーが起動している前提
+python -m src.cli.improver_cli evaluate --detector PZSTDDetector --dataset synthesized_v1 --output-dir mcp_workspace/results/my_eval
+
+python -m src.cli.improver_cli grid-search grid_config.yaml --output-dir mcp_workspace/results/my_grid --best-metric note.f_measure
+```
+
+*   これらのコマンドは MCP サーバーに**非同期ジョブ**をリクエストします。
+*   実行後、ジョブIDが返されます。
+*   結果はサーバー側の `mcp_workspace/results` (または設定による) 配下の指定されたディレクトリに保存されます。
+*   ジョブのステータス確認や結果取得は、現時点では MCP サーバーの API を直接叩くか、データベース (`mcp_server_state.db`) を確認する必要があります (専用のCLIツールは未実装)。
+
+### 4.4. (実験的) Claude Desktop 連携
+
+`src/cli/setup_claude_integration.py` を使用して設定します。詳細はスクリプト内のコメントや `--help` を参照してください。これにより、Claude Desktop から直接 MCP サーバーのツールを呼び出すことが可能になる場合があります (Anthropic の機能に依存)。
+
+## 5. MCP サーバーのツール (LLM が利用)
+
+MCP サーバーは、LLM がアルゴリズム改善のために利用できる様々なツール (Python関数) を公開しています。これらのツールは FastAPI ルートとして公開され、LLM (Anthropic API の Tool Use 機能) から呼び出されます。
+
+主なツールカテゴリ:
+
+*   **評価ツール (`mcp_server_logic/evaluation_tools.py`):**
+    *   `run_evaluation`: 指定された検出器、データセット、パラメータで評価を実行 (非同期ジョブ)。
+    *   `run_grid_search`: グリッドサーチを実行 (非同期ジョブ)。
+*   **コードツール (`mcp_server_logic/code_tools.py`):**
+    *   `get_code`: 指定された検出器クラスのソースコードを取得。
+    *   `save_improved_code`: LLM が生成した改善コードを保存。
+    *   `list_available_detectors`: 利用可能な検出器クラスの一覧を取得。
+*   **改善ループツール (`mcp_server_logic/improvement_loop.py`):**
+    *   `propose_improvement_strategy`: 現在の評価結果に基づき、LLM に改善戦略を提案させる。
+    *   `implement_code_changes`: LLM に具体的なコード変更を実装させる。
+*   **可視化ツール (`mcp_server_logic/visualization_tools.py`):**
+    *   `generate_comparison_plot`: 評価結果の比較プロットを生成 (非同期ジョブ)。
+*   **ジョブ管理ツール (`mcp_server_logic/job_manager.py` API経由):**
+    *   `get_job_status`: 指定されたジョブIDの状態（実行中, 完了, エラー）を取得。
+    *   `get_job_result`: 完了したジョブの結果を取得。
+*   **セッション管理ツール (`mcp_server_logic/session_manager.py` API経由):**
+    *   `start_improvement_session`: 新しい改善セッションを開始。
+    *   `get_session_history`: セッションの履歴 (実行されたツール、結果など) を取得。
+*   **(オプション) 拡張ツール (`mcp_server_logic/mcp_server_extensions.py`):**
+    *   プロジェクト固有のカスタムツールを追加できます。
+
+これらのツールは `src/cli/mcp_server.py` で FastAPI アプリケーションに登録され、Anthropic API との連携部分 (`mcp_server_logic/llm_tools.py`) で利用されます。
+
+## 6. データベース (`mcp_server_state.db`)
+
+MCP サーバーは状態管理のために SQLite データベースを使用します。デフォルトでは `mcp_workspace/db/mcp_server_state.db` に作成されます。`aiosqlite` を使用して**非同期**でアクセスされます。
+
+主なテーブル:
+
+*   `jobs`: 非同期ジョブの情報を格納 (job_id, task_name, status, created_at, result など)。
+*   `improvement_sessions`: 自動改善セッションの情報を格納 (session_id, detector, dataset, goal, status, history など)。
+
+データベーススキーマの詳細は `mcp_server_logic/db_utils.py` の `initialize_database` 関数を参照してください。
+
+## 7. トラブルシューティング
 
 *   **サーバーが起動しない:**
-    *   ポート競合、依存関係不足 (`uv pip sync` または `uv pip install` を確認)、Pythonバージョンを確認。
-    *   設定ファイル (`config.yaml`) のパスや内容が正しいか確認。
-    *   ワークスペースディレクトリの権限を確認。
-    *   ログ (`mcp_server.log` 等) を確認。
-*   **LLM APIエラー:**
-    *   `.env` のAPIキー設定、インターネット接続、サービス障害、使用量制限を確認。
-*   **ジョブが進まない (`pending`/`queued`):**
-    *   サーバーログを確認 (ワーカーエラー)。
-    *   `config.yaml` の `resource_limits.max_concurrent_jobs` 設定を確認。
-    *   DB (`mcp_workspace/db/mcp_server_state.db`) の状態を確認。
-*   **ファイル/パス関連エラー:**
-    *   サーバープロセスがワークスペースやデータセットディレクトリへの読み書き権限を持っているか確認。
-    *   クライアントから指定したパスが、サーバーの `config.yaml` で許可されたベースディレクトリ内にあるか確認 (`FileError: 指定されたパスは許可されたディレクトリ内にありません` エラー)。
-    *   指定したファイルが存在するか、ファイル/ディレクトリ種別が正しいか確認 (`FileError: 指定されたパスが存在しません` / `...ファイルではありません` / `...ディレクトリではありません` エラー)。
-*   **`ValueError` / `FileError` / `ConfigError` (ツール呼び出し時):**
-    *   MCPツールに渡した引数（特にパス）が不正であるか、サーバー側の検証でエラーになった可能性があります。サーバーログとツールのDocstringを確認してください。
+    *   ポートが既に使用されていないか確認 (`netstat` や `lsof` コマンド)。
+    *   必要な依存関係 (`fastapi`, `uvicorn`, `aiosqlite` 等) がインストールされているか確認。
+    *   設定ファイル (`config.yaml`, `.env`) のパスや内容が正しいか確認。
+    *   `MIREX_WORKSPACE` ディレクトリの書き込み権限があるか確認。
+*   **AutoImprover がサーバーに接続できない:**
+    *   サーバーが正しく起動しており、指定した URL (`--mcp-server-url`) が正しいか確認。
+    *   ファイアウォール設定を確認。
+*   **LLM API エラー:**
+    *   `ANTHROPIC_API_KEY` が正しく設定されているか確認。
+    *   APIキーの利用制限や支払い状況を確認。
+    *   Anthropic のサービスステータスを確認。
+*   **ジョブが `pending` または `running` のまま進まない:**
+    *   サーバーログ (`mcp_workspace/logs/mcp_server.log`) でエラーが発生していないか確認。
+    *   サーバープロセスのリソース使用状況（CPU, メモリ）を確認。
+    *   評価やグリッドサーチ自体に時間がかかっている可能性。
+    *   `aiosqlite` の非同期処理に問題が発生していないか確認 (デバッグログ有効化など)。
+*   **ファイルパス関連のエラー:**
+    *   クライアント (AutoImprover, improver_cli) から渡されるパス (データセット、グリッド設定、出力先) が、サーバー側の設定 (`config.yaml` の `allowed_paths` や `MIREX_WORKSPACE`, `DATASETS_BASE_DIR`) で許可された範囲内にあるか確認。
+    *   特に `--output-dir` はサーバー側の `mcp_workspace/results` 配下に解決される点に注意。
+*   **データベースエラー:**
+    *   DBファイル (`mcp_server_state.db`) が破損していないか確認。
+    *   同時に複数のサーバープロセスが同じDBファイルに書き込もうとしていないか確認 (`aiosqlite` は非同期アクセスを扱いますが、プロセスレベルの競合は問題になる可能性)。
 
-**ログファイルの場所:**
+## 8. Dockerでの実行 (再掲)
 
-*   **MCPサーバーログ:** 通常、サーバーを起動したディレクトリに `mcp_server.log` (または設定による) が生成されます。
-*   **AutoImproverログ:** `auto_improver.py` の実行時にコンソールに出力されます (ファイル出力は未実装)。
-*   **Claude Desktop連携ログ:** `~/Library/Logs/Claude/mcp*.log` (macOSの場合)。
+`README.md` と同様に Docker を使用できます。
 
-## 6. まとめ
+1.  **イメージのビルド:** (`uv` とロックファイル推奨)
+    ```bash
+    uv pip compile pyproject.toml --all-extras -o requirements-lock.txt
+    docker build -t mirex-auto-improver .
+    ```
 
-このプロジェクトは、MIRアルゴリズムの評価基盤と、AIを活用した自動改善のための実験的プラットフォームを提供します。基本的な評価機能は安定していますが、AI自動改善機能は開発途上です。フィードバックを歓迎します。
+2.  **コンテナの実行 (MCPサーバー):**
+    ```bash
+    docker run -p 5002:5002 \
+           -e ANTHROPIC_API_KEY="<あなたのAPIキー>" \
+           -e MIREX_WORKSPACE="/app/mcp_workspace" \
+           -e MCP__SERVER__HOST="0.0.0.0" \
+           -v "$(pwd)/mcp_workspace":/app/mcp_workspace \
+           -v "$(pwd)/datasets":/app/datasets \
+           -v "$(pwd)/config.yaml":/app/config.yaml \
+           -v "$(pwd)/.env":/app/.env \
+           --rm -it mirex-auto-improver \
+           python -m src.cli.mcp_server --host 0.0.0.0 --port 5002
+    ```
+    *   **ホストは `0.0.0.0` を指定** してコンテナ外部からのアクセスを許可します。
+    *   必要な環境変数 (`ANTHROPIC_API_KEY`, `MIREX_WORKSPACE` など) を `-e` で渡します。コンテナ内のパス (`/app/mcp_workspace`) を指定します。
+    *   必要なディレクトリや設定ファイルを `-v` でマウントします。
 
-## インストール
+3.  **コンテナの実行 (AutoImprover クライアント):**
+    別のターミナルから、実行中のサーバーコンテナに対して AutoImprover を実行する場合:
+    ```bash
+    # ホストからコンテナ内のサーバー (localhost:5002) に接続する場合
+    # (ホスト側で仮想環境が有効になっている前提)
+    python -m src.cli.auto_improver --mcp-server-url http://localhost:5002 [その他の引数...]
 
-```bash
-# 1. リポジトリをクローン
-git clone <this_repository_url>
-cd <repository_directory>
-
-# 2. (推奨) 仮想環境を作成・有効化
-python -m venv venv
-source venv/bin/activate # Linux/macOS
-# venv\Scripts\activate # Windows
-
-# 3. 必要なライブラリをインストール
-pip install -r requirements.txt
-# poetry を使用する場合:
-# poetry install
-
-# 4. CREPE のインストール (ピッチ推定評価で使用する場合)
-pip install crepe
-# 注意: TensorFlow のバージョン互換性により問題が発生する場合があります。
-# 詳細は CREPE のドキュメントを参照してください: https://github.com/marl/crepe
-
-# 5. (オプション) 開発用ツールをインストール
-pip install -r requirements-dev.txt
-# poetry を使用する場合:
-# poetry install --with dev
-```
-
-## 設定
+    # または、別のコンテナからサーバーコンテナに接続する場合 (Dockerネットワーク設定が必要)
+    # 例: docker exec を使う場合
+    docker exec -it <サーバーコンテナ名またはID> \
+        python -m src.cli.auto_improver --mcp-server-url http://localhost:5002 [その他の引数...]
+    ```

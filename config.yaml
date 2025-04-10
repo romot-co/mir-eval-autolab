@@ -13,22 +13,28 @@ server:
 # === パス設定 ===
 # 注意: 各パスはプロジェクトルートからの相対パス、または絶対パスで指定。
 #       環境変数 (MIREX_*) で上書き可能。
-#       ワークスペースパス (workspace) は get_workspace_dir() で決定されるため、ここでは定義しない。
+#       ワークスペースパスは環境変数 MIREX_WORKSPACE またはデフォルト (./.mcp_server_data) で決まる。
 paths:
-  # デフォルトのデータ関連パス (ワークスペース内を想定)
-  data: data
-  audio: data/audio
-  reference: data/reference
-  # 生成されるファイルの出力先 (ワークスペース内を想定)
-  improved_versions: improved_versions
-  evaluation_results: evaluation_results
-  grid_search_results: grid_search_results
-  visualizations: visualizations
-  scientific_output: scientific_output
-  db: db # データベースファイル格納ディレクトリ
-  # ソースコード関連 (get_detector_path などで参照)
+  # --- Core Paths (Relative to project root or absolute) ---
+  # Workspace is determined by env var MIREX_WORKSPACE or defaults to '.mcp_server_data'
+  # workspace: ./.mcp_server_data # This will be handled by path_utils based on env/default
+
+  # --- Source Code Paths (Relative to project root) ---
   detectors_src: src/detectors
-  # templates: templates # プロンプトテンプレートなど (現状 .env で設定)
+  templates: src/templates # For paper/report generation
+
+  # --- Data Paths (Relative to project root or absolute) ---
+  # Base directory for all datasets (used if dataset paths below are relative)
+  datasets_base: datasets
+
+  # --- Output Base Path (Relative to project root or absolute) ---
+  # All generated results (eval, grid, viz, reports) will go into subdirs here.
+  output_base: output # Environment variable MIREX_OUTPUT_BASE can override this
+
+  # --- Workspace Subdirs (Relative to determined workspace path) ---
+  # These will be subdirectories *within* the workspace defined by MIREX_WORKSPACE or default
+  db: db # For mcp_server_state.db
+  improved_versions: improved_versions # AI-generated code
 
 # === リソース制限 ===
 resource_limits:
@@ -52,16 +58,13 @@ cleanup:
   job_completed_retention_seconds: 604800 # (7日) 完了/失敗ジョブの保持期間
   max_jobs_count: 500          # 最大保持ジョブ数 (古いものから削除)
   # ワークスペースファイルクリーンアップ
+  # 注意: ここで指定するのは `output_base` 内のサブディレクトリを識別するためのパターン (glob形式) か、
+  #       あるいは空リストにしておき、`clean_workspace.py` (またはサーバー内のクリーンアップロジック) に
+  #       タイムスタンプベースの削除を任せる。今回は後者を採用する。
   workspace:
     enabled: true
-    retention_days: 14 # 指定日数より古いファイルを削除
-    target_dirs: # 対象ディレクトリ (paths で定義されたキー名)
-      - evaluation_results
-      - grid_search_results
-      - improved_versions
-      - visualizations
-      - scientific_output
-      # - db # DBディレクトリは通常削除しない方が安全
+    retention_days: 14 # 指定日数より古いファイルを `output_base` 内から削除
+    target_dirs: [] # `output_base` 内を対象とし、タイムスタンプやパターンで賢く削除 (実装依存)
 
 # === 評価設定 ===
 evaluation:
@@ -97,7 +100,7 @@ llm:
   # --- OpenAI Specific --- #
   # api_base_openai: "https://api.openai.com/v1"
   # --- Common --- #
-  max_tokens: 4096 # 生成最大トークン数
+  max_tokens: 128000 # 生成最大トークン数
   timeout: ${MCP_LLM_TIMEOUT:-180} # API呼び出しタイムアウト(秒、環境変数優先)
   # retry_attempts: 3 # リトライ回数 (exception_utils で設定可能)
   # retry_delay: 1 # リトライ遅延 (秒, exception_utils で設定可能)
@@ -109,16 +112,20 @@ llm:
 datasets:
   synthesized_v1:
     description: "基本パターンを含む合成データセット"
-    # パスは paths セクションの値を参照するか、ここで上書き (絶対パス推奨)
-    audio_dir: ${MIREX_AUDIO_DIR:-datasets/synthesized/audio} # 環境変数優先
-    ref_dir: ${MIREX_LABEL_DIR:-datasets/synthesized/labels} # 環境変数優先
-    ref_pattern: "*.csv"
+    # パスは paths.datasets_base からの相対パス、または絶対パス
+    # path_utils.get_dataset_paths() で処理される
+    audio_dir: synthesized/audio # 相対パス (datasets_base 기준)
+    label_dir: synthesized/labels # 相対パス (datasets_base 기준)
+    audio_pattern: '*.wav'
+    label_pattern: '*.csv'
   # --- 他のデータセット例 --- #
   # medleydb_melody:
   #   description: "MedleyDB メロディサブセット"
-  #   audio_dir: /path/to/your/medleydb/audio
-  #   ref_dir: /path/to/your/medleydb/annotations/melody1
-  #   ref_pattern: "*_MELODY1.csv"
+  #   datasets_base: /path/to/your/medleydb # このデータセット固有のベースパス指定も可能
+  #   audio_dir: audio/subset
+  #   label_dir: annotations/melody1
+  #   audio_pattern: '*.wav'
+  #   label_pattern: '*_MELODY1.csv'
 
 # === 検出器デフォルトパラメータ (任意) ===
 # detectors:

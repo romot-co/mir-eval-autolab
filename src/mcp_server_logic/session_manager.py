@@ -95,7 +95,12 @@ async def get_session_info(config: Dict[str, Any], db_path: Path, session_id: st
         except StateManagementError as sme_update: # last_update 更新時のエラー
             logger.error(f"セッション last_update 更新 DBエラー ({session_id}): {sme_update}", exc_info=False)
             # 更新に失敗しても取得した情報自体は返せる場合もあるが、一貫性のためエラーとする
-            raise StateManagementError(f"Failed to update session access time: {sme_update}") from sme_update
+            # raise StateManagementError(f"Failed to update session access time: {sme_update}") from sme_update
+            # --- 修正: 更新失敗しても取得情報は返す --- #
+            logger.warning(f"セッション last_update 更新 DBエラー ({session_id})。取得情報はそのまま返します。: {sme_update}")
+            # エラーは発生させずに取得した情報を返す (履歴追加側で再試行などを検討)
+            # 必要に応じてエラー処理を再検討
+            return session_info # 更新失敗しても取得した row データは返す
         except Exception as e:
             logger.error(f"セッション情報処理/更新中に予期せぬエラー ({session_id}): {e}", exc_info=True)
             raise StateManagementError(f"Unexpected error processing session info: {e}") from e
@@ -118,6 +123,8 @@ async def add_session_history(
     """セッション履歴にイベントを追加し、cycle_state をアトミックに更新します (非同期、ロック付き)"""
     new_event = {"id": utils.generate_id(), "timestamp": utils.get_timestamp(), "type": event_type, "data": event_data}
     current_timestamp = new_event["timestamp"]
+
+    updated_session_info: Optional[Dict[str, Any]] = None # 更新後の情報を格納
 
     async with db_utils.db_lock: # --- DBロック開始 --- #
         try:
@@ -160,28 +167,17 @@ async def add_session_history(
                 params = (updated_history_json, current_timestamp, session_id)
                 log_msg_suffix = ""
 
-            # 4. DB更新を実行 (ロック内で実行)
-            #   同期ヘルパーではなく、直接SQLとパラメータを指定
-            conn = None
-            try:
-                conn = db_utils.get_db_connection(db_path)
-                cursor = conn.cursor()
-                cursor.execute(sql, params)
-                conn.commit()
-                logger.info(f"セッション履歴に '{event_type}' を追加しました (Session: {session_id})" + log_msg_suffix)
-            except sqlite3.Error as db_err_update:
-                 logger.error(f"セッション履歴/状態更新中にDBエラー: {db_err_update}", exc_info=True)
-                 if conn: conn.rollback()
-                 raise StateManagementError(f"DB error updating session history/state: {db_err_update}") from db_err_update
-            finally:
-                 if conn: conn.close()
+            # 4. DB更新を実行 (ロック内で実行、非同期関数を使用)
+            await db_utils.db_execute_commit_async(db_path, sql, params)
+            logger.info(f"セッション履歴に '{event_type}' を追加しました (Session: {session_id})" + log_msg_suffix)
 
         except ValueError as ve:
             # session not found
-            raise ve
+            raise ve # そのままリスロー
         except StateManagementError as sme:
             # fetch or update error
-            raise sme
+            logger.error(f"セッション履歴/状態更新中にDBエラー ({session_id}): {sme}", exc_info=False)
+            raise sme # StateManagementError はそのまま再発生
         except Exception as e:
             # JSON decode or other unexpected errors
             logger.error(f"セッション履歴/状態更新プロセスで予期せぬエラー ({session_id}): {e}", exc_info=True)
@@ -196,8 +192,9 @@ async def add_session_history(
         # 履歴追加自体は成功している可能性があるので、エラーを返しつつ警告
         raise StateManagementError(f"History added, but failed to retrieve updated session info: {get_err}") from get_err
 
-def cleanup_old_sessions(config: Dict[str, Any]):
-    """古いセッションや最大数を超えたセッションをクリーンアップする (同期)"""
+# --- 修正: cleanup_old_sessions を非同期化 --- #
+async def cleanup_old_sessions(config: Dict[str, Any]):
+    """古いセッションや最大数を超えたセッションをクリーンアップする (非同期)"""
     db_path = Path(config['paths']['db']) / db_utils.DB_FILENAME
     session_timeout_seconds = config.get('cleanup', {}).get('session_timeout_seconds', 86400)
     max_sessions_count = config.get('cleanup', {}).get('max_sessions_count', 100)
@@ -210,34 +207,34 @@ def cleanup_old_sessions(config: Dict[str, Any]):
     deleted_timeout_count = 0
     deleted_excess_count = 0
 
-    # --- DB操作は同期ヘルパー (_db_*) を使う --- 
-    #   cleanup はバックグラウンドスレッドで実行される想定なので、
-    #   async def にせず、同期ヘルパーで十分。
+    # --- DB操作は非同期関数 (db_utils.db_*) を使う --- #
     try:
         # タイムアウトしたセッションを削除
         if session_timeout_seconds > 0:
             timeout_threshold = utils.get_timestamp() - session_timeout_seconds
-            # 同期ヘルパーを使用
-            deleted_timeout_count = db_utils._db_execute_commit_sync(db_path, "DELETE FROM sessions WHERE last_update < ?", (timeout_threshold,))
-            if deleted_timeout_count and deleted_timeout_count > 0:
-                logger.info(f"{deleted_timeout_count} 件のタイムアウトしたセッションを削除しました。")
+            # 非同期関数を使用
+            deleted_timeout_count_result = await db_utils.db_execute_commit_async(db_path, "DELETE FROM sessions WHERE last_update < ?", (timeout_threshold,))
+            # execute_commit_async は lastrowid (ここではNone) または影響行数を返さないので、ログのみ
+            # if deleted_timeout_count_result:
+            #     logger.info(f"{deleted_timeout_count_result} 件のタイムアウトしたセッションを削除しました。")
+            logger.info(f"タイムアウトしたセッション削除試行完了 (last_update < {timeout_threshold})。") # 削除件数は正確には取れない
 
         # 最大数を超えたセッションを削除
         if max_sessions_count > 0:
-            # 同期ヘルパーを使用
-            row = db_utils._db_fetch_one_sync(db_path, "SELECT COUNT(*) FROM sessions")
+            # 非同期関数を使用
+            row = await db_utils.db_fetch_one_async(db_path, "SELECT COUNT(*) FROM sessions")
             current_session_count = row[0] if row else 0
             if current_session_count > max_sessions_count:
                 sessions_to_delete_count = current_session_count - max_sessions_count
                 logger.info(f"セッション数が最大保持数 {max_sessions_count} を超過 ({current_session_count} 件)。古い {sessions_to_delete_count} 件を削除します。")
-                # 同期ヘルパーを使用
-                deleted_excess_count = db_utils._db_execute_commit_sync(db_path, "DELETE FROM sessions WHERE session_id IN (SELECT session_id FROM sessions ORDER BY last_update ASC LIMIT ?)", (sessions_to_delete_count,))
-                if deleted_excess_count and deleted_excess_count > 0:
-                    logger.info(f"{deleted_excess_count} 件の超過セッションを削除しました。")
+                # 非同期関数を使用
+                # execute_commit_async は削除件数を返さないので、ログのみ
+                await db_utils.db_execute_commit_async(db_path, "DELETE FROM sessions WHERE session_id IN (SELECT session_id FROM sessions ORDER BY last_update ASC LIMIT ?)", (sessions_to_delete_count,))
+                logger.info(f"{sessions_to_delete_count} 件の超過セッション削除試行完了。")
             else:
                  logger.info(f"現在のセッション数: {current_session_count} (最大: {max_sessions_count}) - 超過削除は不要。")
 
-        logger.info(f"セッションクリーンアップ完了。削除(タイムアウト): {deleted_timeout_count or 0}, 削除(超過): {deleted_excess_count or 0}")
+        logger.info(f"セッションクリーンアップ完了。") # 正確な削除件数はログのみで判断
 
     except StateManagementError as sme:
         logger.error(f"セッションクリーンアップ中にDBエラー: {sme}", exc_info=False)

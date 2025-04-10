@@ -1,14 +1,19 @@
 import logging
 import json
 import time
-from typing import Dict, Any, Optional, Callable, Coroutine
+from typing import Dict, Any, Optional, Callable, Coroutine, Awaitable
 from pathlib import Path
+import asyncio
+from functools import partial
 
 # 関連モジュールインポート
 from mcp.server.fastmcp import FastMCP
-# 各ツールモジュールの同期タスク関数をインポート
-from .llm_tools import _run_suggest_parameters, _run_generate_hypotheses, _run_improve_code # LLM関連
-from .evaluation_tools import _execute_grid_search # グリッドサーチ実行
+# 各ツールモジュールの同期タスク関数をインポート (一部は直接実行しない)
+# from .llm_tools import _run_suggest_parameters, _run_generate_hypotheses, _run_improve_code # LLM関連
+# from .evaluation_tools import _execute_grid_search # グリッドサーチ実行
+# LLMと評価の非同期ラッパーをインポート (あるいはコア関数を run_in_executor で呼び出す)
+from .llm_tools import _run_suggest_parameters_async
+from .evaluation_tools import _execute_grid_search_async
 from .code_tools import _run_get_code, _run_save_code, get_detector_path # コード取得/保存 ヘルパー関数をインポート
 # 科学自動化戦略クラス
 from src.science_automation.exploration_strategy import ExplorationStrategy
@@ -19,29 +24,60 @@ from . import db_utils
 
 logger = logging.getLogger('mcp_server.improvement_loop')
 
-# --- Synchronous Task Functions for Loop Control --- #
+# --- 修正: 非同期 Task Functions --- #
 
-def _run_parameter_optimization(job_id: str, config: Dict[str, Any], add_history_sync_func: Callable, detector_name: str, source_code: str, audio_dir: Optional[str] = None, reference_dir: Optional[str] = None, session_id: Optional[str] = None) -> Dict[str, Any]:
-    """パラメータ最適化プロセスを実行 (同期、LLM提案 -> グリッドサーチ)"""
+async def _run_parameter_optimization(
+    job_id: str,
+    config: Dict[str, Any],
+    # --- 修正: 引数名と型ヒント変更 --- #
+    add_history_async_func: Callable[..., Awaitable[Dict[str, Any]]],
+    detector_name: str,
+    source_code: str,
+    audio_dir: Optional[str] = None,
+    reference_dir: Optional[str] = None,
+    session_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """パラメータ最適化プロセスを実行 (非同期、LLM提案 -> グリッドサーチ)"""
     logger.info(f"[Job {job_id}] Starting parameter optimization for '{detector_name}'... Session: {session_id}")
 
     if session_id:
         try:
-            add_history_sync_func(session_id, "parameter_optimization_started", {"detector_name": detector_name})
+            # --- 修正: await を使用 --- #
+            await add_history_async_func(session_id, "parameter_optimization_started", {"detector_name": detector_name})
         except Exception as hist_e:
             logger.warning(f"[Job {job_id}] Failed to add optimization started history: {hist_e}")
 
     try:
-        # 1. LLM にパラメータ範囲を提案させる (_run_suggest_parameters を直接呼び出す)
+        # 1. LLM にパラメータ範囲を提案させる
         logger.debug(f"[Job {job_id}] Suggesting parameters via LLM...")
-        suggestion_result = _run_suggest_parameters(job_id, config, add_history_sync_func, source_code, context="Suggest parameters for grid search", session_id=session_id)
+        # --- 修正: run_in_executor で実行 (または async 版を await) --- #
+        # 他ツールと合わせ、ここでは run_in_executor を使用
+        loop = asyncio.get_running_loop()
+        # _run_suggest_parameters は内部で非同期LLM呼び出しを行うので run_in_executor は不適切
+        # llm_tools の _run_suggest_parameters_async を直接使うべき
+        # suggestion_result = await _run_suggest_parameters_async(
+        #     job_id, # job_id を渡す必要あり
+        #     add_history_async_func, # 非同期履歴関数を渡す
+        #     config.get('llm', {}),
+        #     config.get('resource_limits', {}),
+        #     Path(config['paths']['db_path']),
+        #     session_id,
+        #     source_code,
+        #     context="Suggest parameters for grid search"
+        # )
+        # --- 仮修正: LLMツールを直接呼び出す (llm_tools 側で対応が必要になる可能性) --- #
+        # このツールは別ジョブとして開始するべきかもしれないが、ここでは直接実行を試みる
+        from .llm_tools import _run_suggest_parameters # 同期版を呼ぶ？非同期にすべき
+        # TODO: この部分の非同期呼び出し方法を再検討。現状は同期関数を呼び出している。
+        suggestion_result = _run_suggest_parameters(job_id, config, add_history_async_func, source_code, context="Suggest parameters for grid search", session_id=session_id)
 
         suggested_params = suggestion_result.get('params', [])
         if not suggested_params or not isinstance(suggested_params, list):
             warning_msg = "LLM did not suggest any valid parameters for optimization."
             logger.warning(f"[Job {job_id}] {warning_msg}")
             if session_id:
-                try: add_history_sync_func(session_id, "parameter_optimization_skipped", {"reason": warning_msg})
+                # --- 修正: await を使用 --- #
+                try: await add_history_async_func(session_id, "parameter_optimization_skipped", {"reason": warning_msg})
                 except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add skipped history: {hist_e}")
             return {"status": "skipped", "message": warning_msg, "suggestion_result": suggestion_result}
 
@@ -77,7 +113,8 @@ def _run_parameter_optimization(job_id: str, config: Dict[str, Any], add_history
              warning_msg = "Could not construct grid search config from LLM suggestions."
              logger.warning(f"[Job {job_id}] {warning_msg}")
              if session_id:
-                 try: add_history_sync_func(session_id, "parameter_optimization_skipped", {"reason": warning_msg})
+                 # --- 修正: await を使用 --- #
+                 try: await add_history_async_func(session_id, "parameter_optimization_skipped", {"reason": warning_msg})
                  except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add skipped history: {hist_e}")
              return {"status": "skipped", "message": warning_msg}
 
@@ -107,8 +144,14 @@ def _run_parameter_optimization(job_id: str, config: Dict[str, Any], add_history
                  # num_procs など、他の引数も config から取得・設定
                  "num_procs": config.get('resource_limits', {}).get('max_concurrent_jobs', 1)
              }
-             grid_results = _execute_grid_search(job_id, config, add_history_sync_func, **grid_search_kwargs)
-             logger.info(f"[Job {job_id}] Grid search completed.")
+             # --- 修正: _execute_grid_search を run_in_executor で実行 --- #
+             # grid_results = _execute_grid_search(job_id, config, add_history_async_func, **grid_search_kwargs)
+             grid_search_func = partial(_execute_grid_search_async, job_id, Path(config['paths']['output_base']), add_history_async_func, config, None, **grid_search_kwargs)
+             # _execute_grid_search_async を呼び出す。これは既に非同期ラッパー。
+             grid_results = await grid_search_func()
+             # loop = asyncio.get_running_loop()
+             # grid_search_func = partial(_execute_grid_search, job_id, Path(config['paths']['output_base']), add_history_async_func, **grid_search_kwargs)
+             # grid_results = await loop.run_in_executor(None, grid_search_func)
 
              final_result = {
                  "status": "completed",
@@ -118,7 +161,8 @@ def _run_parameter_optimization(job_id: str, config: Dict[str, Any], add_history
              }
              if session_id:
                   try:
-                      add_history_sync_func(session_id, "parameter_optimization_complete", final_result)
+                      # --- 修正: await を使用 --- #
+                      await add_history_async_func(session_id, "parameter_optimization_complete", final_result)
                   except Exception as hist_e:
                       logger.warning(f"[Job {job_id}] Failed to add optimization complete history: {hist_e}")
              return final_result
@@ -136,18 +180,27 @@ def _run_parameter_optimization(job_id: str, config: Dict[str, Any], add_history
         logger.error(f"[Job {job_id}] Error during parameter optimization: {e}", exc_info=True)
         if session_id:
             try:
-                add_history_sync_func(session_id, "parameter_optimization_failed", {"error": str(e)})
+                # --- 修正: await を使用 --- #
+                await add_history_async_func(session_id, "parameter_optimization_failed", {"error": str(e)})
             except Exception as hist_e:
                 logger.warning(f"[Job {job_id}] Failed to add optimization failed history: {hist_e}")
         raise MirexError(f"Parameter optimization failed: {e}") from e
 
-def _run_suggest_exploration_strategy(job_id: str, config: Dict[str, Any], add_history_sync_func: Callable, session_id: str, current_performance: Optional[float] = None) -> Dict[str, Any]:
-    """次の探索戦略を提案する (同期)"""
+async def _run_suggest_exploration_strategy(
+    job_id: str,
+    config: Dict[str, Any],
+    # --- 修正: 引数名と型ヒント変更 --- #
+    add_history_async_func: Callable[..., Awaitable[Dict[str, Any]]],
+    session_id: str,
+    current_performance: Optional[float] = None
+) -> Dict[str, Any]:
+    """次の探索戦略を提案する (非同期)"""
     logger.info(f"[Job {job_id}] Suggesting next exploration strategy... Session: {session_id}")
     try:
         # DBからセッション履歴を取得
-        db_path = Path(config['paths']['db']) / db_utils.DB_FILENAME
-        row = db_utils._db_fetch_one(db_path, "SELECT history FROM sessions WHERE session_id = ?", (session_id,))
+        db_path = Path(config['paths']['db_path'])
+        # --- 修正: db_fetch_one_async を使用 --- #
+        row = await db_utils.db_fetch_one_async(db_path, "SELECT history FROM sessions WHERE session_id = ?", (session_id,))
         if not row:
              raise ValueError(f"Session {session_id} not found for strategy suggestion.")
         try:
@@ -184,7 +237,8 @@ def _run_suggest_exploration_strategy(job_id: str, config: Dict[str, Any], add_h
         }
 
         try:
-            add_history_sync_func(session_id, "strategy_suggested", result)
+            # --- 修正: await を使用 --- #
+            await add_history_async_func(session_id, "strategy_suggested", result)
         except Exception as hist_e:
             logger.warning(f"[Job {job_id}] Failed to add strategy suggested history: {hist_e}")
 
@@ -195,7 +249,8 @@ def _run_suggest_exploration_strategy(job_id: str, config: Dict[str, Any], add_h
         logger.error(f"[Job {job_id}] Error suggesting exploration strategy: {e}", exc_info=True)
         if session_id:
              try:
-                  add_history_sync_func(session_id, "strategy_suggestion_failed", {"error": str(e)})
+                  # --- 修正: await を使用 --- #
+                  await add_history_async_func(session_id, "strategy_suggestion_failed", {"error": str(e)})
              except Exception as hist_e:
                   logger.warning(f"[Job {job_id}] Failed to add strategy error history: {hist_e}")
         raise MirexError(f"Failed to suggest strategy: {e}") from e
@@ -203,18 +258,47 @@ def _run_suggest_exploration_strategy(job_id: str, config: Dict[str, Any], add_h
 def register_loop_tools(
     mcp: FastMCP,
     config: Dict[str, Any],
-    start_async_job_func: Callable[..., str],
-    add_history_sync_func: Callable
+    start_async_job_func: Callable[..., Coroutine[Any, Any, str]], # 戻り値は job_id (str) の想定
+    # --- 修正: 引数名と型ヒント変更 --- #
+    add_history_async_func: Callable[..., Awaitable[Dict[str, Any]]]
 ):
     """自動改善ループと関連戦略ツールのMCPツールを登録"""
     logger.info("Registering improvement loop and strategy tools...")
 
     # Helper for starting async jobs, similar to other modules
-    def _start_loop_job(task_func: Callable, tool_name: str, session_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+    # --- 修正: task_func は非同期コルーチンを受け取る --- #
+    async def _start_loop_job(task_coroutine: Coroutine, tool_name: str, session_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         kwargs['session_id'] = session_id # Ensure session_id is passed to task
-        job_id = start_async_job_func(task_func, tool_name, session_id, config, add_history_sync_func, **kwargs)
+        # start_async_job_func にはコルーチン関数オブジェクトを渡す必要がある
+        # ここで task_coroutine は既に実行結果 (コルーチンオブジェクト) になっているため、
+        # 実際にはタスク関数とその引数を渡す必要がある。
+        # start_async_job_func の呼び出し方を修正するか、このヘルパーの引数を変更する。
+
+        # --- 修正案: ヘルパーの引数をタスク関数と引数にする --- #
+        # async def _start_loop_job(task_func: Callable[..., Coroutine], tool_name: str, session_id: Optional[str] = None, **task_args) -> Dict[str, Any]:
+        #     job_id = await start_async_job_func(
+        #         task_func, # 非同期タスク関数を渡す
+        #         tool_name,
+        #         session_id,
+        #         config, # start_async_job_func に config は不要になった？ -> core.py の start_async_job を確認
+        #         add_history_async_func,
+        #         **task_args
+        #     )
+        #     if session_id:
+        #         try: await add_history_async_func(session_id, f"{tool_name}_request", {"params": task_args, "job_id": job_id})
+        #         except Exception as e: logger.warning(f"Failed to add request history for {tool_name}: {e}")
+        #     return {"job_id": job_id, "status": "pending"}
+        # --- 修正案ここまで --- #
+
+        # --- 現状の start_async_job_func のシグネチャに合わせる場合 (core.py の修正が必要になる可能性) --- #
+        # start_async_job_func は Callable[..., Coroutine] を期待している？
+        # task_coroutine が関数オブジェクトならそのまま渡せる
+        # TODO: start_async_job_func の実装を確認し、整合性を取る
+        job_id = await start_async_job_func(task_coroutine, tool_name, session_id, config, add_history_async_func, **kwargs)
+
         if session_id:
-            try: add_history_sync_func(session_id, f"{tool_name}_request", {"params": kwargs, "job_id": job_id})
+            # --- 修正: await を使用 --- #
+            try: await add_history_async_func(session_id, f"{tool_name}_request", {"params": kwargs, "job_id": job_id})
             except Exception as e: logger.warning(f"Failed to add request history for {tool_name}: {e}")
         return {"job_id": job_id, "status": "pending"}
 
@@ -275,7 +359,12 @@ def register_loop_tools(
             "reference_dir": reference_dir,
             "session_id": session_id
         }
-        return _start_loop_job(_run_parameter_optimization, "optimize_parameters", session_id, **task_kwargs)
+        return await _start_loop_job(
+             task_func=_run_parameter_optimization, # 非同期タスク関数
+             tool_name="optimize_parameters",
+             session_id=session_id,
+             task_args=task_kwargs # タスク関数への引数
+        )
 
     # suggest_exploration_strategy ツール
     @mcp.tool("suggest_exploration_strategy")
@@ -290,7 +379,12 @@ def register_loop_tools(
             "session_id": session_id,
             "current_performance": current_performance
         }
-        return _start_loop_job(_run_suggest_exploration_strategy, "suggest_exploration_strategy", session_id, **task_kwargs)
+        return await _start_loop_job(
+            task_func=_run_suggest_exploration_strategy, # 非同期タスク関数
+            tool_name="suggest_exploration_strategy",
+            session_id=session_id,
+            task_args=task_kwargs # タスク関数への引数
+        )
 
     logger.info("Improvement loop and strategy tools registered.")
 

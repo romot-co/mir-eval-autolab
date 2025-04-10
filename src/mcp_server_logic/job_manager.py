@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Callable, Coroutine, List, Tuple
 import time
 import asyncio
-import sqlite3
+# import sqlite3 # 不要になったため削除
 
 # 関連モジュールインポート (型ヒント用)
 from mcp.server.fastmcp import FastMCP
@@ -88,8 +88,9 @@ async def get_job_status(config: Dict[str, Any], db_path: Path, job_id: str) -> 
 
 # --- Cleanup Function --- #
 
-def cleanup_old_jobs(config: Dict[str, Any]):
-    """古いジョブやスタックしたジョブをクリーンアップする (同期)"""
+# --- 修正: cleanup_old_jobs を非同期化 --- #
+async def cleanup_old_jobs(config: Dict[str, Any]):
+    """古いジョブやスタックしたジョブをクリーンアップする (非同期)"""
     db_path = Path(config['paths']['db']) / db_utils.DB_FILENAME
     job_stuck_timeout_seconds = config.get('cleanup', {}).get('job_stuck_timeout_seconds', 3600)
     job_completed_retention_seconds = config.get('cleanup', {}).get('job_completed_retention_seconds', 604800)
@@ -100,9 +101,7 @@ def cleanup_old_jobs(config: Dict[str, Any]):
         return
 
     logger.info(f"古いジョブ/スタックジョブのクリーンアップ開始 (スタック: {job_stuck_timeout_seconds}秒, 保持: {job_completed_retention_seconds}秒, 最大: {max_jobs_count}件)")
-    updated_stuck_count = 0
-    deleted_completed_count = 0
-    deleted_excess_count = 0
+    cleaned_job_ids = set()
     now = utils.get_timestamp()
 
     try:
@@ -111,47 +110,51 @@ def cleanup_old_jobs(config: Dict[str, Any]):
             stuck_threshold = now - job_stuck_timeout_seconds
             stuck_error_msg = f"Job timed out (stuck for > {job_stuck_timeout_seconds}s)"
             # start_time ではなく end_time or last_update を見るべき？ -> DBスキーマに last_update がないので start_time で代用
-            updated_stuck_count = db_utils._db_execute_commit(
+            # --- 修正: 非同期DB関数を使用 --- #
+            await db_utils.db_execute_commit_async(
                 db_path,
-                "UPDATE jobs SET status = 'failed', result = ?, end_time = ? WHERE (status = 'pending' OR status = 'running') AND start_time < ?",
-                (json.dumps({"error": stuck_error_msg}), now, stuck_threshold)
+                "UPDATE jobs SET status = 'failed', result = ?, error_details = ?, end_time = ? WHERE (status = 'pending' OR status = 'running') AND start_time < ?",
+                (json.dumps({"error": "timeout"}), json.dumps({"error": stuck_error_msg}, cls=JsonNumpyEncoder), now, stuck_threshold)
             )
-            if updated_stuck_count and updated_stuck_count > 0:
-                logger.warning(f"{updated_stuck_count} 件のスタックしたジョブを 'failed' に更新しました。")
+            # 件数は返さないのでログで示す
+            logger.warning(f"スタックしたジョブ (開始 < {stuck_threshold}) のステータスを 'failed' に更新試行完了。")
 
         # 保持期間を過ぎた完了/失敗ジョブを削除
         if job_completed_retention_seconds > 0:
             retention_threshold = now - job_completed_retention_seconds
-            deleted_completed_count = db_utils._db_execute_commit(
+            # --- 修正: 非同期DB関数を使用 --- #
+            await db_utils.db_execute_commit_async(
                 db_path,
                 "DELETE FROM jobs WHERE (status = 'completed' OR status = 'failed') AND end_time < ?",
                 (retention_threshold,)
             )
-            if deleted_completed_count and deleted_completed_count > 0:
-                logger.info(f"{deleted_completed_count} 件の完了/失敗ジョブ（保持期間超過）を削除しました。")
+            # 件数は返さないのでログで示す
+            logger.info(f"保持期間超過 ({job_completed_retention_seconds}秒) の完了/失敗ジョブ (終了 < {retention_threshold}) の削除試行完了。")
 
         # 最大保持数を超えたジョブを削除 (古いものから)
         if max_jobs_count > 0:
-            row = db_utils._db_fetch_one(db_path, "SELECT COUNT(*) FROM jobs")
+            # --- 修正: 非同期DB関数を使用 --- #
+            row = await db_utils.db_fetch_one_async(db_path, "SELECT COUNT(*) FROM jobs")
             current_job_count = row[0] if row else 0
             if current_job_count > max_jobs_count:
                 jobs_to_delete_count = current_job_count - max_jobs_count
-                logger.info(f"ジョブ数が最大保持数 {max_jobs_count} を超過 ({current_job_count} 件)。古い {jobs_to_delete_count} 件を削除します。")
+                logger.info(f"ジョブ数が最大保持数 {max_jobs_count} を超過 ({current_job_count} 件)。古い {jobs_to_delete_count} 件の削除を試行します。")
                 # start_time が古い順に削除 (完了/失敗ジョブ優先)
-                deleted_excess_count = db_utils._db_execute_commit(
+                # --- 修正: 非同期DB関数を使用 --- #
+                await db_utils.db_execute_commit_async(
                     db_path,
                     "DELETE FROM jobs WHERE job_id IN (SELECT job_id FROM jobs ORDER BY CASE status WHEN 'completed' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END ASC, start_time ASC LIMIT ?)",
                     (jobs_to_delete_count,)
                 )
-                if deleted_excess_count and deleted_excess_count > 0:
-                    logger.info(f"{deleted_excess_count} 件の超過ジョブを削除しました。")
+                # 件数は返さないのでログで示す
+                logger.info(f"{jobs_to_delete_count} 件の超過ジョブの削除試行完了。")
             else:
                 logger.info(f"現在のジョブ数: {current_job_count} (最大: {max_jobs_count}) - 超過削除は不要。")
 
         # メモリ上の active_jobs からも古い完了/失敗ジョブを削除
         # (DBから削除されたIDに基づいてメモリをクリーンアップ)
         cleaned_job_ids = set()
-        if deleted_completed_count > 0 or deleted_excess_count > 0:
+        if current_job_count > max_jobs_count:
             # 削除されたIDを特定するのは難しいので、単純に完了/失敗していて古いものをメモリから削除
             retention_threshold_mem = now - job_completed_retention_seconds if job_completed_retention_seconds > 0 else 0
             stuck_threshold_mem = now - job_stuck_timeout_seconds if job_stuck_timeout_seconds > 0 else 0
@@ -186,8 +189,8 @@ def cleanup_old_jobs(config: Dict[str, Any]):
     except Exception as e:
         logger.error(f"ジョブクリーンアップ中にエラー: {e}", exc_info=True)
     finally:
-        total_deleted_db = (deleted_completed_count or 0) + (deleted_excess_count or 0)
-        logger.info(f"ジョブクリーンアップ完了。DB更新/削除: {updated_stuck_count or 0} 更新(スタック), {total_deleted_db} 削除。メモリクリーンアップ: {len(cleaned_job_ids)} 件。")
+        # 正確な件数は追跡しないため、簡略化
+        logger.info(f"ジョブクリーンアップ完了。メモリクリーンアップ: {len(cleaned_job_ids)} 件。")
 
 
 # --- Tool Registration --- #

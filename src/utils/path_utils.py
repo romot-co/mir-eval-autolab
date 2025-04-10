@@ -51,7 +51,7 @@ _project_root: Optional[Path] = None
 _markers = ROOT_MARKERS + ["pyproject.toml", ".git"]
 has_dotenv = find_dotenv() is not None
 
-def load_environment_variables(dotenv_path: Optional[Union[str, Path]] = None) -> bool:
+def load_environment_variables(dotenv_path: Optional[Union[str, Path]] = None, *, use_project_root_env: bool = True) -> bool:
     """
     .envファイルから環境変数を読み込む。
 
@@ -61,6 +61,8 @@ def load_environment_variables(dotenv_path: Optional[Union[str, Path]] = None) -
     ----------
     dotenv_path : Optional[Union[str, Path]], optional
         読み込む .env ファイルのパス。Noneの場合、プロジェクトルートの .env を探す。
+    use_project_root_env : bool, optional
+        dotenv_pathが指定されていない場合に、プロジェクトルートの.envを探して読み込むか, by default True
 
     Returns
     -------
@@ -77,10 +79,10 @@ def load_environment_variables(dotenv_path: Optional[Union[str, Path]] = None) -
         if not load_path.exists():
             logger.warning(f"指定された .env パスが見つかりません: {load_path}")
             load_path = None # 見つからなければNoneに戻す
-    else:
+    elif use_project_root_env:
         try:
-            # プロジェクトルートを取得 (まだキャッシュされていない可能性あり)
-            root = get_project_root(use_cache=False) # キャッシュを使わずに再検索
+            # プロジェクトルートを取得 (キャッシュを利用)
+            root = get_project_root(use_cache=True) # 通常はキャッシュされたものを使う
             default_env_path = root / '.env'
             if default_env_path.exists():
                 load_path = default_env_path
@@ -89,8 +91,11 @@ def load_environment_variables(dotenv_path: Optional[Union[str, Path]] = None) -
                  example_path = root / '.env.example'
                  if example_path.exists():
                      logger.info(f".env ファイルが見つかりません ({default_env_path})。.env.example をコピーして設定できます。")
+                # else: # .env も .env.example もない場合は特にログ不要
+                #     logger.debug(f"プロジェクトルートに .env も .env.example も見つかりません: {root}")
         except ConfigError:
-             logger.warning("プロジェクトルート特定前に .env を探しています。.env の場所を明示的に指定するか、先にプロジェクトルートを設定してください。")
+            # プロジェクトルートが見つからない場合は、.env 読み込みも失敗
+            logger.warning("プロジェクトルートが未確定のため、プロジェクトルートの .env ファイルの読み込みをスキップします。")
         except Exception as e:
              logger.error(f"プロジェクトルート下の .env 検索中に予期せぬエラー: {e}")
 
@@ -108,7 +113,10 @@ def load_environment_variables(dotenv_path: Optional[Union[str, Path]] = None) -
             logger.error(f"{load_path} の読み込み中にエラーが発生しました: {e}", exc_info=True)
             return False
     else:
-        logger.debug(f".env ファイルが見つからなかったか、ファイルではありません: {load_path}")
+        if dotenv_path: # path指定があった場合のみ、見つからなかったログを出す
+             logger.debug(f"指定された .env パスが見つからなかったか、ファイルではありません: {load_path}")
+        # else: # プロジェクトルートに .env がないのは通常なのでログ不要
+        #     logger.debug("読み込むべき .env ファイルが見つかりませんでした。")
         return False
 
 def find_project_root(
@@ -281,282 +289,304 @@ def get_absolute_path(relative_or_absolute_path: Union[str, Path],
             base_dir = get_project_root() # プロジェクトルートを基準にする
         return (base_dir / path_obj).resolve()
 
-def ensure_dir(dir_path: Union[str, Path]) -> Path:
+def ensure_dir(dir_path: Union[str, Path], *, check_writable: bool = True) -> Path:
     """
-    指定されたパスのディレクトリが存在することを確認し、なければ作成する。
-    パスオブジェクトを返す。
+    指定されたパスのディレクトリが存在することを確認し、存在しない場合は作成する。
+    オプションで書き込み可能かどうかもチェックする。
 
     Parameters
     ----------
     dir_path : Union[str, Path]
-        確認・作成するディレクトリのパス。
+        確認または作成するディレクトリのパス。
+    check_writable : bool, optional
+        ディレクトリが書き込み可能かどうかのチェックを行うか, by default True
 
     Returns
     -------
     Path
-        存在する(または作成された)ディレクトリのパスオブジェクト。
+        確認または作成されたディレクトリの絶対パス。
 
     Raises
     ------
     FileError
-        パスがディレクトリでない、または作成に失敗した場合。
-    PermissionError
-        ディレクトリ作成に必要な権限がない場合。
+        ディレクトリの作成に失敗した場合、または書き込み不可の場合。
+    TypeError
+        dir_path が文字列またはPathオブジェクトでない場合。
     """
-    path_obj = Path(dir_path).resolve()
+    if not isinstance(dir_path, (str, Path)):
+        raise TypeError(f"dir_path must be a string or Path object, got {type(dir_path)}")
+
     try:
-        if path_obj.exists():
-            if not path_obj.is_dir():
-                msg = f"指定されたパスは存在しますが、ディレクトリではありません: {path_obj}"
-                logger.error(msg)
-                raise FileError(msg)
-        else:
-            # parents=True で中間ディレクトリも作成
-            # exist_ok=True で既に存在する場合にエラーにしない
-            path_obj.mkdir(parents=True, exist_ok=True)
-            logger.info(f"ディレクトリを作成しました: {path_obj}")
-        return path_obj
-    except PermissionError as pe:
-        msg = f"ディレクトリ作成/アクセスに必要な権限がありません: {path_obj}"
-        logger.error(msg)
-        raise PermissionError(msg) from pe
-    except OSError as ose:
-        msg = f"ディレクトリ作成/アクセス中にOSエラーが発生しました: {path_obj} - {ose}"
-        logger.error(msg)
-        raise FileError(msg) from ose
+        path = Path(dir_path).resolve()
+        # ディレクトリが存在しない場合は作成
+        if not path.exists():
+            logger.info(f"ディレクトリが存在しないため作成します: {path}")
+            path.mkdir(parents=True, exist_ok=True)
+        # ディレクトリでない場合はエラー
+        elif not path.is_dir():
+            raise FileError(f"指定されたパスはディレクトリではありません: {path}")
 
+        # 書き込み可能チェック (オプション)
+        if check_writable:
+            # 一時ファイルを作成してテスト
+            try:
+                with tempfile.NamedTemporaryFile(prefix='write_test_', dir=str(path)) as tf:
+                    logger.debug(f"ディレクトリへの書き込みテスト成功: {path}")
+            except OSError as e:
+                logger.error(f"ディレクトリへの書き込みテストに失敗しました: {path} - {e}", exc_info=True)
+                raise FileError(f"ディレクトリに書き込み権限がありません: {path}") from e
 
-def get_workspace_dir(config: Optional[Dict[str, Any]] = None) -> Path:
+        return path
+    except OSError as e:
+        logger.error(f"ディレクトリの確認または作成中にエラーが発生しました: {dir_path} - {e}", exc_info=True)
+        raise FileError(f"ディレクトリの確認または作成に失敗しました: {dir_path}") from e
+    except Exception as e:
+        logger.error(f"ディレクトリ確認中に予期せぬエラー: {dir_path} - {e}", exc_info=True)
+        raise FileError(f"ディレクトリ確認中に予期せぬエラーが発生しました: {dir_path}") from e
+
+# --- Workspace Path --- #
+_workspace_dir: Optional[Path] = None
+
+def get_workspace_dir(config: Optional[Dict[str, Any]] = None, use_cache: bool = True) -> Path:
     """
-    ワークスペースディレクトリのパスを取得・検証する。
-    優先順位: 環境変数 MIREX_WORKSPACE > config.yaml > デフォルトパス。
-    パスが存在しないか書き込み不可の場合はエラーを発生させる。
+    MCP サーバーのワークスペースディレクトリを取得する。
+
+    優先順位:
+    1. キャッシュされたパス (_workspace_dir) があればそれを返す (use_cache=Trueの場合)。
+    2. 環境変数 MIREX_WORKSPACE が設定されていれば、そのパスを使用する。
+    3. デフォルトのワークスペースパス (プロジェクトルート/.mcp_server_data) を使用する。
+
+    取得したパスのディレクトリが存在することを確認し、必要であれば作成する。
+    また、そのディレクトリが書き込み可能であることを確認する。
 
     Parameters
     ----------
     config : Optional[Dict[str, Any]], optional
-        読み込み済みの設定辞書 (config.yaml の値を含む), by default None。
-        Noneの場合、デフォルトパスのみが考慮される。
+        アプリケーション設定辞書。現在は直接使用されないが、将来のために残す。
+    use_cache : bool, optional
+        グローバルキャッシュを利用するかどうか, by default True
 
     Returns
     -------
     Path
-        検証済みのワークスペースディレクトリのパス
+        ワークスペースディレクトリの絶対パス。
 
     Raises
     ------
-    FileError
-        指定されたパスが無効、存在しない、または書き込みできない場合
-    PermissionError
-        書き込み権限がない場合
     ConfigError
-        パスを決定できなかった場合
+        環境変数で指定されたパスが無効な場合、またはプロジェクトルートが見つからない場合。
+    FileError
+        ディレクトリの作成または書き込みテストに失敗した場合。
     """
-    workspace_path_str: Optional[str] = None
-    source: str = ""
+    global _workspace_dir
+    if use_cache and _workspace_dir is not None:
+        return _workspace_dir
 
-    # 1. 環境変数 MIREX_WORKSPACE を確認
-    # 環境変数は .env 読み込み後であるべき -> get_project_root() を先に呼んでおく
+    workspace_path_str: Optional[str] = os.environ.get('MIREX_WORKSPACE')
+    project_root = get_project_root() # プロジェクトルートは必須
+
+    workspace_dir: Path
+    if workspace_path_str:
+        logger.info(f"環境変数 MIREX_WORKSPACE からワークスペースパスを取得します: {workspace_path_str}")
+        path_obj = Path(workspace_path_str)
+        # 環境変数で指定されたパスが絶対パスか相対パスかによって処理を分ける
+        if path_obj.is_absolute():
+            workspace_dir = path_obj
+        else:
+            # 相対パスの場合はプロジェクトルート基準で解決
+            workspace_dir = (project_root / path_obj).resolve()
+            logger.debug(f"相対パスをプロジェクトルート基準で解決しました: {workspace_dir}")
+    else:
+        # デフォルトのパス (プロジェクトルート直下の隠しディレクトリ)
+        default_workspace_name = ".mcp_server_data"
+        workspace_dir = (project_root / default_workspace_name).resolve()
+        logger.info(f"デフォルトのワークスペースパスを使用します: {workspace_dir}")
+
+    # ディレクトリの存在確認、作成、書き込みテスト
     try:
-         get_project_root() # これにより内部で .env が読み込まれるはず
-    except ConfigError:
-         pass # ルートが見つからなくても、環境変数だけはチェックできる
-    env_workspace = os.environ.get('MIREX_WORKSPACE')
-    if env_workspace:
-        workspace_path_str = env_workspace
-        source = "環境変数 MIREX_WORKSPACE"
+        resolved_workspace_dir = ensure_dir(workspace_dir, check_writable=True)
+    except (FileError, TypeError) as e:
+        # ensure_dir からのエラーを ConfigError にラップして再送出 (設定に起因する問題として扱う)
+        raise ConfigError(f"ワークスペースディレクトリの設定またはアクセスに問題があります: {workspace_dir}. 詳細: {e}") from e
 
-    # 2. config.yaml の設定を確認 (config が提供された場合)
-    if not workspace_path_str and config and isinstance(config.get('paths'), dict):
-        config_workspace = config['paths'].get('workspace')
-        if config_workspace:
-            workspace_path_str = config_workspace
-            source = "config.yaml の paths.workspace"
+    if use_cache:
+        _workspace_dir = resolved_workspace_dir
 
-    # 3. デフォルトパスを使用
-    if not workspace_path_str:
-        try:
-            project_root = get_project_root() # ここで ConfigError が発生する可能性
-            default_workspace_path = project_root / 'mcp_workspace'
-            workspace_path_str = str(default_workspace_path)
-            source = "デフォルトパス (プロジェクトルート/mcp_workspace)"
-        except ConfigError:
-             # プロジェクトルートが見つからない場合、ワークスペースパスを決定できない
-             msg = "ワークスペースパスを決定できませんでした (プロジェクトルート不明、環境変数/設定もなし)。"
-             logger.critical(msg)
-             raise ConfigError(msg)
+    return resolved_workspace_dir
 
+# --- Output Base Path --- #
+_output_base_dir: Optional[Path] = None
 
-    # パスの検証
-    if not workspace_path_str:
-        # 通常ここには到達しないはずだが念のため
-        raise ConfigError("ワークスペースパスを決定できませんでした。")
-
-    workspace_dir = Path(workspace_path_str).resolve()
-    logger.info(f"使用するワークスペースパス ({source}): {workspace_dir}")
-
-    try:
-        # ディレクトリを確保 (ensure_dir が存在確認・作成・権限チェックを行う)
-        ensure_dir(workspace_dir)
-
-        # 書き込み権限テスト (ensure_dir内で行うべきかもしれないが、念のため)
-        test_file_path = workspace_dir / f".write_test_{os.urandom(4).hex()}.tmp"
-        try:
-            test_file_path.touch(exist_ok=True) # exist_ok=True を追加
-            # 書き込んだ後すぐに削除
-            test_file_path.unlink()
-            logger.debug(f"ワークスペースディレクトリへの書き込み権限を確認しました: {workspace_dir}")
-        except (PermissionError, OSError) as e:
-            # touch や unlink でエラーが発生した場合
-            msg = f"ワークスペースディレクトリへの書き込み/削除テストに失敗しました: {workspace_dir} - {e}"
-            logger.critical(msg)
-            # PermissionError はそのまま、他のOSErrorはFileErrorにラップ
-            if isinstance(e, PermissionError):
-                raise PermissionError(msg) from e
-            else:
-                raise FileError(msg) from e
-        finally:
-            # テストファイルが残った場合に備えて再度削除試行
-            if test_file_path.exists():
-                try: test_file_path.unlink()
-                except OSError: pass
-
-        return workspace_dir
-
-    except (FileError, PermissionError) as e:
-        # ensure_dir や書き込みテストで発生したエラーをそのまま上に投げる
-        raise e
-    except Exception as e:
-        # その他の予期せぬエラー
-        msg = f"ワークスペースディレクトリの準備中に予期せぬエラー ({source}): {workspace_dir} - {e}"
-        logger.critical(msg, exc_info=True)
-        raise FileError(msg) from e
-
-# --- 各種ディレクトリ取得関数 (get_workspace_dir を使用するように修正) ---
-
-def get_evaluation_results_dir() -> Path:
-    """評価結果ディレクトリのパスを取得する (ワークスペース基準)。"""
-    env_output_dir = os.environ.get('MIREX_OUTPUT_DIR')
-    if env_output_dir:
-        results_dir = Path(env_output_dir).resolve()
-    else:
-        results_dir = get_workspace_dir() / 'evaluation_results' # get_workspace_dir() を呼ぶ
-    return ensure_dir(results_dir)
-
-def get_grid_search_results_dir() -> Path:
-    """グリッドサーチ結果ディレクトリのパスを取得する (ワークスペース基準)。"""
-    env_grid_dir = os.environ.get('MIREX_GRID_SEARCH_DIR')
-    if env_grid_dir:
-        results_dir = Path(env_grid_dir).resolve()
-    else:
-        results_dir = get_workspace_dir() / 'grid_search_results' # get_workspace_dir() を呼ぶ
-    return ensure_dir(results_dir)
-
-def get_improved_versions_dir() -> Path:
-    """改善バージョンディレクトリのパスを取得する (ワークスペース基準)。"""
-    env_versions_dir = os.environ.get('MIREX_VERSIONS_DIR')
-    if env_versions_dir:
-        versions_dir = Path(env_versions_dir).resolve()
-    else:
-        versions_dir = get_workspace_dir() / 'improved_versions' # get_workspace_dir() を呼ぶ
-    return ensure_dir(versions_dir)
-
-def get_session_dir(session_id: str) -> Path:
-    """セッションディレクトリのパスを取得する (ワークスペース基準)。"""
-    env_session_base = os.environ.get('MIREX_SESSION_DIR')
-    if env_session_base:
-        session_base_dir = Path(env_session_base).resolve()
-    else:
-        session_base_dir = get_workspace_dir() / 'sessions' # get_workspace_dir() を呼ぶ
-    # セッションIDが安全な文字列か検証
-    if not is_safe_path_component(session_id):
-        raise ValueError(f"セッションIDに使用できない文字が含まれています: {session_id}")
-    session_dir = session_base_dir / session_id
-    return ensure_dir(session_dir)
-
-def get_state_dir() -> Path:
-    """状態保存ディレクトリのパスを取得する (ワークスペース基準)。"""
-    env_state_dir = os.environ.get('MCP_STATE_DIR')
-    if env_state_dir:
-        state_dir = Path(env_state_dir).resolve()
-    else:
-        state_dir = get_workspace_dir() / 'improvement_states' # get_workspace_dir() を呼ぶ
-    return ensure_dir(state_dir)
-
-def get_db_dir() -> Path:
-    """データベースファイル用ディレクトリのパスを取得する (ワークスペース基準)。"""
-    # 環境変数等で変更できるようにしても良い
-    db_dir = get_workspace_dir() / 'db' # get_workspace_dir() を呼ぶ
-    return ensure_dir(db_dir)
-
-# --- データセット関連のパス取得 (プロジェクトルート基準が多い) ---
-
-def get_datasets_dir() -> Path:
-    """データセットのベースディレクトリパスを取得する (プロジェクトルート基準)。"""
-    # 環境変数 MIREX_DATASETS_DIR を優先
-    env_datasets_dir = os.environ.get('MIREX_DATASETS_DIR')
-    if env_datasets_dir:
-        datasets_dir = Path(env_datasets_dir).resolve()
-    else:
-        datasets_dir = get_project_root() / 'datasets'
-    # ensure_dir(datasets_dir) # 存在しなくてもパスは返す
-    if not datasets_dir.is_dir():
-         logger.warning(f"データセットベースディレクトリが存在しません: {datasets_dir}")
-    return datasets_dir
-
-def get_synthesized_datasets_dir() -> Path:
-    """合成データセットのベースディレクトリパスを取得する。"""
-    synth_dir = get_datasets_dir() / 'synthesized'
-    # ensure_dir(synth_dir)
-    if not synth_dir.is_dir():
-         logger.warning(f"合成データセットディレクトリが存在しません: {synth_dir}")
-    return synth_dir
-
-def get_audio_dir() -> Path:
-    """デフォルトの合成音声ファイルディレクトリのパスを取得する。"""
-    env_audio_dir = os.environ.get('MIREX_AUDIO_DIR')
-    if env_audio_dir:
-        audio_dir = Path(env_audio_dir).resolve()
-    else:
-        audio_dir = get_synthesized_datasets_dir() / 'audio'
-    # ensure_dir(audio_dir)
-    if not audio_dir.is_dir():
-        logger.warning(f"デフォルト音声ディレクトリが存在しません: {audio_dir}")
-    return audio_dir
-
-def get_label_dir() -> Path:
-    """デフォルトの合成ラベルファイルディレクトリのパスを取得する。"""
-    env_label_dir = os.environ.get('MIREX_LABEL_DIR')
-    if env_label_dir:
-        label_dir = Path(env_label_dir).resolve()
-    else:
-        label_dir = get_synthesized_datasets_dir() / 'labels'
-    # ensure_dir(label_dir)
-    if not label_dir.is_dir():
-        logger.warning(f"デフォルトラベルディレクトリが存在しません: {label_dir}")
-    return label_dir
-
-# --- 検出器コード関連のパス取得 ---
-
-def get_detectors_src_dir() -> Path:
-    """`src/detectors` ディレクトリのパスを取得する。"""
-    return get_project_root() / 'src' / 'detectors'
-
-def get_detector_path(detector_name: str, version: Optional[str] = None) -> Path:
+def get_output_base_dir(config: Dict[str, Any], use_cache: bool = True) -> Path:
     """
-    指定された検出器名とバージョンに対応するPythonファイルのパスを取得する。
+    全ての実行結果が出力されるベースディレクトリ (`output_base`) を取得する。
 
-    検索順序:
-    1. バージョン指定あり: `improved_versions` ディレクトリ内 (`<name>_<version>.py`)
-    2. バージョン指定なし: `improved_versions` ディレクトリ内の最新版 (タイムスタンプベース)
-    3. 上記で見つからない場合: `src/detectors` ディレクトリ内 (`<name>.py`)
+    優先順位:
+    1. キャッシュされたパス (_output_base_dir) があればそれを返す (use_cache=Trueの場合)。
+    2. 環境変数 MIREX_OUTPUT_BASE が設定されていれば、そのパスを使用する。
+    3. `config['paths']['output_base']` で指定されたパスを使用する。
+    4. デフォルトのパス (プロジェクトルート/output) を使用する。
+
+    取得したパスのディレクトリが存在することを確認し、必要であれば作成する。
+    また、そのディレクトリが書き込み可能であることを確認する。
+
+    Parameters
+    ----------
+    config : Dict[str, Any]
+        アプリケーション設定辞書。`paths.output_base` を参照するために必須。
+    use_cache : bool, optional
+        グローバルキャッシュを利用するかどうか, by default True
+
+    Returns
+    -------
+    Path
+        出力ベースディレクトリの絶対パス。
+
+    Raises
+    ------
+    ConfigError
+        設定や環境変数で指定されたパスが無効な場合、またはプロジェクトルートが見つからない場合。
+    FileError
+        ディレクトリの作成または書き込みテストに失敗した場合。
+    """
+    global _output_base_dir
+    if use_cache and _output_base_dir is not None:
+        return _output_base_dir
+
+    output_path_str: Optional[str] = os.environ.get('MIREX_OUTPUT_BASE')
+    source = "環境変数 MIREX_OUTPUT_BASE"
+
+    if not output_path_str:
+        output_path_str = config.get('paths', {}).get('output_base')
+        source = "設定ファイル (paths.output_base)"
+        if not output_path_str:
+            output_path_str = 'output' # デフォルト値
+            source = "デフォルト値 ('output')"
+
+    logger.info(f"{source} から出力ベースパスを取得します: {output_path_str}")
+
+    project_root = get_project_root() # プロジェクトルートは必須
+    path_obj = Path(output_path_str)
+
+    output_dir: Path
+    if path_obj.is_absolute():
+        output_dir = path_obj
+    else:
+        # 相対パスの場合はプロジェクトルート基準で解決
+        output_dir = (project_root / path_obj).resolve()
+        logger.debug(f"相対パスをプロジェクトルート基準で解決しました: {output_dir}")
+
+    # ディレクトリの存在確認、作成、書き込みテスト
+    try:
+        resolved_output_dir = ensure_dir(output_dir, check_writable=True)
+    except (FileError, TypeError) as e:
+        raise ConfigError(f"出力ベースディレクトリの設定またはアクセスに問題があります: {output_dir}. 詳細: {e}") from e
+
+    if use_cache:
+        _output_base_dir = resolved_output_dir
+
+    return resolved_output_dir
+
+# --- Workspace Subdirectories --- #
+
+def get_improved_versions_dir(config: Dict[str, Any]) -> Path:
+    """
+    AIによって生成された改善版コードを保存するディレクトリ (`improved_versions`) のパスを取得する。
+    このディレクトリはワークスペース内に配置される。
+
+    Parameters
+    ----------
+    config : Dict[str, Any]
+        アプリケーション設定辞書 (`paths.improved_versions` を参照)。
+
+    Returns
+    -------
+    Path
+        改善版コードディレクトリの絶対パス。
+
+    Raises
+    ------
+    ConfigError
+        設定やワークスペースディレクトリに問題がある場合。
+    FileError
+        ディレクトリの作成または書き込みテストに失敗した場合。
+    """
+    versions_subdir_name = config.get('paths', {}).get('improved_versions', 'improved_versions')
+    if not isinstance(versions_subdir_name, str) or not is_safe_path_component(versions_subdir_name):
+         raise ConfigError(f"設定内の 'paths.improved_versions' が不正です: {versions_subdir_name}")
+
+    try:
+        workspace = get_workspace_dir(config) # ワークスペースパスを取得 (キャッシュ利用可能)
+        versions_dir = workspace / versions_subdir_name
+        # このディレクトリも存在確認と書き込みテストを行う
+        return ensure_dir(versions_dir, check_writable=True)
+    except (ConfigError, FileError, TypeError) as e:
+        # エラーをラップして再送出
+        raise ConfigError(f"改善バージョンディレクトリの設定またはアクセスに問題があります: {versions_subdir_name}. 詳細: {e}") from e
+
+def get_db_dir(config: Dict[str, Any]) -> Path:
+    """
+    データベースファイル (mcp_server_state.db など) を格納するディレクトリ (`db`) のパスを取得する。
+    このディレクトリはワークスペース内に配置される。
+
+    Parameters
+    ----------
+    config : Dict[str, Any]
+        アプリケーション設定辞書 (`paths.db` を参照)。
+
+    Returns
+    -------
+    Path
+        データベースディレクトリの絶対パス。
+
+    Raises
+    ------
+    ConfigError
+        設定やワークスペースディレクトリに問題がある場合。
+    FileError
+        ディレクトリの作成または書き込みテストに失敗した場合。
+    """
+    db_subdir_name = config.get('paths', {}).get('db', 'db')
+    if not isinstance(db_subdir_name, str) or not is_safe_path_component(db_subdir_name):
+         raise ConfigError(f"設定内の 'paths.db' が不正です: {db_subdir_name}")
+
+    try:
+        workspace = get_workspace_dir(config) # ワークスペースパスを取得 (キャッシュ利用可能)
+        db_dir = workspace / db_subdir_name
+        # このディレクトリも存在確認と書き込みテストを行う
+        return ensure_dir(db_dir, check_writable=True)
+    except (ConfigError, FileError, TypeError) as e:
+        raise ConfigError(f"DBディレクトリの設定またはアクセスに問題があります: {db_subdir_name}. 詳細: {e}") from e
+
+# --- Source Code Paths --- #
+
+def get_detectors_src_dir(config: Optional[Dict[str, Any]] = None) -> Path:
+    """検出器のソースコードが格納されているディレクトリ (`detectors_src`) のパスを取得する。"""
+    # config があればそこから、なければデフォルト値
+    src_dir_name = 'src/detectors' # デフォルトはプロジェクトルートからの相対パス
+    if config:
+        src_dir_name = config.get('paths', {}).get('detectors_src', src_dir_name)
+
+    project_root = get_project_root()
+    detectors_dir = project_root / src_dir_name
+    if not detectors_dir.is_dir():
+         # ここでは ensure_dir しない方が良い (ソースディレクトリが存在しないのは設定ミス)
+         raise ConfigError(f"検出器ソースディレクトリが見つかりません: {detectors_dir}")
+    return detectors_dir.resolve() # 絶対パスを返すように修正
+
+def get_detector_path(detector_name: str, config: Dict[str, Any], version: Optional[str] = None) -> Path:
+    """
+    指定された検出器の Python ファイルパスを取得する。
+    改善版が存在する場合はそちらを優先する。
 
     Parameters
     ----------
     detector_name : str
-        検出器名 (ベース名)。
+        検出器のクラス名またはファイル名 (例: 'PZSTDDetector' または 'pzstd_detector.py')。
+    config : Dict[str, Any]
+        アプリケーション設定辞書。`get_improved_versions_dir` と `get_detectors_src_dir` を呼び出すために必要。
     version : Optional[str], optional
-        取得したいバージョンタグ。Noneの場合は最新の改善版またはベースコードを探す, by default None
+        取得したい改善版のバージョン (例: 'v3')。None の場合は最新の改善版またはオリジナルを探す。
 
     Returns
     -------
@@ -567,151 +597,268 @@ def get_detector_path(detector_name: str, version: Optional[str] = None) -> Path
     ------
     FileNotFoundError
         指定された検出器ファイルが見つからない場合。
+    ConfigError
+        パス設定に問題がある場合。
     ValueError
-        検出器名やバージョン名に不正な文字が含まれる場合。
+        detector_name や version が不正な形式の場合。
     """
-    if not is_safe_path_component(detector_name):
-        raise ValueError(f"検出器名に使用できない文字が含まれています: {detector_name}")
-    if version and not is_safe_path_component(version):
-         raise ValueError(f"バージョン名に使用できない文字が含まれています: {version}")
+    if not detector_name or not isinstance(detector_name, str):
+        raise ValueError("detector_name must be a non-empty string.")
+    if version is not None and (not isinstance(version, str) or not version.startswith('v') or not version[1:].isdigit()):
+         raise ValueError("version must be None or a string like 'v1', 'v2', etc.")
 
-    improved_dir = get_improved_versions_dir() # ワークスペース基準
-    src_detectors_dir = get_detectors_src_dir() # プロジェクトルート基準
+    # detector_name からファイル名を推定 (クラス名 -> スネークケース.py)
+    if detector_name.endswith('.py'):
+        filename = detector_name
+        class_name_part = detector_name[:-3] # .py を除去
+    else:
+        # クラス名をスネークケースに変換 (より堅牢な方法を検討)
+        # 例: 大文字の前にアンダースコアを挿入 (先頭と連続大文字を除く)
+        s1 = re.sub(r"(?<!^)(?=[A-Z])", "_", detector_name).lower()
+        filename = f"{s1}.py"
+        class_name_part = detector_name # 元のクラス名
 
-    # 1. バージョン指定がある場合
-    if version:
-        versioned_file = improved_dir / f"{detector_name}_{version}.py"
-        if versioned_file.is_file():
-            logger.debug(f"指定バージョン '{version}' を improved_versions で発見: {versioned_file}")
-            return versioned_file.resolve()
-        else:
-            # 指定バージョンが見つからない場合はエラー
-            msg = f"指定されたバージョンの検出器が見つかりません: name='{detector_name}', version='{version}' in {improved_dir}"
-            logger.error(msg)
-            raise FileNotFoundError(msg)
+    logger.debug(f"検出器 '{detector_name}' のファイル名を推定: {filename}")
 
-    # 2. バージョン指定なし -> 最新の改善版を探す
-    latest_improved_file: Optional[Path] = None
-    latest_mtime: float = -1.0
+    try:
+        # 改善版ディレクトリを取得 (ワークスペース内)
+        improved_versions_dir = get_improved_versions_dir(config)
+        detector_versions_dir = improved_versions_dir / class_name_part # クラス名ベースのサブディレクトリ
 
-    if improved_dir.is_dir():
-        # detector_name で始まるファイルを探す
-        pattern = f"{detector_name}_*.py"
-        for file_path in improved_dir.glob(pattern):
-            if file_path.is_file():
+        target_path: Optional[Path] = None
+
+        # 改善版ディレクトリを確認
+        if detector_versions_dir.is_dir():
+            if version:
+                # 特定バージョンの改善版を探す
+                version_filename = f"{filename.rsplit('.', 1)[0]}_{version}.py"
+                potential_path = detector_versions_dir / version_filename
+                if potential_path.is_file():
+                    target_path = potential_path
+                    logger.info(f"指定されたバージョンの改善版を使用します ({version}): {target_path}")
+                else:
+                    # ★ 修正: 特定バージョンが見つからない場合はエラー
+                    logger.error(f"指定されたバージョン '{version}' の改善版ファイルが見つかりません: {potential_path}")
+                    # 修正: f-string を正しく閉じる
+                    raise FileNotFoundError(
+                        f"指定されたバージョン '{version}' の検出器ファイルが見つかりません。\n"
+                        f"検索パス: {potential_path}"
+                    )
+            else:
+                # 最新バージョンの改善版を探す
+                latest_version_num = -1
+                latest_file_path = None
+                version_pattern = re.compile(rf"^{re.escape(filename.rsplit('.', 1)[0])}_v(\d+)\.py$")
                 try:
-                    mtime = file_path.stat().st_mtime
-                    if mtime > latest_mtime:
-                        latest_mtime = mtime
-                        latest_improved_file = file_path
+                    for item in detector_versions_dir.iterdir():
+                        if item.is_file():
+                            match = version_pattern.match(item.name)
+                            if match:
+                                v_num = int(match.group(1))
+                                if v_num > latest_version_num:
+                                    latest_version_num = v_num
+                                    latest_file_path = item
                 except OSError as e:
-                    logger.warning(f"改善版ファイルの最終更新日時取得エラー: {file_path} ({e})")
-                    continue # 次のファイルへ
+                    logger.warning(f"改善版ディレクトリの読み取り中にエラー ({detector_versions_dir}): {e}. オリジナルを探します。")
+                    # エラーが発生した場合、最新版は見つからなかったとして次に進む
 
-    if latest_improved_file:
-        logger.debug(f"最新の改善バージョンを発見 (更新日時ベース): {latest_improved_file}")
-        return latest_improved_file.resolve()
+                if latest_file_path:
+                    target_path = latest_file_path
+                    logger.info(f"最新バージョンの改善版 (v{latest_version_num}) を使用します: {target_path}")
 
-    # 3. 改善版が見つからない -> src/detectors を探す
-    base_file = src_detectors_dir / f"{detector_name}.py"
-    if base_file.is_file():
-        logger.debug(f"改善バージョンが見つからず。ベースコードを使用: {base_file}")
-        return base_file.resolve()
+        # 改善版が見つかった場合はそれを返す
+        if target_path and target_path.is_file():
+            return target_path.resolve()
+        elif version: # target_path が None だが version が指定されていた場合 (上記のエラー発生ケース)
+             # このパスには到達しないはず (上で FileNotFoundError が raise されるため)
+             # 念のためエラーを追加
+             raise FileNotFoundError(f"指定されたバージョン '{version}' の検出器ファイルが見つかりませんでした (予期せぬ状態)。")
 
-    # 4. 小文字ファイル名も試す (フォールバック)
-    base_file_lower = src_detectors_dir / f"{detector_name.lower()}.py"
-    if base_file_lower.is_file():
-        logger.warning(f"ベースコード '{detector_name}.py' が見つからず、小文字版を使用: {base_file_lower}")
-        return base_file_lower.resolve()
+        # 特定バージョン指定がなく、改善版が見つからなかった場合、または改善版ディレクトリが存在しない場合
+        # オリジナルの検出器を探す
+        detectors_src_dir = get_detectors_src_dir(config)
+        original_path = detectors_src_dir / filename
+        if original_path.is_file():
+            logger.info(f"オリジナルの検出器ファイルを使用します: {original_path}")
+            return original_path.resolve()
+        else:
+            # オリジナルも見つからない場合
+            # ★ 修正: エラーメッセージをより詳細に
+            searched_paths = f"改善版検索パス: {detector_versions_dir}\nオリジナル検索パス: {original_path}"
+            if version:
+                 # 特定バージョンを探して見つからなかった場合 (このパスには到達しないはずだが念のため)
+                 msg = f"指定されたバージョン '{version}' の検出器ファイルも、オリジナルのファイルも見つかりませんでした。"
+            elif detector_versions_dir.is_dir() and latest_version_num != -1:
+                 # 最新版を探したがオリジナルも見つからなかった (通常ありえない？)
+                 msg = f"最新の改善版 (v{latest_version_num}) もオリジナルの検出器ファイルも見つかりませんでした。"
+            elif detector_versions_dir.is_dir():
+                 # 改善版ディレクトリはあるが、バージョンファイルが見つからず、オリジナルもない
+                 msg = f"改善版ディレクトリにバージョンファイルが見つからず、オリジナルの検出器ファイルも見つかりませんでした。"
+            else:
+                 # 改善版ディレクトリがなく、オリジナルもない
+                 msg = f"改善版ディレクトリもオリジナルの検出器ファイルも見つかりませんでした。"
 
-    # 最終的に見つからない場合
-    msg = f"検出器ファイルが見つかりませんでした: name='{detector_name}' (src: {src_detectors_dir}, improved: {improved_dir})"
-    logger.error(msg)
-    raise FileNotFoundError(msg)
+            raise FileNotFoundError(f"{msg}\n{searched_paths}")
 
+    except (ConfigError, FileError, ValueError) as e:
+         # 設定やパスアクセスに関するエラー
+         # ★ 修正: FileError は ValueError ではなく ConfigError にラップする
+         if isinstance(e, FileError):
+              raise ConfigError(f"検出器パスの取得中にファイルアクセスエラーが発生しました: {e}") from e
+         elif isinstance(e, ValueError):
+              raise ValueError(f"検出器パスの取得中に無効な値が指定されました: {e}") from e # ValueErrorはそのまま
+         else: # ConfigError
+              raise e # ConfigErrorはそのまま
+    except Exception as e:
+        logger.error(f"検出器パス取得中に予期せぬエラー: {e}", exc_info=True)
+        raise FileError(f"検出器パスの取得中に予期せぬエラーが発生しました: {detector_name}, version={version}. 詳細: {e}") from e
 
-def get_dataset_paths(config: Dict[str, Any], dataset_name: str) -> Tuple[Path, Path, str]:
+# --- Data Paths --- #
+
+def get_dataset_paths(config: Dict[str, Any], dataset_name: str) -> Tuple[Path, Path, str, str]:
     """
-    設定とデータセット名から音声ディレクトリ、ラベルディレクトリ、ラベルパターンを取得する。
+    指定されたデータセットの音声ディレクトリ、参照ディレクトリ、およびパターンを取得する。
+
+    `config['datasets'][dataset_name]` の設定と `config['paths']['datasets_base']` を参照する。
+    パスは絶対パスに解決される。
 
     Parameters
     ----------
     config : Dict[str, Any]
-        プロジェクト設定辞書。
+        アプリケーション設定辞書。
     dataset_name : str
-        データセット名 (`config['datasets']` のキー)。
+        `config['datasets']` 内のキー。
 
     Returns
     -------
-    Tuple[Path, Path, str]
-        (音声ディレクトリパス, ラベルディレクトリパス, ラベルファイルパターン)
+    Tuple[Path, Path, str, str]
+        (audio_dir_path, ref_dir_path, audio_pattern, ref_pattern) のタプル。
 
     Raises
     ------
     ConfigError
-        データセット設定が見つからない、またはパスが無効な場合。
-    FileNotFoundError
-        指定されたディレクトリが存在しない場合。
+        設定が見つからないか、不正な場合。
+    FileError
+        ディレクトリが存在しない場合。
     """
-    if 'datasets' not in config or dataset_name not in config['datasets']:
-        msg = f"設定ファイルにデータセット '{dataset_name}' の定義が見つかりません。"
-        logger.error(msg)
-        raise ConfigError(msg)
+    datasets_config = config.get('datasets')
+    if not datasets_config or dataset_name not in datasets_config:
+        raise ConfigError(f"設定ファイルにデータセット '{dataset_name}' の定義が見つかりません。")
 
-    dataset_config = config['datasets'][dataset_name]
-    audio_dir_str = dataset_config.get('audio_dir')
-    label_dir_str = dataset_config.get('label_dir')
-    label_pattern = dataset_config.get('label_pattern', '*.csv') # デフォルト *.csv
+    ds_config = datasets_config[dataset_name]
+    required_keys = ['audio_dir', 'label_dir', 'audio_pattern', 'label_pattern']
+    if not all(key in ds_config for key in required_keys):
+        missing = [key for key in required_keys if key not in ds_config]
+        raise ConfigError(f"データセット '{dataset_name}' の設定に不足しているキーがあります: {missing}")
 
-    if not audio_dir_str or not label_dir_str:
-        msg = f"データセット '{dataset_name}' の設定に 'audio_dir' または 'label_dir' が不足しています。"
-        logger.error(msg)
-        raise ConfigError(msg)
+    # データセット固有のベースパスがあればそれを使う、なければ全体のベースパス
+    dataset_base_override = ds_config.get('datasets_base')
+    if dataset_base_override:
+         datasets_base_str = dataset_base_override
+         source = f"データセット '{dataset_name}' 固有の datasets_base"
+    else:
+         datasets_base_str = config.get('paths', {}).get('datasets_base', 'datasets')
+         source = "全体の paths.datasets_base"
 
-    # パスを解決 (プロジェクトルート基準の可能性あり)
-    audio_dir = get_absolute_path(audio_dir_str)
-    label_dir = get_absolute_path(label_dir_str)
+    logger.debug(f"{source} からデータセットベースパスを取得: {datasets_base_str}")
 
-    # ディレクトリの存在確認
-    if not audio_dir.is_dir():
-        msg = f"データセット '{dataset_name}' の音声ディレクトリが見つからないか、ディレクトリではありません: {audio_dir}"
-        logger.error(msg)
-        raise FileNotFoundError(msg)
-    if not label_dir.is_dir():
-        msg = f"データセット '{dataset_name}' のラベルディレクトリが見つからないか、ディレクトリではありません: {label_dir}"
-        logger.error(msg)
-        raise FileNotFoundError(msg)
+    base_dir = Path(datasets_base_str)
+    project_root = get_project_root()
+    if not base_dir.is_absolute():
+        base_dir = (project_root / base_dir).resolve()
 
-    logger.info(f"データセット '{dataset_name}' のパスを取得: Audio='{audio_dir}', Labels='{label_dir}', Pattern='{label_pattern}'")
-    return audio_dir, label_dir, label_pattern
+    if not base_dir.is_dir():
+         # ここで ensure_dir しない方が良い (データセットディレクトリは存在している前提)
+         raise ConfigError(f"データセットのベースディレクトリが見つかりません ({source}): {base_dir}")
 
-def get_output_dir(base_dir: Path, unique_suffix: str) -> Path:
+    # 各ディレクトリパスを解決
+    try:
+        audio_dir_rel = Path(ds_config['audio_dir'])
+        audio_dir = (base_dir / audio_dir_rel).resolve() if not audio_dir_rel.is_absolute() else audio_dir_rel.resolve()
+        if not audio_dir.is_dir():
+            raise FileError(f"Audio directory not found for dataset '{dataset_name}': {audio_dir}")
+
+        label_dir_rel = Path(ds_config['label_dir']) # label_dir を使用
+        label_dir = (base_dir / label_dir_rel).resolve() if not label_dir_rel.is_absolute() else label_dir_rel.resolve()
+        if not label_dir.is_dir():
+             raise FileError(f"Label directory not found for dataset '{dataset_name}': {label_dir}")
+
+        # パターンを取得
+        audio_pattern = ds_config['audio_pattern']
+        label_pattern = ds_config['label_pattern'] # label_pattern を使用
+
+        if not isinstance(audio_pattern, str) or not isinstance(label_pattern, str):
+             raise ConfigError(f"データセット '{dataset_name}' の audio_pattern または label_pattern が文字列ではありません。")
+
+        return audio_dir, label_dir, audio_pattern, label_pattern
+
+    except FileError as e:
+        # ディレクトリが存在しないエラーはそのまま送出
+        raise e
+    except Exception as e:
+        logger.error(f"データセット '{dataset_name}' のパス解決中にエラー: {e}", exc_info=True)
+        raise ConfigError(f"データセット '{dataset_name}' のパス設定の処理中にエラーが発生しました。設定を確認してください。詳細: {e}") from e
+
+# --- Output Directory Construction --- #
+
+def get_output_dir(base_dir: Path, *subdirs: str, unique_suffix: Optional[str] = None) -> Path:
     """
-    一意のサフィックスを持つ出力ディレクトリパスを生成し、存在を確認/作成する。
+    指定されたベースディレクトリの下に、サブディレクトリと一意なサフィックスを持つ出力パスを構築する。
+    注意: この関数はパスを構築するだけで、ディレクトリの作成は行わない。
+         ディレクトリ作成は ensure_dir を呼び出し元で使用する。
 
     Parameters
     ----------
     base_dir : Path
-        出力のベースとなるディレクトリ。
-    unique_suffix : str
-        サブディレクトリ名となる一意のサフィックス。安全な文字列か検証される。
+        出力のベースとなるディレクトリ (例: get_output_base_dir() の戻り値)。絶対パスである必要あり。
+    *subdirs : str
+        ベースディレクトリの下に作成するサブディレクトリ名のシーケンス。
+    unique_suffix : Optional[str], optional
+        パスの末尾に追加する一意な文字列 (例: ジョブID, セッションID+タイムスタンプ)。
+        Noneの場合、サフィックスは追加されない。
 
     Returns
     -------
     Path
-        生成された出力ディレクトリのパス。
+        構築された出力ディレクトリの絶対パス。
 
     Raises
     ------
     ValueError
-        unique_suffix に不正な文字が含まれる場合。
-    FileError, PermissionError
-        ディレクトリ作成に失敗した場合。
+        ベースディレクトリが絶対パスでない、またはサブディレクトリ名やサフィックスに不正な文字が含まれている場合。
+    TypeError
+        base_dir が Path オブジェクトでない場合。
     """
-    if not is_safe_path_component(unique_suffix):
-        raise ValueError(f"出力ディレクトリのサフィックスに使用できない文字が含まれています: {unique_suffix}")
-    output_dir = base_dir / unique_suffix
-    return ensure_dir(output_dir) # ensure_dir がエラー処理を行う
+    if not isinstance(base_dir, Path):
+        raise TypeError("base_dir must be a Path object.")
+    if not base_dir.is_absolute():
+        raise ValueError("base_dir must be an absolute path.")
+
+    current_path = base_dir
+
+    # サブディレクトリを安全に追加
+    for subdir in subdirs:
+        if not is_safe_path_component(subdir):
+            raise ValueError(f"サブディレクトリ名に不正な文字が含まれています: '{subdir}'")
+        current_path /= subdir
+
+    # 一意なサフィックスを追加
+    if unique_suffix:
+        if not is_safe_path_component(unique_suffix):
+             raise ValueError(f"一意なサフィックスに不正な文字が含まれています: '{unique_suffix}'")
+        current_path = current_path / unique_suffix
+
+    # ensure_created=False なのでディレクトリ作成は行わない
+    # if ensure_created:
+    #     try:
+    #         ensure_dir(current_path, check_writable=True) # 作成し、書き込み可能か確認
+    #     except (FileError, TypeError) as e:
+    #         # ensure_dir からのエラーをそのまま送出
+    #         raise FileError(f"出力ディレクトリの作成またはアクセスに失敗しました: {current_path}. 詳細: {e}") from e
+
+    return current_path.resolve()
+
+# --- Setup & Utilities --- #
 
 def setup_python_path() -> None:
     """
@@ -738,12 +885,27 @@ def setup_python_path() -> None:
     except Exception as e:
          logger.error(f"PYTHONPATH設定中に予期せぬエラー: {e}", exc_info=True)
 
+# --- Deprecated Path Functions (Remove after refactoring) --- #
 
-# --- モジュールのインポート時に実行 ---
-# 1. PYTHONPATH設定
+# def get_evaluation_results_dir() -> Path:
+#     """(Deprecated) Get the directory for evaluation results."""
+#     # ...
+
+# def get_grid_search_results_dir() -> Path:
+#     """(Deprecated) Get the directory for grid search results."""
+#     # ...
+
+# def get_session_dir(session_id: str) -> Path:
+#     """(Deprecated) Get the directory for a specific session."""
+#     # ...
+
+# def get_state_dir() -> Path:
+#     """(Deprecated) Get the directory for state files."""
+#     # ...
+
+# --- Module Initialization --- #
 setup_python_path()
-# 2. 環境変数読み込み（setup_python_path内で呼ばれるが、明示的に呼んでも良い）
-# load_environment_variables()
+# load_environment_variables() # Optionally load here, or let consuming code call it.
 
 # --- 安全なパスコンポーネント検証関数 (再掲) --- #
 def is_safe_path_component(component: str) -> bool:

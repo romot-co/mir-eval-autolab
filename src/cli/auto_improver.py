@@ -16,9 +16,10 @@ import numpy as np
 import yaml # yaml をインポート
 
 # Add project root to sys.path to allow importing detectors
-project_root = os.path.dirname(os.path.abspath(__file__))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+# project_root = os.path.dirname(os.path.abspath(__file__))
+# スクリプト実行時のパスではなく、utilsを使ってプロジェクトルートを取得する
+# if project_root not in sys.path:
+#     sys.path.insert(0, project_root)
 
 # path_utils をインポート (get_project_root など必要な関数)
 from src.utils.path_utils import (
@@ -47,7 +48,7 @@ except ImportError as e:
     DETECTOR_REGISTRY = {}
 
 # MCPクライアントライブラリ
-import mcp.client
+from mcp.client import Client as MCPClient # クラス名を直接インポート
 
 # --- Logging Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s:%(name)s:%(message)s')
@@ -156,7 +157,7 @@ class AutoImprover:
         logging.getLogger('auto_improver').setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
         # MCPクライアントの初期化
-        self.client = mcp.client.Client(self.server_url)
+        self.client = MCPClient(self.server_url)
         logger.info(f"MCPクライアントを初期化しました（サーバーURL: {self.server_url}）")
         logger.info(f"Improvement settings: max_iterations={self.max_iterations}, threshold={self.improvement_threshold}, grid_search={self.grid_search_enabled}")
 

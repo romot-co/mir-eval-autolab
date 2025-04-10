@@ -4,17 +4,20 @@
 
 本プロジェクトは、音楽情報検索 (MIR) アルゴリズム、特に音符検出、オンセット検出、ピッチ推定などの性能評価と比較を容易にするためのフレームワークを提供します。
 
+**8割Vibeコーディングで生成されています。**
+
 **主な機能:**
 
-*   **標準化された評価:** `mir_eval` ライブラリに基づいた客観的な評価指標（Precision, Recall, F-measure）を算出します。ノートベース評価（ポリフォニー対応）とフレームベース評価の両方をサポートします。
-*   **合成データ生成:** アルゴリズムの頑健性をテストするための多様な合成音声データセット（ノイズ、リバーブ、ポリフォニー、パーカッションなど）を簡単に生成できます。
-*   **柔軟な評価実行:** 単一ファイルまたはディレクトリ全体、単一または複数の検出器、カスタムパラメータでの評価が可能です。
+*   **評価:** `mir_eval` ライブラリに基づいた客観的な評価指標（Precision, Recall, F-measure）を算出します。ノートベース評価（ポリフォニー対応）とフレームベース評価の両方をサポートします。
+*   **合成データ生成:** 多様な合成音声データセット（ノイズ、リバーブ、ポリフォニー、パーカッションなど）を生成できます。
+*   **評価実行:** 単一ファイルまたはディレクトリ全体、単一または複数の検出器、カスタムパラメータでの評価が可能です。
 *   **結果の可視化:** 検出結果と参照データを比較するプロットを生成できます。
 *   **パラメータ最適化:** グリッドサーチにより、検出器の最適なパラメータ設定を探索できます。
 
 ### 1.1 実験的機能：AI駆動自動改善システム (AutoImprover)
 
-**注意:** 本プロジェクトには、AIを活用してMIRアルゴリズムの改善サイクルを自動化する**実験的な機能**が含まれています。これは、AIがアルゴリズム自体を発見・進化させる可能性を探求する試みであり、活発な開発下にあります。安定性や結果の品質は保証されません。
+**注意:** 本プロジェクトには、AIを活用してMIRアルゴリズムの改善サイクルを自動化する**実験的な機能**が含まれています。これは、AIがアルゴリズム自体を発見・改善させる可能性を探求する試みであり、安定性や結果の品質は保証されません。
+基本的にはLLM自体で手動で試すよりも品質が低く安定しないとお考えください。
 
 **AI駆動自動改善システムの詳細なセットアップ、利用方法、トラブルシューティングについては、[`MCP_README.md`](MCP_README.md) を参照してください。**
 
@@ -28,19 +31,33 @@
 │   │   └── grid_search/     # グリッドサーチ関連
 │   ├── data_generation/     # 合成データ生成
 │   ├── utils/               # 共通ユーティリティ (パス, 例外, etc.)
-│   └── visualization/       # 可視化関数
+│   ├── visualization/       # 可視化関数
+│   ├── science_automation/  # (実験的) 科学自動化戦略など
+│   └── cli/                 # コマンドラインインターフェーススクリプト
+│       ├── mcp_server.py        # (実験的) MCPサーバー起動スクリプト
+│       ├── improver_cli.py      # 評価・グリッドサーチ用CLI
+│       ├── auto_improver.py     # (実験的) 自動改善クライアント
+│       └── setup_claude_integration.py # (実験的) Claude Desktop連携設定
 ├── mcp_server_logic/        # (実験的) MCPサーバーの中核ロジック
-│   ├── db_utils.py        # データベース操作 (SQLite)
-│   ├── job_manager.py       # 非同期ジョブ管理
-│   └── session_manager.py   # 改善セッション管理
+│   ├── core.py              # 設定読み込み、非同期ジョブワーカー、クリーンアップ等
+│   ├── db_utils.py          # 非同期DB操作 (aiosqlite)
+│   ├── job_manager.py       # 非同期ジョブキュー・状態管理
+│   ├── session_manager.py   # 改善セッション管理
+│   ├── llm_tools.py         # LLM連携ツール
+│   ├── evaluation_tools.py  # 評価/グリッドサーチ実行ツール
+│   ├── code_tools.py        # コード取得/保存ツール
+│   ├── improvement_loop.py  # 改善ループ/戦略提案ツール
+│   ├── visualization_tools.py # 可視化ツール
+│   ├── serialization_utils.py # シリアライズ関連ユーティリティ
+│   └── mcp_server_extensions.py # (オプション) 拡張ツール
 ├── tests/                   # テストコード
 ├── datasets/                # データファイル (設定ファイルや .env でパス指定)
 ├── templates/               # (実験的) プロンプトテンプレート等
-├── mcp_workspace/           # MCPサーバーのデフォルト作業ディレクトリ (DB, 結果, ログ等)
-├── improver_cli.py          # コマンドラインインターフェース (評価, グリッドサーチ, AI改善起動)
-├── mcp_server.py            # (実験的) MCPサーバー (FastAPI/Uvicorn) 起動スクリプト
-├── auto_improver.py         # (実験的) 自動改善サイクル実行クライアント
-├── setup_claude_integration.py # (実験的) Claude Desktop連携設定ツール
+├── mcp_workspace/           # MCPサーバーのデフォルト作業ディレクトリ
+│   ├── db/                  # データベースファイル (mcp_server_state.db)
+│   ├── improved_versions/   # AIが改善したコード
+│   ├── results/             # 評価・グリッドサーチ結果
+│   └── logs/                # MCPサーバーログなど
 ├── pyproject.toml           # プロジェクト設定、依存関係 (uv が使用)
 ├── config.yaml              # プロジェクト全体の設定ファイル
 ├── requirements-lock.txt    # (推奨) 生成された依存関係ロックファイル
@@ -79,7 +96,7 @@
     `.gitignore` に `.venv/` を追加してください。
 
 4.  **依存関係のインストール:**
-    `pyproject.toml` に基づいて依存関係をインストールします。
+    `pyproject.toml` に基づいて依存関係をインストールします。**非同期DBアクセスに必要な `aiosqlite` なども含まれます。**
 
     *   **(推奨) ロックファイルを使用する場合:**
         事前に推奨されるロックファイル (`requirements-lock.txt` など) を生成しておきます。
@@ -106,23 +123,23 @@
         必要なオプション (`numba`, `crepe`) は適宜調整してください。
 
 5.  **環境変数の設定:**
-    `.env.example` をコピーして `.env` を作成し、必要な設定（特にAPIキーなど）を行います。`.env` ファイルは Git にコミットしないでください。
+    `.env.example` をコピーして `.env` を作成し、必要な設定（特にAPIキー、ワークスペースパスなど）を行います。`.env` ファイルは Git にコミットしないでください。
     ```bash
     cp .env.example .env
     # nano .env や vim .env などで編集
     ```
-    環境変数は `config.yaml` の値を上書きします。詳細は `MCP_README.md` または `mcp_server_logic/core.py` の `load_config` 関数の Docstring を参照してください。
+    環境変数は `config.yaml` の値を上書きします。詳細は `MCP_README.md` または `src/mcp_server_logic/core.py` の `load_config` 関数の Docstring を参照してください。
 
 6.  **合成データ生成 (評価に必要):**
     ```bash
-    python src/data_generation/generate_all.py
+    python -m src.data_generation.generate_all
     ```
     これにより、`datasets/synthesized/` (または `config.yaml` や環境変数で指定されたパス) 以下に評価用の音声とラベルが生成されます。
 
 ## 4. 基本的な使用方法 (評価とグリッドサーチ)
 
-コマンドラインからの操作は `improver_cli.py` を使用します。
-**注意:** 以下のコマンド (`evaluate`, `grid-search`) は、バックグラウンドでMCPサーバー (`mcp_server.py`) のAPIツールを呼び出します。そのため、これらのコマンドを実行する前に **MCPサーバーが起動している必要があります** (詳細は `MCP_README.md` 参照)。
+コマンドラインからの操作は `src/cli/improver_cli.py` を使用します。
+**注意:** 以下のコマンド (`evaluate`, `grid-search`) は、バックグラウンドで動作する**非同期MCPサーバー (`src/cli/mcp_server.py`)** のAPIツールを呼び出します。そのため、これらのコマンドを実行する前に **MCPサーバーが起動している必要があります** (詳細は `MCP_README.md` 参照)。サーバーはリクエストを受け付けると、評価やグリッドサーチを**非同期ジョブ**として実行します。
 
 ### 4.1. アルゴリズム評価 (`evaluate` コマンド)
 
@@ -131,18 +148,19 @@
 **基本的な使い方:**
 
 ```bash
-python improver_cli.py evaluate --detector PZSTDDetector --dataset synthesized_v1 --output-dir results/pzstd_eval
+# MCPサーバーが別ターミナルなどで起動している前提
+python -m src.cli.improver_cli evaluate --detector PZSTDDetector --dataset synthesized_v1 --output-dir mcp_workspace/results/pzstd_eval
 ```
 
 *   `--detector`: 評価する検出器のクラス名を指定します。
 *   `--dataset`: `config.yaml` で定義されたデータセット名を指定します。
-*   `--output-dir`: 結果（JSONやプロット）の保存先ディレクトリを指定します。
+*   `--output-dir`: 結果（JSONやプロット）の保存先ディレクトリを指定します。**注意: このパスはサーバー側の `mcp_workspace/results` (または設定による) 配下に解釈されます。** クライアント側で絶対パスを指定しても、サーバー側で検証・調整される可能性があります。
 *   **(オプション) 個別ファイル指定:** `--audio-path` と `--ref-path` でファイルを直接指定します (`--dataset` と排他)。指定されたパスはサーバー側で検証されます。
 *   **(オプション) パラメータ指定 (JSON形式):** `--detector-params` でパラメータを上書きします。
 *   **(オプション) 保存設定:** `--plot/--no-plot`, `--json/--no-json`。
 *   **(オプション) 評価指標の選択:** `--note/--no-note`, `--pitch/--no-pitch`, `--frame/--no-frame`。
 
-詳細は `python improver_cli.py evaluate --help` を参照してください。
+詳細は `python -m src.cli.improver_cli evaluate --help` を参照してください。
 
 ### 4.2. パラメータグリッドサーチ (`grid-search` コマンド)
 
@@ -162,7 +180,8 @@ dataset_name: synthesized_v1
 **ステップ 2: グリッドサーチの実行**
 
 ```bash
-python improver_cli.py grid-search grid_config.yaml --output-dir results/pzstd_gridsearch --best-metric note.f_measure
+# MCPサーバーが別ターミナルなどで起動している前提
+python -m src.cli.improver_cli grid-search grid_config.yaml --output-dir results/pzstd_gridsearch --best-metric note.f_measure
 ```
 
 *   最初の引数にグリッド設定ファイルのパスを指定します。パスはサーバー側で検証されます。
@@ -171,7 +190,7 @@ python improver_cli.py grid-search grid_config.yaml --output-dir results/pzstd_g
 *   `--num-procs`: (オプション) 並列実行プロセス数。
 *   `--skip-existing`: (オプション) 既存結果のスキップ。
 
-詳細は `python improver_cli.py grid-search --help` を参照してください。
+詳細は `python -m src.cli.improver_cli grid-search --help` を参照してください。
 
 ## 5. 合成データセット詳細
 
@@ -226,7 +245,8 @@ python improver_cli.py grid-search grid_config.yaml --output-dir results/pzstd_g
     docker run -p 5002:5002 \
            -e ANTHROPIC_API_KEY="<あなたのAPIキー>" \
            -v $(pwd)/mcp_workspace:/app/mcp_workspace \
-           mirex-auto-improver
+           mirex-auto-improver \
+           python -m src.cli.mcp_server
     ```
     *   `-p`: ポートをホストにマッピングします。
     *   `-e`: APIキーなどの環境変数を渡します。

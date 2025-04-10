@@ -14,19 +14,21 @@ import json
 # --- PYTHONPATH設定 ---
 # スクリプトの場所に基づいてプロジェクトルートを決定
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR # このスクリプトがプロジェクトルートにある前提
+# PROJECT_ROOT = SCRIPT_DIR # このスクリプトがプロジェクトルートにある前提
+# src/cli/ に移動したので、プロジェクトルートは2つ上
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
-if str(PROJECT_ROOT / 'src') not in sys.path: # srcも追加
-    sys.path.append(str(PROJECT_ROOT / 'src'))
+# src/ は PROJECT_ROOT を追加すれば不要なはず
+# if str(PROJECT_ROOT / 'src') not in sys.path: # srcも追加
+#     sys.path.append(str(PROJECT_ROOT / 'src'))
 
 # --- モジュールインポート ---
 try:
     from src.utils.path_utils import (
         get_project_root, load_environment_variables, get_workspace_dir,
-        get_evaluation_results_dir, get_grid_search_results_dir,
-        get_improved_versions_dir, get_audio_dir, get_label_dir,
-        get_dataset_paths, get_output_dir, ensure_dir
+        get_dataset_paths, get_output_dir, ensure_dir,
+        validate_path_within_allowed_dirs
     )
     # exception_utils から必要な例外をインポート
     from src.utils.exception_utils import (
@@ -40,7 +42,7 @@ try:
     # MCPクライアントやAutolabクライアントは現状未使用のためコメントアウト or 削除
     # from src.autolab.autolab_client import AutoLabClient
     # AutoImprover クラスをインポート
-    from auto_improver import AutoImprover
+    from src.cli.auto_improver import AutoImprover
 
 except ImportError as e:
     print(f"エラー: 必要なモジュールのインポートに失敗しました: {e}", file=sys.stderr)
@@ -75,6 +77,19 @@ PROJECT_ROOT = get_project_root()
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / 'config.yaml'
 DEFAULT_CONFIG = load_default_config(DEFAULT_CONFIG_PATH)
 CONFIG = DEFAULT_CONFIG.copy()
+
+# --- Define allowed directories for client-side input validation ---
+# クライアント側で読み取りアクセスを検証する基本ディレクトリ
+# (サーバー側でもさらに厳密な検証が行われる)
+try:
+    CLIENT_ALLOWED_READ_DIRS = [
+        PROJECT_ROOT,
+        get_workspace_dir(config=CONFIG) # workspaceも許可
+        # 必要に応じてデータセットベースなども追加可能だが、まずはシンプルに
+    ]
+except Exception as e:
+    logger.error(f"クライアントの許可ディレクトリ設定中にエラー: {e}. パス検証が機能しない可能性があります。")
+    CLIENT_ALLOWED_READ_DIRS = [] # エラー時は空リストにフォールバック
 
 # パス設定 (環境変数 > .env > デフォルト)
 CONFIG['paths'] = CONFIG.get('paths', {})
@@ -238,76 +253,55 @@ async def run(
 @app.command()
 def visualize(
     session_id: str = typer.Argument(..., help="視覚化するセッションID"),
-    output_path: Optional[Path] = typer.Option(None, "--output", "-o", help="グラフ画像の保存先パス。省略時は表示のみ。", resolve_path=True),
+    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="グラフ画像の保存先ディレクトリ。省略時はサーバー側で決定。", resolve_path=True),
 ):
     """改善セッションの軌跡を視覚化します。"""
     typer.echo(f"セッション {session_id} の改善軌跡を視覚化しています...")
 
+    payload = {"session_id": session_id}
+
+    # ユーザー指定の出力ディレクトリがあればペイロードに追加
+    # (visualize系ツールも output_dir を受け付けるように修正されている前提)
+    if output_dir:
+        payload['output_dir'] = str(output_dir)
+
     try:
-        # 修正: visualize_sessionを直接呼び出す代わりに、MCPサーバーのツールを呼び出す
-        # visualize_improvement_trajectory ツールを呼び出す
-        payload = {"session_id": session_id}
-        job_info = call_mcp_api("visualize_improvement_trajectory", payload) # エンドポイントは仮
-        job_id = job_info.get("job_id")
-        if not job_id:
-            typer.echo("エラー: 可視化ジョブの開始に失敗しました。", err=True)
-            logger.error(f"MCPサーバーでの可視化ジョブ開始失敗。 session_id={session_id}")
-            raise typer.Exit(code=1)
-        typer.echo(f"可視化ジョブが開始されました。Job ID: {job_id}")
+        # 可視化ツール呼び出し (仮のツール名: visualize_session_history)
+        # 実際のツール名に応じて変更してください
+        vis_tool_name = "visualize_session_history"
+        response = call_mcp_api(vis_tool_name, payload)
 
-        # ジョブ完了を待機
-        status = monitor_job_status(job_id, timeout=300) # タイムアウトを短めに設定
-
-        # 結果を取得
-        final_job_info = call_mcp_api(f"job/status/{job_id}", method="GET")
-
-        if final_job_info.get('status') == 'completed':
-            result = final_job_info.get('result', {})
-            chart_path = result.get("chart_path")
-            if chart_path:
-                typer.echo(f"視覚化完了！チャートが作成されました: {chart_path}")
-                # 必要であればローカルにコピーまたは表示
-                if output_path:
-                     # TODO: サーバーからファイルをダウンロードする機能が必要
-                     typer.echo(f"チャートを {output_path} に保存する機能は未実装です。サーバー上のパス: {chart_path}")
-                     pass
-            else:
-                typer.echo("チャートパスが結果に含まれていません。", err=True)
-
-            # 改善メトリクスの表示
-            if "initial_f_measure" in result and "final_f_measure" in result:
-                initial_f = result["initial_f_measure"]
-                final_f = result["final_f_measure"]
-                improvement_pct = result.get("improvement_percent", 0)
-                iterations = result.get("iterations", "?") # イテレーション数も取得試行
-
-                typer.echo(f"初期F値: {initial_f:.4f} → 最終F値: {final_f:.4f}")
-                typer.echo(f"改善率: {improvement_pct:.2f}%")
-                typer.echo(f"イテレーション数: {iterations}") # イテレーション数を表示
-        elif final_job_info.get('status') == 'failed':
-             error_msg = final_job_info.get('error', '不明なエラー')
-             typer.echo(f"視覚化に失敗しました: {error_msg}", err=True)
+        job_id = response.get('job_id')
+        if job_id:
+            typer.echo(f"可視化ジョブを開始しました。Job ID: {job_id}")
+            typer.echo("ジョブの完了を待機します...")
+            monitor_job_status(job_id)
+            typer.echo("可視化ジョブが完了しました。")
+            # 完了後、結果のパスなどを表示（サーバーからの応答による）
+            # 例: final_status = call_mcp_api(f"job/status/{job_id}", method="GET")
+            #     output_files = final_status.get('result', {}).get('output_files', [])
+            #     if output_files:
+            #         typer.echo("生成されたファイル:")
+            #         for f in output_files:
+            #             typer.echo(f"- {f}")
         else:
-             typer.echo(f"可視化ジョブが予期しないステータスで終了しました: {final_job_info.get('status')}", err=True)
+            typer.echo(f"エラー: ジョブの開始に失敗しました。応答: {response}", err=True)
+            raise typer.Exit(code=1)
 
     except RequestError as e:
-        logger.error(f"MCPサーバーとの通信に失敗しました: {e}", exc_info=True)
-        typer.echo(f"エラー: MCPサーバーとの通信に失敗しました: {e}", err=True)
-        raise typer.Exit(code=1)
-    except TimeoutError as e:
-        logger.error(f"処理がタイムアウトしました: {e}")
-        typer.echo(f"エラー: タイムアウトしました: {e}", err=True)
+        logger.error(f"可視化リクエストエラー: {e}")
+        typer.echo(f"エラー: サーバーへのリクエストに失敗しました: {e}", err=True)
         raise typer.Exit(code=1)
     except Exception as e:
-        logger.error(f"視覚化処理中に予期せぬエラーが発生しました: {e}", exc_info=True)
-        typer.echo(f"視覚化処理中にエラーが発生しました: {e}", err=True)
+        # RequestError, TimeoutError, RuntimeError from monitor_job_status etc.
+        logger.error(f"可視化ジョブ実行中にエラー: {e}", exc_info=True)
+        typer.echo(f"エラー: {e}", err=True)
         raise typer.Exit(code=1)
-
 
 @app.command()
 async def evaluate(
     detector_name: str = typer.Option(..., "--detector", "-d", help="使用する検出器の名前"),
-    output_dir: Optional[Path] = typer.Option(Path("evaluation_results"), "--output", "-o", help="評価結果を保存するディレクトリ", resolve_path=True),
+    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="評価結果の出力先ディレクトリ (省略時はサーバーが自動生成)", resolve_path=True),
     audio_path: Optional[Path] = typer.Option(None, "--audio-path", help="評価対象のオーディオファイルまたはディレクトリのパス（dataset と排他）", exists=True, resolve_path=True),
     ref_path: Optional[Path] = typer.Option(None, "--ref-path", help="参照ファイルまたはディレクトリのパス（dataset と排他）", exists=True, resolve_path=True),
     dataset_name: Optional[str] = typer.Option(None, "--dataset", "-D", help="使用するデータセット名 (config.yaml で定義)。audio-path/ref-path と排他。"),
@@ -323,19 +317,32 @@ async def evaluate(
     """
     logger.info(f"検出器 '{detector_name}' の評価を開始します (MCPサーバー呼び出し)...")
 
-    # 引数のバリデーション
-    if dataset_name and (audio_path or ref_path):
-        logger.error("--dataset オプションと --audio-path/--ref-path オプションは同時に指定できません。")
-        typer.echo("エラー: --dataset オプションと --audio-path/--ref-path オプションは同時に指定できません。", err=True)
+    # --- 入力パス検証 (クライアント側) ---
+    validated_audio_path: Optional[str] = None
+    validated_ref_path: Optional[str] = None
+    try:
+        if audio_path:
+            validated_audio_path = str(validate_path_within_allowed_dirs(
+                audio_path, CLIENT_ALLOWED_READ_DIRS, check_existence=True, check_is_file=True
+            ))
+        if ref_path:
+            validated_ref_path = str(validate_path_within_allowed_dirs(
+                ref_path, CLIENT_ALLOWED_READ_DIRS, check_existence=True, check_is_file=True
+            ))
+    except (ValueError, FileError, ConfigError) as e:
+        logger.error(f"入力パスの検証に失敗しました: {e}")
+        typer.echo(f"エラー: 入力パスの検証に失敗しました: {e}", err=True)
         raise typer.Exit(code=1)
+
+    # --- 引数バリデーション (dataset vs audio/ref) ---
     if not dataset_name and not (audio_path and ref_path):
         logger.error("--dataset または (--audio-path と --ref-path の両方) のいずれかを指定する必要があります。")
         typer.echo("エラー: --dataset または (--audio-path と --ref-path の両方) のいずれかを指定する必要があります。", err=True)
         raise typer.Exit(code=1)
-    if (audio_path and not ref_path) or (not audio_path and ref_path):
-         logger.error("--audio-path と --ref-path は両方指定する必要があります。")
-         typer.echo("エラー: --audio-path と --ref-path は両方指定する必要があります。", err=True)
-         raise typer.Exit(code=1)
+    if dataset_name and (audio_path or ref_path):
+        logger.error("--dataset オプションと --audio-path/--ref-path オプションは同時に指定できません。")
+        typer.echo("エラー: --dataset オプションと --audio-path/--ref-path オプションは同時に指定できません。", err=True)
+        raise typer.Exit(code=1)
 
     typer.echo(f"検出器: {detector_name}" + (f" (バージョン: {code_version})" if code_version else " (最新バージョン)"))
     if dataset_name:
@@ -358,8 +365,8 @@ async def evaluate(
         tool_payload = {
             "detector_name": detector_name,
             "dataset_name": dataset_name,
-            "audio_path": str(audio_path.resolve()) if audio_path else None,
-            "ref_path": str(ref_path.resolve()) if ref_path else None,
+            "audio_path": validated_audio_path,
+            "ref_path": validated_ref_path,
             "output_dir": str(output_dir.resolve()) if output_dir else None,
             "code_version": code_version,
             # サーバー側のツールが解釈するオプション
@@ -439,7 +446,7 @@ async def evaluate(
 @app.command(name="grid-search")
 async def grid_search(
     config_path: Path = typer.Argument(..., help="グリッドサーチ設定ファイル (YAML) のパス。", exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True),
-    output_dir: Path = typer.Option(None, "--output", "-o", help="グリッドサーチ結果の出力先ディレクトリ。省略時は設定ファイル名に基づいて自動生成。", resolve_path=True),
+    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="グリッドサーチ結果の出力先ディレクトリ (省略時はサーバーが自動生成)", resolve_path=True),
     num_procs: Optional[int] = typer.Option(None, "--num-procs", "-p", help="並列処理に使用するプロセス数。省略時は自動検出 (サーバー側)。"),
     skip_existing: bool = typer.Option(False, "--skip-existing", help="既存の結果をスキップする (サーバー側)。"),
     best_metric: str = typer.Option("note.f_measure", "--best-metric", "-b", help="最適化対象とするメトリック名 (例: 'note.f_measure', 'pitch.accuracy')。")
@@ -449,6 +456,17 @@ async def grid_search(
     MCPサーバーの `run_grid_search` ツールを呼び出します。
     """
     logger.info(f"グリッドサーチを開始します (設定ファイル: {config_path}, MCPサーバー呼び出し)...")
+
+    # --- 入力パス検証 (クライアント側) ---
+    validated_config_path: str
+    try:
+        validated_config_path = str(validate_path_within_allowed_dirs(
+            config_path, CLIENT_ALLOWED_READ_DIRS, check_existence=True, check_is_file=True
+        ))
+    except (ValueError, FileError, ConfigError) as e:
+        logger.error(f"グリッドサーチ設定ファイルのパス検証に失敗しました: {e}")
+        typer.echo(f"エラー: 設定ファイルのパス検証に失敗しました: {e}", err=True)
+        raise typer.Exit(code=1)
 
     # --- 出力ディレクトリの決定ロジックは維持 (サーバーに渡す情報として) ---
     final_output_dir: Optional[Path] = None # Optional に変更
@@ -486,7 +504,7 @@ async def grid_search(
 
         # run_grid_search ツールの引数を準備
         tool_payload = {
-            "config_path": str(config_path.resolve()), # 設定ファイルのパスは必須
+            "config_path": validated_config_path,
             "output_dir": str(final_output_dir.resolve()) if final_output_dir else None,
             "num_procs": num_procs,
             "skip_existing": skip_existing,

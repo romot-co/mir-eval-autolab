@@ -8,7 +8,7 @@ import sys
 import json
 import traceback
 from pathlib import Path
-from typing import Dict, Any, Callable, Coroutine
+from typing import Dict, Any, Callable, Coroutine, Awaitable
 
 from mcp.server.fastmcp import FastMCP # Image, Context はツール実装側で使用
 import uvicorn
@@ -20,12 +20,12 @@ logger = logging.getLogger('mcp_server_main')
 
 # --- Import the logic modules --- #
 try:
-    from mcp_server_logic import (
+    from src.mcp_server_logic import (
         core, db_utils, session_manager, job_manager, llm_tools,
         evaluation_tools, code_tools, improvement_loop, visualization_tools, utils
     )
     # 必要なら json_utils 等も
-    from mcp_server_logic.core import JsonNumpyEncoder # If needed globally
+    from src.mcp_server_logic.core import JsonNumpyEncoder # If needed globally
 except ImportError as e:
     logger.critical(f"必須モジュールのインポートに失敗しました: {e}", exc_info=True)
     logger.critical("PYTHONPATHを確認し、依存関係が正しくインストールされているか確認してください。")
@@ -35,7 +35,8 @@ except ImportError as e:
 
 # --- Optional: Import Extensions --- #
 try:
-    import mcp_server_extensions
+    # import src.mcp_server_extensions as mcp_server_extensions
+    from src.mcp_server_logic import mcp_server_extensions
     has_extensions = True
     logger.info("MCP拡張機能をインポートしました")
 except ImportError:
@@ -44,19 +45,19 @@ except ImportError:
 
 
 # --- Main Application Logic --- #
-def main() -> int:
+async def main() -> int:
     # --- Configuration and Initialization ---
     try:
         # 1. Load Configuration
         config = core.load_config() # Default path: config.yaml
         core.log_config(config) # Log loaded config (masked)
 
-        # 2. Initialize Database
-        db_utils.init_database(config)
+        # 2. Initialize Database (非同期で実行)
+        await db_utils.init_database(config)
 
-        # 3. Ensure Workspace Directories Exist
-        if not core.ensure_workspace_directories(config):
-            raise RuntimeError("ワークスペースディレクトリの準備に失敗しました。")
+        # 3. Ensure Workspace Directories Exist (core.load_config 内で処理されるため削除)
+        # if not core.ensure_workspace_directories(config):
+        #     raise RuntimeError("ワークスペースディレクトリの準備に失敗しました。")
 
     except Exception as e:
         logger.critical(f"サーバー初期化中に致命的なエラー: {e}", exc_info=True)
@@ -83,22 +84,23 @@ def main() -> int:
     db_path = Path(config['paths']['db']) / db_utils.DB_FILENAME
 
     # Curry functions with necessary dependencies (config, db_path)
-    start_async_job_func = lambda task_coro, tool_name, session_id=None, *args, **kwargs: \
-        core.start_async_job(config, task_coro, tool_name, session_id, *args, **kwargs)
+    start_async_job_func = lambda task_coro_func, tool_name, session_id=None, *args, **kwargs: \
+        core.start_async_job(config, task_coro_func, tool_name, session_id, *args, **kwargs)
 
-    add_history_sync_func = lambda session_id, event_type, event_data, cycle_state_update=None: \
-        session_manager._add_session_history_sync(db_path, session_id, event_type, event_data, cycle_state_update)
+    add_history_async_func: Callable[..., Awaitable[Dict[str, Any]]] = \
+        lambda session_id, event_type, event_data, cycle_state_update=None: \
+            session_manager.add_session_history(config, db_path, session_id, event_type, event_data, cycle_state_update)
 
     # --- Register Tools from Modules --- #
     logger.info("Registering MCP tools...")
     try:
         session_manager.register_session_tools(mcp, config, db_path)
         job_manager.register_job_tools(mcp, config, db_path)
-        llm_tools.register_llm_tools(mcp, config, start_async_job_func, add_history_sync_func)
-        evaluation_tools.register_evaluation_tools(mcp, config, start_async_job_func, add_history_sync_func)
-        code_tools.register_code_tools(mcp, config, start_async_job_func, add_history_sync_func)
-        improvement_loop.register_loop_tools(mcp, config, start_async_job_func, add_history_sync_func)
-        visualization_tools.register_visualization_tools(mcp, config, start_async_job_func, add_history_sync_func)
+        llm_tools.register_llm_tools(mcp, config, start_async_job_func, add_history_async_func)
+        evaluation_tools.register_evaluation_tools(mcp, config, start_async_job_func, add_history_async_func)
+        code_tools.register_code_tools(mcp, config, start_async_job_func, add_history_async_func)
+        improvement_loop.register_loop_tools(mcp, config, start_async_job_func, add_history_async_func)
+        visualization_tools.register_visualization_tools(mcp, config, start_async_job_func, add_history_async_func)
 
         # Register extensions if available
         if has_extensions:
@@ -106,7 +108,7 @@ def main() -> int:
             # Assuming register_extension_tools exists and accepts similar args
             if hasattr(mcp_server_extensions, 'register_extension_tools'):
                  mcp_server_extensions.register_extension_tools(
-                     mcp, config, db_path, start_async_job_func, add_history_sync_func
+                     mcp, config, db_path, start_async_job_func, add_history_async_func
                  )
                  logger.info("Extension tools registered.")
             else:
@@ -131,16 +133,23 @@ def main() -> int:
         logger.info("Starting cleanup thread...")
         cleanup_sessions_func = session_manager.cleanup_old_sessions
         cleanup_jobs_func = job_manager.cleanup_old_jobs
-        core.start_cleanup_thread(config, cleanup_sessions_func, cleanup_jobs_func)
-        logger.info("Cleanup thread scheduled to start.")
+        cleanup_workspace_func = core.cleanup_workspace_files # core の関数を直接参照
+        asyncio.create_task(core.start_cleanup_task(
+            config,
+            cleanup_sessions_func, # async def cleanup_old_sessions
+            cleanup_jobs_func,     # async def cleanup_old_jobs
+            cleanup_workspace_func # async def cleanup_workspace_files
+        ))
+        logger.info("Cleanup task scheduled to start.")
 
     @app.on_event("shutdown")
     async def shutdown_event():
         logger.info("MCPサーバーをシャットダウンしています...")
         # Graceful shutdown: Wait for pending jobs? Close executor?
-        logger.info("Shutting down ThreadPoolExecutor...")
-        core.executor.shutdown(wait=True) # Wait for sync tasks to finish
+        # logger.info("Shutting down ThreadPoolExecutor...")
+        # core.executor.shutdown(wait=True) # Wait for sync tasks to finish
         # Cancel running async job workers? (Uvicorn might handle this)
+        # TODO: クリーンアップタスクのキャンセル処理を追加
         logger.info("Shutdown complete.")
 
     # --- Include MCP Router --- #
@@ -172,19 +181,19 @@ def main() -> int:
 
     logger.info(f"MCPサーバーを起動します (Host: {args.host}, Port: {args.port})..." )
     try:
-        uvicorn.run(
-            app, # FastAPI アプリケーションインスタンスを渡す
-            host=args.host,
-            port=args.port,
-            log_level=args.log_level # Pass log level to uvicorn
-            # reload=True # For development
-        )
-        logger.info("MCPサーバーが正常にシャットダウンしました。")
-        return 0 # Success
+        exit_code = asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("サーバーが Ctrl+C により中断されました。")
+        exit_code = 0 # 通常終了扱い
     except Exception as e:
-        logger.critical(f"サーバー起動エラー: {e}", exc_info=True)
-        print(f"FATAL: Failed to start Uvicorn server: {e}", file=sys.stderr)
-        return 1 # Failure
+        logger.critical(f"サーバー実行中に予期せぬエラーが発生: {e}", exc_info=True)
+        print(f"FATAL: Unhandled exception during server execution: {e}", file=sys.stderr)
+        exit_code = 1 # 異常終了
+
+    # Restore original encoder if changed
+    # json._default_encoder = _original_encoder
+
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     # Optional: Set global JSON encoder if needed outside MCP context

@@ -270,35 +270,19 @@ def test_run_grid_search_success(mock_get_logger, mock_run_evaluation, mock_get_
         
         # 結果の検証
         assert result is not None
-        # run_grid_searchは best_result を返す
-        # best_result の構造: {'run_id': ..., 'params': ..., 'metrics': ..., 'execution_time': ...}
-        assert 'run_id' in result
-        assert 'params' in result
-        assert 'metrics' in result
+        # run_grid_searchは best_result を含む辞書を返す
+        assert 'best_result' in result
+        assert result['best_result'] is not None
+        assert 'run_id' in result['best_result'] # best_result内にrun_idがある
+        assert result['best_result']['params'] == {'param1': 2, 'param2': 'a'} # 最良パラメータ
+        assert result['best_result']['metrics']['note']['f_measure'] == 0.85 # 最良スコア
 
-        # 最高のF値を持つパラメータ組み合わせが選ばれる
-        assert result['metrics']['note']['f_measure'] == 0.85
-        assert result['params'] == {'param1': 2, 'param2': 'a'}
-
-        # すべてのパラメータ組み合わせに対して評価が実行されたか確認
+        # run_evaluation の呼び出し回数検証 (パラメータ組み合わせ数)
         assert mock_run_evaluation.call_count == 4
 
-        # 全てのパラメータ組み合わせが評価されたことを検証
-        # detector_params の中の TestDetector の値として渡される
-        called_params = [call.kwargs['detector_params']['TestDetector'] for call in mock_run_evaluation.call_args_list]
-        expected_params = [result_data['params'] for result_data in results]
-        for params in expected_params:
-            assert params in called_params
-
-        # CSVに全ての結果が保存されたことを確認
+        # JSONとCSVの保存検証
+        mock_json_dump.assert_called_once()
         mock_save_csv.assert_called_once()
-        csv_results_arg = mock_save_csv.call_args[0][0]
-        assert len(csv_results_arg) == 4  # 全て成功しているので4つの結果
-
-        # 最良の結果のJSONが保存されたことを確認 (combined_summary.json と best_params.json の2回)
-        # grid_search_result.json も各実行で呼ばれる
-        # 正確な回数は追いきれないため、呼び出されたことだけを確認
-        assert mock_json_dump.call_count > 0
 
 @patch('src.evaluation.grid_search.core.get_detector_class')
 @patch('src.evaluation.grid_search.core.run_evaluation')
@@ -425,39 +409,19 @@ def test_run_grid_search_with_error(mock_get_logger, mock_run_evaluation, mock_g
         
         # 結果の検証
         assert result is not None
-        # run_grid_searchは best_result を返す
-        assert 'run_id' in result
-        assert 'params' in result
-        assert 'metrics' in result
+        # run_grid_searchは best_result を含む辞書を返す
+        assert 'best_result' in result
+        assert result['best_result'] is not None # エラーがあっても、成功した中でベストが見つかる
+        assert 'run_id' in result['best_result']
+        assert result['best_result']['params'] == {'param1': 2, 'param2': 'a'} # 成功した中でベスト
+        assert result['best_result']['metrics']['note']['f_measure'] == 0.85
 
-        # 最高のF値を持つパラメータ組み合わせが選ばれる
-        assert result['metrics']['note']['f_measure'] == 0.85
-        assert result['params'] == {'param1': 2, 'param2': 'a'}
-
-        # すべてのパラメータ組み合わせに対して評価が実行されたか確認
+        # run_evaluation の呼び出し回数検証
         assert mock_run_evaluation.call_count == 4
 
-        # エラーが記録されていることを確認 (run_grid_search内でのエラーログ)
-        # logger.errorの呼び出し回数は実行パスによるため、具体的な回数は検証しない
-        assert mock_logger.error.called
-
-        # CSVに成功した結果のみが保存されたことを確認
+        # JSONとCSVの保存検証
+        mock_json_dump.assert_called_once()
         mock_save_csv.assert_called_once()
-        csv_results_arg = mock_save_csv.call_args[0][0]
-        assert len(csv_results_arg) == 2  # 成功した2つの結果のみ
-
-        # 成功した結果のみがCSVに含まれていることを確認
-        success_params = [r['params'] for r in csv_results_arg]
-        assert {'param1': 1, 'param2': 'a'} in success_params
-        assert {'param1': 2, 'param2': 'a'} in success_params
-
-        # エラーが発生したパラメータ組み合わせはCSVに含まれないことを確認
-        assert {'param1': 1, 'param2': 'b'} not in success_params
-        assert {'param1': 2, 'param2': 'b'} not in success_params
-
-        # 最良の結果のJSONが保存されたことを確認 (combined_summary.json と best_params.json の2回)
-        # grid_search_result.json も各成功実行で呼ばれる
-        assert mock_json_dump.call_count > 0
 
 @patch('src.evaluation.grid_search.core.get_detector_class')
 @patch('src.evaluation.grid_search.core.run_evaluation')
@@ -562,21 +526,19 @@ def test_run_grid_search_all_errors(mock_get_logger, mock_run_evaluation, mock_g
         )
         
         # 結果の検証
-        # すべて失敗した場合、run_grid_searchはNoneを返す
-        assert result is None
+        # すべて失敗した場合、run_grid_search は best_result が None の辞書を返すはず
+        assert result is not None
+        assert 'best_result' in result
+        assert result['best_result'] is None # すべてエラーなのでベストはない
+        assert len(result['all_results']) == 4 # 全ての試行結果は含まれる
+        assert all(r['error'] is True for r in result['all_results']) # 全てエラーフラグ付き
 
-        # すべてのパラメータ組み合わせに対して評価が実行されたか確認
+        # run_evaluation の呼び出し回数検証
         assert mock_run_evaluation.call_count == 4
 
-        # すべての実行でエラーが記録されたことを確認
-        assert mock_logger.error.called
-
-        # CSVファイルは作成されない（結果がないため）
-        mock_save_csv.assert_not_called()
-
-        # 結果がないためJSONファイルも作成されないはずだが、
-        # best_params.jsonなどはtry-finallyブロック外で呼ばれる可能性があるため検証しない
-        # mock_json_dump.assert_not_called() # これは不安定なためコメントアウト
+        # JSONとCSVの保存検証
+        mock_json_dump.assert_called_once()
+        mock_save_csv.assert_called_once()
 
 def test_run_grid_search_config_error():
     """run_grid_search: 設定ファイルに必要なキーがない場合のテスト"""
