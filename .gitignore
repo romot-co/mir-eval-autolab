@@ -8,6 +8,13 @@
 # /mcp_workspace/ # Or /.mcp_server_data/ if renamed later
 /.mcp_server_data/
 
+# Old output directories (to be removed eventually)
+# /evaluation_results/
+# /grid_search_results/
+# /visualizations/
+# /scientific_output/
+# /results/
+
 # ========================================
 # ======== Database, Logs & Temp ========
 # ========================================
@@ -24,8 +31,8 @@
 # ========================================
 # ====== Environment Specific Files ======
 # ========================================
-.env # IMPORTANT: Never commit secrets!
-.env.* # Include specific .env files like .env.development if needed, but be careful!
+.env
+.env.*
 
 # ========================================
 # ========= Python Specific Files ========
