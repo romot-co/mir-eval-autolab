@@ -30,12 +30,16 @@ import tempfile
 from pathlib import Path
 from tqdm import tqdm
 import yaml
+import multiprocessing
+from functools import partial
+import pandas as pd
 
 from src.utils.audio_utils import load_audio_file, load_reference_data, make_output_path
 from src.utils.exception_utils import log_exception, create_error_result
 from src.utils.json_utils import NumpyEncoder
 from src.utils.detection_result import DetectionResult
 from src.utils.detector_utils import get_detector_class, normalize_detection_result
+from src.utils.path_utils import ensure_dir, get_evaluation_results_dir, get_output_dir
 from src.evaluation.evaluation_io import create_summary_dataframe, save_evaluation_result, print_summary_statistics
 
 import mir_eval
@@ -371,6 +375,68 @@ def create_error_result(error_msg: str) -> Dict[str, float]:
         'overall_accuracy': 0.0
     }
 
+def _evaluate_file_for_detector(detector_name, params, audio_ref_tuple, output_base_dir, eval_id, evaluator_config, save_plots, plot_format, plot_config, save_results_json):
+    """単一の音声ファイルに対して単一の検出器を評価する関数 (並列処理用)
+    
+    Parameters
+    ----------
+    detector_name : str
+        検出器名
+    params : dict or None
+        検出器のパラメータ
+    audio_ref_tuple : tuple
+        (audio_file, ref_file) のタプル
+    output_base_dir : Path
+        出力ディレクトリのベースパス
+    eval_id : str
+        評価ID
+    evaluator_config : dict or None
+        評価設定
+    save_plots : bool
+        プロットを保存するかどうか
+    plot_format : str
+        プロット形式
+    plot_config : dict or None
+        プロット設定
+    save_results_json : bool
+        結果をJSONで保存するかどうか
+        
+    Returns
+    -------
+    dict
+        評価結果の辞書
+    """
+    audio_file, ref_file = audio_ref_tuple
+    detector_specific_output_dir = output_base_dir / detector_name / eval_id
+    detector_specific_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 評価実行
+    try:
+        file_result = evaluate_detector(
+            detector_name=detector_name,
+            detector_params=params,
+            audio_file=str(audio_file),
+            ref_file=str(ref_file),
+            output_dir=str(detector_specific_output_dir),
+            evaluator_config=evaluator_config,
+            save_plots=save_plots,
+            plot_format=plot_format,
+            plot_config=plot_config,
+            save_results_json=save_results_json
+        )
+        file_result['audio_file'] = str(audio_file)
+        file_result['ref_file'] = str(ref_file)
+        return file_result
+    except Exception as e:
+        logger.error(f"ファイル {audio_file.name} の評価中にエラー (並列処理): {e}")
+        error_result = create_error_result(str(e))
+        error_result['audio_file'] = str(audio_file)
+        error_result['ref_file'] = str(ref_file)
+        error_result['detector_name'] = detector_name
+        error_result['detection_time'] = 0.0
+        error_result['valid'] = False
+        return error_result
+
 def run_evaluation(
     detector_names: Union[str, List[str]],
     audio_paths: Optional[Union[str, List[str]]] = None,
@@ -405,7 +471,7 @@ def run_evaluation(
         plot_config (Optional[Dict[str, Any]]): プロット設定。
         dataset_name (Optional[str]): 使用するデータセット名 (config.yaml で定義)。
                                       audio_paths/ref_paths が省略された場合に必須。
-        num_procs (Optional[int]): 並列処理に使用するプロセス数 (未実装)。
+        num_procs (Optional[int]): 並列処理に使用するプロセス数。Noneの場合はシングルプロセスで実行。
 
     Returns:
         Dict[str, Any]: 評価結果のサマリーを含む辞書。
@@ -422,7 +488,7 @@ def run_evaluation(
         if isinstance(audio_paths, str):
             if Path(audio_paths).is_dir():
                 # ディレクトリの場合はファイルを検索 (例: *.wav)
-                final_audio_paths = sorted(list(Path(audio_paths).glob('*.wav')))
+                final_audio_paths = sorted([p for p in Path(audio_paths).glob('*.wav')], key=str)
                 # TODO: .flacなども考慮
             else:
                 final_audio_paths = [Path(audio_paths)]
@@ -435,7 +501,7 @@ def run_evaluation(
         if isinstance(ref_paths, str):
             if Path(ref_paths).is_dir():
                 # ディレクトリの場合はファイルを検索 (拡張子は仮)
-                final_ref_paths = sorted(list(Path(ref_paths).glob('*.csv')))
+                final_ref_paths = sorted([p for p in Path(ref_paths).glob('*.csv')], key=str)
             else:
                 final_ref_paths = [Path(ref_paths)]
         elif isinstance(ref_paths, list):
@@ -479,7 +545,7 @@ def run_evaluation(
             raise FileNotFoundError(f"データセットのラベルディレクトリが見つかりません: {label_dir_path}")
 
         # ファイルリストを取得してペアリング
-        audio_files_found = sorted(list(audio_dir_path.glob(audio_pattern)))
+        audio_files_found = sorted([p for p in audio_dir_path.glob(audio_pattern)], key=str)
         ref_files_dict = {p.stem: p for p in label_dir_path.glob(label_pattern)}
 
         if not audio_files_found:
@@ -495,7 +561,7 @@ def run_evaluation(
         if not final_audio_paths:
             raise ValueError(f"データセット '{dataset_name}' で音声ファイルと参照ファイルのペアが見つかりませんでした。")
         logger.info(f"データセット '{dataset_name}' から {len(final_audio_paths)} ペアのファイルをロードしました。")
-
+            
     else:
         raise ValueError("audio_paths/ref_paths または dataset_name のいずれかを指定する必要があります。")
 
@@ -511,7 +577,7 @@ def run_evaluation(
     else:
         # デフォルトの出力先 (mcp_serverのワークスペース内を想定)
         try:
-            from src.utils.path_utils import get_evaluation_results_dir
+            # 既にファイル先頭でインポート済みなので直接使用
             output_base_dir = get_evaluation_results_dir()
         except ImportError:
             output_base_dir = Path("./evaluation_results")
@@ -525,31 +591,91 @@ def run_evaluation(
     total_files = len(final_audio_paths)
     logger.info(f"合計 {total_files} ファイルの評価を開始します。検出器: {detector_names}")
 
-    # tqdm を使用してプログレスバーを表示
-    for i, (audio_file, ref_file) in enumerate(tqdm(zip(final_audio_paths, final_ref_paths), total=total_files, desc="Evaluating files")):
-        logger.debug(f"Processing file {i+1}/{total_files}: {audio_file.name}")
-
-        # 各検出器で処理
+    # マルチプロセス処理を実行するかどうか
+    use_multiprocessing = num_procs is not None and num_procs > 1 and total_files > 1
+    
+    if use_multiprocessing:
+        # プロセス数の決定
+        if num_procs <= 0:
+            # 自動設定: CPUコア数に基づく
+            num_procs = multiprocessing.cpu_count()
+        
+        logger.info(f"マルチプロセス評価を実行します (プロセス数: {num_procs})")
+        
+        # 各検出器で並列処理
         for detector_name in detector_names:
+            # 並列処理用の出力ディレクトリを作成
             detector_specific_output_dir = output_base_dir / detector_name / eval_id
             detector_specific_output_dir.mkdir(parents=True, exist_ok=True)
-
-            # evaluate_detector を呼び出す (引数を修正)
-            file_result = evaluate_detector(
-                detector_name=detector_name,
-                detector_params=detector_params.get(detector_name),
-                audio_file=str(audio_file),
-                ref_file=str(ref_file),
-                output_dir=str(detector_specific_output_dir), # 出力先を渡す
+            
+            # 並列処理用の関数を準備
+            process_func = partial(
+                _evaluate_file_for_detector,
+                detector_name,
+                detector_params.get(detector_name),
+                output_base_dir=output_base_dir,
+                eval_id=eval_id,
                 evaluator_config=evaluator_config,
                 save_plots=save_plots,
                 plot_format=plot_format,
                 plot_config=plot_config,
-                save_results_json=save_results_json # file ごとのjson保存も制御
+                save_results_json=save_results_json
             )
-            file_result['audio_file'] = str(audio_file) # 結果にファイル名を追加
-            file_result['ref_file'] = str(ref_file)
-            results_per_detector[detector_name].append(file_result)
+            
+            # ファイルペアのリスト
+            file_pairs = list(zip(final_audio_paths, final_ref_paths))
+            
+            # 並列処理を実行
+            with multiprocessing.Pool(num_procs) as pool:
+                # tqdmでプログレスバーを表示しながら並列処理
+                file_results = list(tqdm(
+                    pool.imap(process_func, file_pairs),
+                    total=len(file_pairs),
+                    desc=f"Evaluating {detector_name}"
+                ))
+                
+                # 結果を保存
+                results_per_detector[detector_name].extend(file_results)
+    else:
+        # シングルプロセスでの処理
+        # tqdm を使用してプログレスバーを表示
+        for i, (audio_file, ref_file) in enumerate(tqdm(zip(final_audio_paths, final_ref_paths), total=total_files, desc="Evaluating files")):
+            logger.debug(f"Processing file {i+1}/{total_files}: {audio_file.name}")
+
+            # 各検出器で処理
+            for detector_name in detector_names:
+                detector_specific_output_dir = output_base_dir / detector_name / eval_id
+                detector_specific_output_dir.mkdir(parents=True, exist_ok=True)
+
+                try:
+                    # evaluate_detector を呼び出す
+                    file_result = evaluate_detector(
+                        detector_name=detector_name,
+                        detector_params=detector_params.get(detector_name),
+                        audio_file=str(audio_file),
+                        ref_file=str(ref_file),
+                        output_dir=str(detector_specific_output_dir), # 出力先を渡す
+                        evaluator_config=evaluator_config,
+                        save_plots=save_plots,
+                        plot_format=plot_format,
+                        plot_config=plot_config,
+                        save_results_json=save_results_json # file ごとのjson保存も制御
+                    )
+                    file_result['audio_file'] = str(audio_file) # 結果にファイル名を追加
+                    file_result['ref_file'] = str(ref_file)
+                    results_per_detector[detector_name].append(file_result)
+                except Exception as e:
+                    logger.error(f"ファイル {audio_file.name} の評価中にエラーが発生しました ({detector_name}): {e}")
+                    # エラー情報を結果に追加するか、あるいは単にスキップするか。
+                    # ここではスキップし、サマリー計算時に考慮されるようにする。
+                    # 必要であれば、エラー情報を含む結果を results_per_detector に追加することも可能。
+                    results_per_detector[detector_name].append({
+                        'audio_file': str(audio_file),
+                        'ref_file': str(ref_file),
+                        'detector_name': detector_name,
+                        'status': 'error',
+                        'error_message': str(e)
+                    }) # エラー情報を含む結果を追加する方針に変更
 
     # --- 結果集計 ---
     all_results = {
@@ -569,7 +695,13 @@ def run_evaluation(
         
         # 概要をログとコンソールに出力
         logger.info(f"--- 評価サマリー ({detector_name}) ---")
-        print_summary_statistics(summary, detector_name)
+        # summaryがDataFrameの場合のみprint_summary_statisticsを呼び出す
+        if isinstance(summary, pd.DataFrame):
+            print_summary_statistics(summary, detector_name)
+        elif isinstance(summary, dict) and 'error_count' in summary:
+             logger.warning(f"{detector_name} の評価で {summary.get('error_count', 0)} 件のエラーが発生しました。エラー例: {summary.get('error_message_sample', 'N/A')}")
+        else:
+            logger.warning(f"{detector_name} の評価サマリーが予期しない形式です。表示をスキップします。")
 
     # 総合結果をJSONで保存
     if save_results_json:
@@ -587,7 +719,6 @@ def run_evaluation(
     logger.info(f"評価が完了しました (所要時間: {elapsed_time:.2f}秒)")
 
     # MCPに返す結果（サマリー部分）
-    # ここでは主要なメトリクスだけを返すなど、調整が必要かもしれない
     return all_results # とりあえず全結果を返す
 
 def _calculate_evaluation_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -604,51 +735,63 @@ def _calculate_evaluation_summary(results: List[Dict[str, Any]]) -> Dict[str, An
     Dict[str, Any]
         評価結果の要約
     """
+    # 結果リストが空の場合、空のサマリーを返す
+    if not results:
+        return {}
+        
     # 検出器ごとのサマリを計算
     detector_summary = {}
     
     for detector_name in {result["detector_name"] for result in results}:
-        # 対象の検出器の結果のみをフィルタ
-        detector_results = [r for r in results if r["detector_name"] == detector_name]
+        # 対象の検出器の結果のみをフィルタ (エラーでないもののみ)
+        detector_results = [r for r in results if r["detector_name"] == detector_name and r.get('status') != 'error']
         
+        # 有効な結果がない場合は、エラー情報を返すか空にする
+        if not detector_results:
+             # エラーのみの結果から代表的なエラーメッセージを取得（オプション）
+             error_messages = [r.get('error_message', 'Unknown error') for r in results if r["detector_name"] == detector_name]
+             detector_summary[detector_name] = {
+                 "files_count": len(results), # 全ファイル数をカウント
+                 "error_count": len(error_messages),
+                 "error_message_sample": error_messages[0] if error_messages else "No valid results"
+             }
+             continue # 次の検出器へ
+             
         # 検出時間の平均を計算
         avg_detection_time = sum(r["detection_time"] for r in detector_results) / len(detector_results)
         
-        # 評価結果の集計
-        onset_precision = [r["evaluation"]["onset"]["precision"] for r in detector_results]
-        onset_recall = [r["evaluation"]["onset"]["recall"] for r in detector_results]
-        onset_f_measure = [r["evaluation"]["onset"]["f_measure"] for r in detector_results]
-        
-        offset_precision = [r["evaluation"]["offset"]["precision"] for r in detector_results]
-        offset_recall = [r["evaluation"]["offset"]["recall"] for r in detector_results]
-        offset_f_measure = [r["evaluation"]["offset"]["f_measure"] for r in detector_results]
-        
-        pitch_precision = [r["evaluation"]["pitch"]["precision"] for r in detector_results]
-        pitch_recall = [r["evaluation"]["pitch"]["recall"] for r in detector_results]
-        pitch_f_measure = [r["evaluation"]["pitch"]["f_measure"] for r in detector_results]
-        
-        note_precision = [r["evaluation"]["note"]["precision"] for r in detector_results]
-        note_recall = [r["evaluation"]["note"]["recall"] for r in detector_results]
-        note_f_measure = [r["evaluation"]["note"]["f_measure"] for r in detector_results]
-        
-        # オプショナルな指標（フレーム評価）
-        frame_pitch_metrics = {
-            "voicing_recall": [],
-            "voicing_false_alarm": [],
-            "raw_pitch_accuracy": [],
-            "raw_chroma_accuracy": [],
-            "overall_accuracy": [],
-            "precision": [],
-            "recall": [],
-            "f_measure": [],
-            "accuracy": []
-        }
-        
-        for r in detector_results:
-            if "frame_pitch" in r["evaluation"]:
-                for metric in frame_pitch_metrics:
-                    if metric in r["evaluation"]["frame_pitch"]:
-                        frame_pitch_metrics[metric].append(r["evaluation"]["frame_pitch"][metric])
+        # 評価結果の集計 (キー名を 'evaluation' から 'evaluation_metrics' に変更)
+        onset_precision = [r["evaluation_metrics"]["onset"]["precision"] for r in detector_results]
+        onset_recall = [r["evaluation_metrics"]["onset"]["recall"] for r in detector_results]
+        onset_f_measure = [r["evaluation_metrics"]["onset"]["f_measure"] for r in detector_results]
+        note_precision = [r["evaluation_metrics"]["note"]["precision"] for r in detector_results]
+        note_recall = [r["evaluation_metrics"]["note"]["recall"] for r in detector_results]
+        note_f_measure = [r["evaluation_metrics"]["note"]["f_measure"] for r in detector_results]
+        offset_precision = [r["evaluation_metrics"]["offset"]["precision"] for r in detector_results]
+        offset_recall = [r["evaluation_metrics"]["offset"]["recall"] for r in detector_results]
+        offset_f_measure = [r["evaluation_metrics"]["offset"]["f_measure"] for r in detector_results]
+        pitch_precision = [r["evaluation_metrics"]["pitch"]["precision"] for r in detector_results]
+        pitch_recall = [r["evaluation_metrics"]["pitch"]["recall"] for r in detector_results]
+        pitch_f_measure = [r["evaluation_metrics"]["pitch"]["f_measure"] for r in detector_results]
+
+        # フレーム評価結果の集計 (存在する場合のみ)
+        frame_results = [r["evaluation_metrics"]["frame_pitch"] for r in detector_results if "frame_pitch" in r["evaluation_metrics"]]
+        if frame_results:
+            frame_pitch = {
+                "voicing_recall": sum(frame_results, start=0.0) / len(frame_results),
+                "voicing_false_alarm": 1.0 - sum(frame_results, start=0.0) / len(frame_results),
+                "raw_pitch_accuracy": sum(frame_results, start=0.0) / len(frame_results),
+                "raw_chroma_accuracy": sum(frame_results, start=0.0) / len(frame_results),
+                "overall_accuracy": sum(frame_results, start=0.0) / len(frame_results)
+            }
+        else:
+            frame_pitch = {
+                "voicing_recall": 0.0,
+                "voicing_false_alarm": 1.0,
+                "raw_pitch_accuracy": 0.0,
+                "raw_chroma_accuracy": 0.0,
+                "overall_accuracy": 0.0
+            }
         
         # サマリの作成
         summary = {
@@ -673,21 +816,22 @@ def _calculate_evaluation_summary(results: List[Dict[str, Any]]) -> Dict[str, An
                 "precision": sum(note_precision) / len(note_precision),
                 "recall": sum(note_recall) / len(note_recall),
                 "f_measure": sum(note_f_measure) / len(note_f_measure)
-            }
+            },
+            "frame_pitch": frame_pitch
         }
         
-        # フレーム評価の結果が存在すれば追加
-        frame_pitch = {}
-        for metric, values in frame_pitch_metrics.items():
-            if values:
-                frame_pitch[metric] = sum(values) / len(values)
-        
-        if frame_pitch:
-            summary["frame_pitch"] = frame_pitch
-        
         detector_summary[detector_name] = summary
-    
-    return detector_summary
+
+    # 検出器名をキーとする辞書ではなく、最初の検出器のサマリ(summary)を返すように修正
+    # (run_evaluationが期待する形式に合わせる - 要確認)
+    # return detector_summary # 元のコード
+    # if detector_summary:
+    #     # 最初の検出器のサマリを返す（複数検出器のケースは別途検討）
+    #     first_detector_name = list(detector_summary.keys())[0]
+    #     return detector_summary[first_detector_name]
+    # else:
+    #     return {} # 有効な結果がない場合
+    return detector_summary # 元の実装に戻す
 
 def create_summary(results: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """

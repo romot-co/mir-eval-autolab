@@ -12,21 +12,70 @@ from mcp_server_logic.utils import generate_id, get_timestamp # Assuming these u
 
 @pytest.fixture
 def in_memory_db(monkeypatch):
-    """Creates an in-memory SQLite database and sets up the schema."""
-    db_path = ":memory:"
+    """Creates an in-memory SQLite database and sets up the schema directly."""
+    db_path_id = ":memory:"
 
-    # Mock get_db_connection to always return connection to in-memory db
-    conn = sqlite3.connect(db_path)
+    # Create the in-memory connection
+    conn = sqlite3.connect(db_path_id, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    original_get_conn = db_utils.get_db_connection
-    monkeypatch.setattr(db_utils, 'get_db_connection', lambda path: conn if path == db_path else original_get_conn(path))
 
-    # Setup schema
-    db_utils.initialize_database(db_path) # Pass the :memory: path
+    # --- Directly create schema in the in-memory DB --- #
+    try:
+        cursor = conn.cursor()
+        # Copy table creation SQL from db_utils.init_database
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            base_algorithm TEXT,
+            start_time REAL,
+            last_update REAL,
+            status TEXT,
+            history TEXT,
+            config TEXT,
+            current_metrics TEXT,
+            best_metrics TEXT,
+            best_code_version TEXT,
+            best_code_path TEXT,
+            baseline_metrics TEXT,
+            cycle_state TEXT
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            job_id TEXT PRIMARY KEY,
+            session_id TEXT,
+            tool_name TEXT,
+            status TEXT,
+            start_time REAL,
+            end_time REAL,
+            result TEXT,
+            error_details TEXT,
+            task_args TEXT,
+            worker_id TEXT,
+            FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+        )
+        """)
+        # Add indices if necessary for tests, though likely not critical for in-memory
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_last_update ON sessions(last_update);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);")
+        # ... add other indices if needed ...
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        pytest.fail(f"DB schema creation failed in fixture: {e}")
+    # --- Schema creation done --- #
 
-    yield db_path, conn # Provide path and connection to the test
+    # Mock get_db_connection to *always* return the in-memory connection
+    def mock_get_conn_always(path: Path):
+        return conn
+    monkeypatch.setattr(db_utils, 'get_db_connection', mock_get_conn_always)
 
-    # Cleanup (close connection)
+    # Mock init_database to do nothing, as we created the schema manually
+    monkeypatch.setattr(db_utils, 'init_database', lambda *args, **kwargs: None)
+
+    yield db_path_id, conn # Provide identifier and connection
+
+    # Cleanup
     conn.close()
 
 # --- Test db_utils functions ---

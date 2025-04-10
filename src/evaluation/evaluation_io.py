@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Dict, Any, List, Union, Tuple, Optional
 
 from src.utils.json_utils import NumpyEncoder
+from src.utils.exception_utils import FileError, log_exception
+
+logger = logging.getLogger(__name__) # モジュールレベルのロガーを取得
 
 def save_evaluation_result(result: Dict[str, Any], output_path: str) -> None:
     """
@@ -56,14 +59,14 @@ def load_evaluation_result(input_path: str) -> Dict[str, Any]:
 
 def load_multiple_evaluation_results(input_dir: str, pattern: str = "*_evaluation.json") -> List[Dict[str, Any]]:
     """
-    複数の評価結果をディレクトリからロードします。
+    指定されたディレクトリから複数の評価結果ファイルをロードします。
 
     Parameters
     ----------
     input_dir : str
         入力ディレクトリのパス
     pattern : str, optional
-        ファイル検索パターン, by default "*_evaluation.json"
+        検索するファイルパターン, by default "*_evaluation.json"
 
     Returns
     -------
@@ -71,18 +74,37 @@ def load_multiple_evaluation_results(input_dir: str, pattern: str = "*_evaluatio
         評価結果の辞書のリスト
     """
     results = []
-    
+
     # ディレクトリ内のファイルを検索
     input_path = Path(input_dir)
+    if not input_path.is_dir():
+        logger.error(f"指定された入力パスはディレクトリではありません: {input_dir}")
+        # FileError を発生させるか、空リストを返すか？ -> エラーとして処理
+        raise FileError(f"入力パスがディレクトリではありません: {input_dir}")
+
     files = list(input_path.glob(pattern))
-    
+    logger.info(f"{len(files)} 件の評価結果ファイルを {input_dir} からロードします (パターン: {pattern})。")
+
     for file_path in files:
         try:
             result = load_evaluation_result(str(file_path))
             results.append(result)
+        except FileNotFoundError:
+            # ファイルが見つからない場合は警告ログ (ループは継続)
+            logger.warning(f"評価結果ファイルが見つかりません: {file_path}")
+        except PermissionError:
+            # パーミッションエラーも警告ログ (ループは継続)
+            logger.warning(f"ファイルへのアクセス権がありません: {file_path}")
+        except json.JSONDecodeError as json_err:
+            # JSONデコードエラーは警告ログ (ループは継続)
+            logger.warning(f"JSONファイルの解析に失敗しました: {file_path} - {json_err}")
         except Exception as e:
-            logging.warning(f"ファイル {file_path} のロード中にエラーが発生しました: {str(e)}")
-    
+            # その他の予期せぬエラーはエラーログを出し、カスタム例外でラップすることも検討
+            log_exception(logger, e, f"ファイル {file_path} のロード中に予期せぬエラーが発生しました", log_level=logging.ERROR)
+            # 必要に応じて raise FileError(...) from e するか、ループを継続するか判断
+            # ここでは処理を継続し、ロードできたものだけを返す方針とする
+
+    logger.info(f"{len(results)} 件の評価結果を正常にロードしました。")
     return results
 
 def print_summary_statistics(results_summary: pd.DataFrame, logger: logging.Logger = None, 

@@ -37,11 +37,12 @@ async def get_job_status(config: Dict[str, Any], db_path: Path, job_id: str) -> 
         # pending or running の場合はDBも確認する（ワーカーによって更新されている可能性）
 
     # メモリにない、または完了/失敗していない場合はDBを確認
+    row = None
     try:
         row = await db_utils.db_fetch_one_async(db_path, "SELECT * FROM jobs WHERE job_id = ?", (job_id,))
-    except sqlite3.Error as db_err:
-         logger.error(f"ジョブ状態取得 DBエラー ({job_id}): {db_err}", exc_info=True)
-         raise StateManagementError(f"Failed to fetch job status due to DB error: {db_err}") from db_err
+    except StateManagementError as sme:
+         logger.error(f"ジョブ状態取得 DBエラー ({job_id}): {sme}", exc_info=False)
+         raise sme # StateManagementError はそのまま再発生
     except Exception as e:
          logger.error(f"ジョブ状態取得中に予期せぬエラー ({job_id}): {e}", exc_info=True)
          raise StateManagementError(f"Unexpected error fetching job status: {e}") from e

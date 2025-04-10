@@ -27,32 +27,35 @@
 
 ## 2. セットアップ手順 (AI自動改善機能向け)
 
-基本的なセットアップ (Python環境、`requirements.txt`) はメインの `README.md` を参照してください。AI自動改善機能には追加のステップが必要です。
+基本的なセットアップ (Python環境、`uv` の導入、仮想環境作成) はメインの `README.md` の「3. セットアップ (`uv` 使用)」を参照してください。AI自動改善機能には追加のステップが必要です。
 
 ### 2.1 依存ライブラリの確認
 
-`requirements.txt` に以下のライブラリが含まれていることを確認してください。
+`uv` を使用して依存関係をインストールする際に、必要なライブラリが `pyproject.toml` に含まれていることを確認してください。
 
 *   `mcp-fastmcp`: MCPサーバー/クライアントの基盤ライブラリ。
-*   `requests`: MCPサーバーへのHTTPリクエスト用。
+*   `fastapi`, `uvicorn`: MCPサーバーのWebフレームワークとASGIサーバー。
+*   `requests`, `httpx`: クライアントからのHTTPリクエスト用。
 *   `pyyaml`: 設定ファイル (`config.yaml`) の読み込み用。
 *   `numpy`, `pandas`: データ処理用。
 *   `tenacity`: リトライ処理用 (LLM API呼び出しなど)。
 *   `python-dotenv`: `.env` ファイルからの環境変数読み込み用。
-*   (オプション) `matplotlib`, `seaborn`: 可視化機能用。
-*   (オプション) `pillow`: 画像処理 (サムネイル生成など) 用。
+*   必要なLLMクライアントライブラリ (例: `anthropic`, `openai`)。
+
+`uv pip install -e .[dev,numba,crepe]` またはロックファイル (`requirements-lock.txt` など) を使用した `uv pip sync` でインストールされます。
 
 ### 2.2 ワークスペースと設定
 
-*   **ワークスペース:** スクリプト実行時に `mcp_workspace` ディレクトリが自動生成されます (場所は環境変数 `MIREX_WORKSPACE` または `config.yaml` で指定可能)。この中にセッション状態、改善版コード、ログなどが保存されます。
-*   **設定ファイル (`config.yaml`):** プロジェクトルートの `config.yaml` で、データセットパス、各種タイムアウト値、クリーンアップ設定などを構成できます。
-*   **環境変数 (`.env`):** プロジェクトルートに `.env` ファイルを作成 (または `.env.example` をコピー) し、以下の**必須**またはオプションの変数を設定します。
-    *   `ANTHROPIC_API_KEY`: (必須、モック以外の場合) Anthropic Claude APIキー。
-    *   `CLAUDE_MODEL`: (オプション) 使用するClaudeモデル名 (デフォルト: `claude-3-opus-20240229`)。
-    *   `MCP_SERVER_URL`: (オプション) MCPサーバーのURL (デフォルト: `http://localhost:5002`)。
-    *   `MIREX_WORKSPACE`: (オプション) ワークスペースディレクトリのパス。
-    *   `MCP_PORT`: (オプション) MCPサーバーが使用するポート番号 (デフォルト: 5002)。
-    *   その他、`config.yaml` の値を上書きするための環境変数 (例: `MCP_LLM_TIMEOUT`, `MCP_CLEANUP_INTERVAL_SECONDS`)。
+*   **ワークスペース:** スクリプト実行時に `mcp_workspace` ディレクトリが自動生成されます (場所は環境変数 `MIREX_WORKSPACE` または `config.yaml` で指定可能)。この中にセッション状態DB (`mcp_server_state.db`)、改善版コード、ログなどが保存されます。
+*   **設定ファイル (`config.yaml`):** プロジェクトルートの `config.yaml` で、サーバー設定、パス、リソース制限、クリーンアップ設定、LLMモデル、データセットなどを構成できます。構造は機能ごとに整理されています。
+*   **環境変数 (`.env`):** プロジェクトルートに `.env` ファイルを作成 (または `.env.example` をコピー) し、以下の**必須**またはオプションの変数を設定します。**環境変数は `config.yaml` の値を上書きします。**
+    *   `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`: (条件付き必須) 利用するLLMのAPIキー。
+    *   `MIREX_WORKSPACE`: (推奨) ワークスペースディレクトリのパス。指定しない場合は `./mcp_workspace` が試みられますが、書き込み権限などの問題が発生する可能性があります。
+    *   `MCP_SERVER_URL`: (任意) クライアントが接続するMCPサーバーのURL (デフォルト: `http://localhost:5002`)。
+    *   `MCP_PORT`: (任意) MCPサーバーがリッスンするポート (デフォルト: 5002)。
+    *   その他、`config.yaml` の値を上書きするための環境変数。
+        *   命名規則: `MCP__SECTION__KEY=value` (例: `MCP__LLM__MODEL=gpt-4`, `MCP__SERVER__LOG_LEVEL=DEBUG`)
+        *   詳細は `mcp_server_logic/core.py` の `load_config` 関数の Docstring を参照してください。
 
 ### 2.3 Claude Desktop用設定 (オプション)
 
@@ -74,27 +77,30 @@ python setup_claude_integration.py --open-claude
 AI自動改善機能を利用するには、まずMCPサーバーが起動している必要があります。
 
 ```bash
-python mcp_server.py [--port <ポート番号>] [--log-level <レベル>] [--workspace <パス>] [--num-workers <数>]
+# 仮想環境を有効化していることを確認
+python mcp_server.py [--port <ポート番号>] [--log-level <レベル>] [--config <設定ファイル>] [--workspace <パス>] [--num-workers <数>]
 ```
 
 *   サーバーはAPIリクエストを待ち受け、非同期ジョブを実行します。
-*   Claude Desktopから使用する場合、通常はDesktopアプリがサーバーを自動的に起動・管理します (`setup_claude_integration.py` で設定した場合)。
+*   `--config`: デフォルト (`config.yaml`) 以外の設定ファイルを指定する場合。
+*   `--workspace`: `.env` や `config.yaml` の設定を上書きする場合。
+*   サーバー起動時にデータベース (`mcp_workspace/db/mcp_server_state.db`) が初期化されます。
+*   サーバー起動時にパス検証用の許可ディレクトリリストが `config.yaml` から読み込まれます。
 
 ### 3.2 自動改善サイクルの実行 (`auto_improver.py`)
 
 コマンドラインから自動改善プロセス全体を開始します。
 
 ```bash
-python auto_improver.py --detector <検出器名> [--goal <目標>] [--iterations <回数>] [--server-url <URL>] [--config <設定ファイル>]
+# 仮想環境を有効化していることを確認
+python auto_improver.py --detector <検出器名> [--goal <目標>] [--iterations <回数>] [--server-url <URL>] [--config-file <設定ファイル>]
 ```
 
-*   `--detector`: 改善対象のベースとなる検出器名 (例: `PZSTDDetector`)。
-*   `--goal`: (オプション) 自然言語での初期改善目標。
-*   `--iterations`: (オプション) 実行する改善サイクルの最大回数。
-*   `--server-url`: (オプション) 起動中のMCPサーバーのURL。
-*   `--config`: (オプション) `auto_improver.py` 固有の設定ファイル (現在は未使用)。
+*   `--detector`: 改善対象のベースとなる検出器名。
+*   他オプションは以前と同様。
+*   `--config-file`: (New!) AutoImprover 固有の設定を記述したYAMLファイルのパス。
 
-実行すると、`auto_improver.py` がクライアントとして動作し、MCPサーバーの各種ツールを呼び出しながら改善サイクルを進めます。進捗はログに出力され、セッション状態は `mcp_workspace/improvement_states/` に保存されます。
+実行すると、`auto_improver.py` がクライアントとして動作し、MCPサーバーの各種ツールを呼び出しながら改善サイクルを進めます。進捗はログに出力され、セッション状態はサーバーのDBに記録されます。
 
 ### 3.3 Claude Desktopでの対話的操作 (オプション)
 
@@ -138,6 +144,7 @@ python auto_improver.py --detector <検出器名> [--goal <目標>] [--iteration
 *   `visualize_spectrogram`: スペクトログラム画像生成。
 *   `process_audio_files`: 複数音声ファイル処理 (Context使用例)。
 *   **(拡張機能)** `visualize_code_impact`, `generate_performance_heatmap`, `generate_scientific_outputs`: 可視化・科学的成果物生成ツール (`mcp_server_extensions.py` が存在する場合)。
+*   **注意:** パスを引数に取るツール (`run_evaluation`, `run_grid_search`, `get_code`, `save_code` など) は、入力されたパスがサーバー側で許可されたディレクトリ内にあるか検証します。
 
 ## 4. 自動改善プロセスの詳細 (AutoImprover)
 
@@ -155,21 +162,22 @@ python auto_improver.py --detector <検出器名> [--goal <目標>] [--iteration
 ## 5. トラブルシューティング
 
 *   **サーバーが起動しない:**
-    *   ポート番号が競合していないか確認 (`netstat` や `lsof` コマンド）。`--port` オプションで変更できます。
-    *   依存ライブラリが正しくインストールされているか確認 (`pip install -r requirements.txt`)。
-    *   Pythonのバージョンが適合しているか確認 (`pyproject.toml` の `requires-python`)。
-    *   ログファイル (`mcp_server.log` など) を確認して詳細なエラーメッセージを探します。
+    *   ポート競合、依存関係不足 (`uv pip sync` または `uv pip install` を確認)、Pythonバージョンを確認。
+    *   設定ファイル (`config.yaml`) のパスや内容が正しいか確認。
+    *   ワークスペースディレクトリの権限を確認。
+    *   ログ (`mcp_server.log` 等) を確認。
 *   **LLM APIエラー:**
-    *   `.env` ファイルに正しいAPIキーが設定されているか確認。
-    *   インターネット接続を確認。
-    *   AnthropicなどのAPIサービス側で障害が発生していないか確認。
-    *   APIの使用量制限に達していないか確認。
-*   **ジョブが `pending` または `queued` のまま進まない:**
-    *   MCPサーバーのログを確認し、ワーカースレッドでエラーが発生していないか確認。
-    *   `MAX_CONCURRENT_JOBS` の設定値に対して、実行中のジョブが多すぎないか確認。
-    *   DB (`mcp_state.db`) の状態を確認（破損など）。
-*   **ファイル権限エラー:**
-    *   サーバープロセスがワークスペースディレクトリ (`mcp_workspace` など) への書き込み権限を持っているか確認。環境変数 `MIREX_WORKSPACE` で書き込み可能な場所を指定することも検討してください。
+    *   `.env` のAPIキー設定、インターネット接続、サービス障害、使用量制限を確認。
+*   **ジョブが進まない (`pending`/`queued`):**
+    *   サーバーログを確認 (ワーカーエラー)。
+    *   `config.yaml` の `resource_limits.max_concurrent_jobs` 設定を確認。
+    *   DB (`mcp_workspace/db/mcp_server_state.db`) の状態を確認。
+*   **ファイル/パス関連エラー:**
+    *   サーバープロセスがワークスペースやデータセットディレクトリへの読み書き権限を持っているか確認。
+    *   クライアントから指定したパスが、サーバーの `config.yaml` で許可されたベースディレクトリ内にあるか確認 (`FileError: 指定されたパスは許可されたディレクトリ内にありません` エラー)。
+    *   指定したファイルが存在するか、ファイル/ディレクトリ種別が正しいか確認 (`FileError: 指定されたパスが存在しません` / `...ファイルではありません` / `...ディレクトリではありません` エラー)。
+*   **`ValueError` / `FileError` / `ConfigError` (ツール呼び出し時):**
+    *   MCPツールに渡した引数（特にパス）が不正であるか、サーバー側の検証でエラーになった可能性があります。サーバーログとツールのDocstringを確認してください。
 
 **ログファイルの場所:**
 

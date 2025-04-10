@@ -37,7 +37,7 @@ from collections import defaultdict
 from tqdm import tqdm
 
 from src.utils.audio_utils import load_audio_file, load_reference_data, load_audio_and_reference, make_output_path
-from src.utils.exception_utils import log_exception, create_error_result, safe_execute
+from src.utils.exception_utils import log_exception, create_error_result
 from src.utils.json_utils import NumpyEncoder
 from src.utils.detection_result import DetectionResult
 from src.utils.pitch_utils import hz_to_midi, midi_to_hz

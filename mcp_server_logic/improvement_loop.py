@@ -13,6 +13,7 @@ from .code_tools import _run_get_code, _run_save_code, get_detector_path # コ�
 # 科学自動化戦略クラス
 from src.science_automation.exploration_strategy import ExplorationStrategy
 from src.utils.exception_utils import MirexError, LLMError, ConfigError
+from src.utils.path_utils import is_safe_path_component # インポート追加
 # DBアクセス関数
 from . import db_utils
 
@@ -229,23 +230,36 @@ def register_loop_tools(
     ) -> Dict[str, Any]:
         """指定された検出器のパラメータ最適化 (LLM提案+グリッドサーチ) を実行します。"""
         if not auto_suggest:
-            # If auto_suggest is False, we expect the caller to manually run grid search later
-            # This tool focuses on the LLM suggestion + grid search combo
-            # Maybe return an error or just don't do anything? Let's return an error for now.
             raise ValueError("optimize_parameters tool currently only supports auto_suggest=True (LLM parameter suggestion).")
+
+        # --- Input Validation --- #
+        if not is_safe_path_component(detector_name):
+            raise ValueError(f"Invalid detector name format: {detector_name}")
+        if code_version and not is_safe_path_component(code_version):
+            raise ValueError(f"Invalid code_version format: {code_version}")
+        # audio_dir, reference_dir はここでは検証しない (タスク関数内で grid search config 作成時に検証されるべき)
+        # --- Validation End --- #
 
         # 最適化対象のコードを取得
         try:
-            # Use _run_get_code task function to get code content (consistency with save_code)
-            # This runs it as a separate (short) job, maybe less efficient but uses the same infra
-            # Alternatively, call get_detector_path and read directly like in the loop task?
-            # Let's try direct read for efficiency here.
+            # ... (get_detector_path call, which should now be safer due to component validation)
             logger.debug(f"Getting code for '{detector_name}' version '{code_version or 'latest'}' for optimization...")
-            code_path = get_detector_path(config, detector_name, version=code_version, session_id=session_id)
+
+            # Extract necessary paths from config for get_detector_path
+            paths_config = config.get('paths', {})
+            detectors_dir = Path(paths_config.get('detectors', ''))
+            improved_versions_dir = Path(paths_config.get('improved_versions', ''))
+            # --- 再度コンポーネント検証 (念のため) --- #
+            if not is_safe_path_component(detector_name):
+                 raise ValueError(f"[Internal Check] Invalid detector name: {detector_name}")
+            if code_version and not is_safe_path_component(code_version):
+                 raise ValueError(f"[Internal Check] Invalid code version: {code_version}")
+            # --- 検証終了 --- #
+            code_path = get_detector_path(detectors_dir, improved_versions_dir, detector_name, version=code_version, session_id=session_id)
             with open(code_path, "r", encoding="utf-8") as f:
                 source_code = f.read()
             logger.debug(f"Got code from {code_path}")
-        except (FileNotFoundError, ConfigError, FileError) as e:
+        except (FileNotFoundError, ConfigError, FileError, ValueError) as e: # ValueError を追加
             logger.error(f"Failed to get code '{detector_name}' (Version: {code_version or 'latest'}) for optimization: {e}")
             # Return a job-like failure structure
             return {"job_id": None, "status": "failed", "error": str(e)}
@@ -255,15 +269,12 @@ def register_loop_tools(
 
         task_kwargs = {
             "detector_name": detector_name,
-            "code_version": code_version, # _run_parameter_optimization 内でコード取得時に使用
+            # "code_version": code_version, # 不要: source_code を直接渡す
             "source_code": source_code, # Pass the obtained source code directly to the task function
             "audio_dir": audio_dir,
             "reference_dir": reference_dir,
             "session_id": session_id
         }
-        # _run_parameter_optimization は source_code を要求するため、ここで None を渡すか、
-        # タスク関数側で get_code を呼び出すように修正が必要。
-        # -> タスク関数側で get_code を呼び出すように修正する。
         return _start_loop_job(_run_parameter_optimization, "optimize_parameters", session_id, **task_kwargs)
 
     # suggest_exploration_strategy ツール

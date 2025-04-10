@@ -30,7 +30,7 @@ try:
     )
     # exception_utils から必要な例外をインポート
     from src.utils.exception_utils import (
-        log_exception, safe_execute, EvaluationError, FileError, ConfigError,
+        log_exception, EvaluationError, FileError, ConfigError,
         format_exception_message, wrap_exceptions, MirexError, GridSearchError # GridSearchErrorを追加
     )
     from src.evaluation.evaluation_runner import run_evaluation as run_eval_func

@@ -6,7 +6,7 @@ import csv
 import logging
 from typing import List, Tuple, Optional, Union
 from scipy.signal import butter, filtfilt, fftconvolve
-from src.utils.exception_utils import SynthesizerError
+from src.utils.exception_utils import SynthesizerError, FileError, log_exception
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -88,12 +88,11 @@ def save_audio_and_label(filename_base: str, audio_data: np.ndarray, labels: Lis
     # Check for NaN or Inf in audio data more robustly
     if not np.all(np.isfinite(audio_data)):
         logging.error(f"音声データに NaN または Inf が含まれています: {filename_base}。0に置換します。")
-        audio_data = np.nan_to_num(audio_data) # Replace NaN with 0, Inf with large finite numbers
+        audio_data = np.nan_to_num(audio_data)
 
-    # Check for empty audio data
     if audio_data.size == 0:
         logging.error(f"音声データが空です: {filename_base}。保存をスキップします。")
-        return # Skip saving empty audio
+        return
 
     # Log basic stats (optional, keep at DEBUG level)
     # logging.debug(f"Saving {filename_base}: Audio shape={audio_data.shape}, Size={audio_data.size}, Min={np.min(audio_data):.4f}, Max={np.max(audio_data):.4f}, Mean={np.mean(audio_data):.4f}")
@@ -104,7 +103,6 @@ def save_audio_and_label(filename_base: str, audio_data: np.ndarray, labels: Lis
     if peak_amp > 1e-9:
         normalized_audio = audio_data * (AMP_MAX / peak_amp)
     else:
-        # Avoid division by zero if signal is silent
         normalized_audio = audio_data
         logging.warning(f"オーディオ信号のピーク振幅が非常に小さいです: {filename_base}。正規化はスキップされました。")
 
@@ -114,14 +112,21 @@ def save_audio_and_label(filename_base: str, audio_data: np.ndarray, labels: Lis
     # --- Audio Saving --- #
     audio_saved_successfully = False
     try:
+        ensure_output_dirs() # 保存前にディレクトリ確認/作成
         logging.debug(f"音声書き込み試行: {audio_path}")
         sf.write(audio_path, normalized_audio.astype(np.float32), sr)
         logging.info(f"音声を保存しました: {audio_path}")
         audio_saved_successfully = True
+    except (IOError, PermissionError) as file_err:
+        log_exception(logging.getLogger(__name__), file_err, f"音声ファイルの保存中にIO/Permissionエラー: {audio_path}", log_level=logging.ERROR)
+        # FileError でラップして再発生させることも検討
+        # raise FileError(f"Failed to save audio: {file_err}") from file_err
     except Exception as e:
-        logging.error(f"音声ファイルの保存に失敗しました {audio_path}: {e}", exc_info=True)
+        log_exception(logging.getLogger(__name__), e, f"音声ファイルの保存中に予期せぬエラー: {audio_path}", log_level=logging.ERROR)
+        # 必要であれば FileError でラップ
+        # raise FileError(f"Unexpected error saving audio: {e}") from e
 
-    # --- Audio Save Verification (Error log if failed) --- #
+    # --- Audio Save Verification --- #
     try:
         if audio_saved_successfully and os.path.exists(audio_path):
             file_size = os.path.getsize(audio_path)
@@ -131,13 +136,15 @@ def save_audio_and_label(filename_base: str, audio_data: np.ndarray, labels: Lis
                 logging.debug(f"音声ファイル保存確認OK: {audio_path}, サイズ: {file_size} バイト")
         elif audio_saved_successfully:
              logging.error(f"音声保存関数は成功しましたが、ファイルが存在しません: {audio_path}")
-        # else: # If save failed, error was already logged
+    except (IOError, PermissionError) as verify_err:
+        log_exception(logging.getLogger(__name__), verify_err, f"音声ファイルの存在/サイズ確認中にIO/Permissionエラー: {audio_path}", log_level=logging.ERROR)
     except Exception as ve:
-         logging.error(f"音声ファイルの存在確認中にエラー: {audio_path}: {ve}", exc_info=True)
+        log_exception(logging.getLogger(__name__), ve, f"音声ファイルの存在確認中に予期せぬエラー: {audio_path}", log_level=logging.ERROR)
 
     # --- Label Saving --- #
     label_saved_successfully = False
     try:
+        ensure_output_dirs() # 保存前にディレクトリ確認/作成
         logging.debug(f"ラベル書き込み試行: {label_path}")
         with open(label_path, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
@@ -150,24 +157,32 @@ def save_audio_and_label(filename_base: str, audio_data: np.ndarray, labels: Lis
                 writer.writerow([f"{onset:.6f}", f"{offset:.6f}", freq_str])
         logging.info(f"ラベルを保存しました: {label_path}")
         label_saved_successfully = True
+    except (IOError, PermissionError) as file_err:
+        log_exception(logging.getLogger(__name__), file_err, f"ラベルファイルの保存中にIO/Permissionエラー: {label_path}", log_level=logging.ERROR)
+        # raise FileError(...) from file_err
+    except csv.Error as csv_err: # csv固有のエラーも捕捉
+         log_exception(logging.getLogger(__name__), csv_err, f"ラベルファイルのCSV書き込みエラー: {label_path}", log_level=logging.ERROR)
+         # raise FileError(...) from csv_err
     except Exception as e:
-        logging.error(f"ラベルファイルの保存に失敗しました {label_path}: {e}", exc_info=True)
+        log_exception(logging.getLogger(__name__), e, f"ラベルファイルの保存中に予期せぬエラー: {label_path}", log_level=logging.ERROR)
+        # raise FileError(...) from e
 
-    # --- Label Save Verification (Error log if failed) --- #
+    # --- Label Save Verification --- #
     try:
         if label_saved_successfully and os.path.exists(label_path):
             file_size = os.path.getsize(label_path)
-            if file_size == 0 and labels: # Check if empty despite having labels
+            if file_size == 0 and labels:
                  logging.error(f"ラベルファイルは作成されましたが空です (0 バイト): {label_path} (ラベル数: {len(labels)})")
             elif file_size == 0 and not labels:
-                 logging.debug(f"ラベルファイルは空ですが、ラベルデータもありません: {label_path}") # OK
+                 logging.debug(f"ラベルファイルは空ですが、ラベルデータもありません: {label_path}")
             else:
                  logging.debug(f"ラベルファイル保存確認OK: {label_path}, サイズ: {file_size} バイト")
         elif label_saved_successfully:
             logging.error(f"ラベル保存関数は成功しましたが、ファイルが存在しません: {label_path}")
-        # else: # If save failed, error was already logged
+    except (IOError, PermissionError) as verify_err:
+        log_exception(logging.getLogger(__name__), verify_err, f"ラベルファイルの存在/サイズ確認中にIO/Permissionエラー: {label_path}", log_level=logging.ERROR)
     except Exception as ve:
-        logging.error(f"ラベルファイルの存在確認中にエラー: {label_path}: {ve}", exc_info=True)
+        log_exception(logging.getLogger(__name__), ve, f"ラベルファイルの存在確認中に予期せぬエラー: {label_path}", log_level=logging.ERROR)
 
 def add_white_noise(audio_data: np.ndarray, snr_db: float) -> np.ndarray:
     signal_power = np.mean(audio_data ** 2)
@@ -217,44 +232,62 @@ def apply_reverb(audio_data: np.ndarray, ir: np.ndarray, mix_level: float = 0.3)
     -------
     np.ndarray
         リバーブが付加された音声データ
+
+    Raises
+    ------
+    SynthesizerError
+        畳み込み処理中に予期せぬエラーが発生した場合
     """
+    logger = logging.getLogger(__name__) # 関数スコープでロガーを取得
+
     if len(ir) == 0 or mix_level <= 0:
-        # IRがない、またはミックスレベルが0なら元の音声を返す
+        logger.debug("IRが空またはミックスレベルが0以下なのでリバーブ適用をスキップします。")
         return audio_data
     if mix_level > 1.0:
+        logger.warning(f"ミックスレベル {mix_level} が1.0を超えています。1.0にクリップします。")
         mix_level = 1.0
 
     # 畳み込みを実行し、リバーブ信号を生成
-    # mode='full' で全長を取得
     try:
+        # mode='full' で全長を取得
         reverb_signal = fftconvolve(audio_data, ir, mode='full')
-    except ValueError as e:
-        logging.error(f"fftconvolve中にエラーが発生しました: {e}. IR Length: {len(ir)}, Audio Length: {len(audio_data)}")
-        return audio_data # エラー時は元の音声を返す
+    except ValueError as ve:
+        # ValueError は不正な入力が原因の可能性が高い
+        log_exception(logger, ve, f"fftconvolve中にValueErrorが発生しました。IR Length: {len(ir)}, Audio Length: {len(audio_data)}", log_level=logging.ERROR)
+        # エラー時は元の音声を返すか、例外を発生させるか？ -> SynthesizerError を発生させる
+        raise SynthesizerError(f"Convolution failed due to invalid input: {ve}") from ve
+    except MemoryError as me:
+        # MemoryError はリソース不足
+        log_exception(logger, me, f"fftconvolve中にMemoryErrorが発生しました。IR Length: {len(ir)}, Audio Length: {len(audio_data)}", log_level=logging.CRITICAL)
+        raise SynthesizerError(f"Convolution failed due to insufficient memory: {me}") from me
+    except Exception as e:
+        # その他の予期せぬエラー
+        log_exception(logger, e, f"fftconvolve中に予期せぬエラーが発生しました。", log_level=logging.ERROR)
+        raise SynthesizerError(f"Unexpected error during convolution: {e}") from e
 
     # 期待される出力長
     target_len = len(audio_data) + len(ir) - 1
 
     # 念のため長さを確認・調整（通常は不要だが数値誤差対策）
-    if len(reverb_signal) < target_len:
-        reverb_signal = np.pad(reverb_signal, (0, target_len - len(reverb_signal)))
-    elif len(reverb_signal) > target_len:
-        reverb_signal = reverb_signal[:target_len]
+    if len(reverb_signal) != target_len:
+        logger.warning(f"畳み込み結果の長さが期待値と異なります。期待値: {target_len}, 実際: {len(reverb_signal)}。調整します。")
+        if len(reverb_signal) < target_len:
+            reverb_signal = np.pad(reverb_signal, (0, target_len - len(reverb_signal)))
+        else:
+            reverb_signal = reverb_signal[:target_len]
 
     # ドライ信号をリバーブ信号の長さに合わせてパディング
     padded_dry = np.pad(audio_data, (0, target_len - len(audio_data)))
 
     # ドライ信号とウェット信号をミックス
-    # Wet/Dry Mix: output = dry * (1 - mix) + wet * mix
     mixed_signal = padded_dry * (1.0 - mix_level) + reverb_signal * mix_level
 
-    # 注意: ここではピークノーマライズは行わない。
-    #       save_audio_and_label での最終的なノーマライズに任せる。
-    # peak_amp = np.max(np.abs(mixed_signal))
-    # if peak_amp > 1.0:
-    #    mixed_signal /= peak_amp
+    # ミックス後の信号のクリッピングも検討 (オプション)
+    # max_val = np.max(np.abs(mixed_signal))
+    # if max_val > 1.0:
+    #     logger.warning(f"リバーブ適用後の信号がクリップしました (Max: {max_val:.2f})。クリッピングします。")
+    #     mixed_signal = np.clip(mixed_signal, -1.0, 1.0)
 
-    logging.debug(f"Reverb applied. Original len: {len(audio_data)}, IR len: {len(ir)}, Output len: {len(mixed_signal)}")
     return mixed_signal
 
 def generate_kick_sound(duration_sec: float = 0.3, freq: float = 60.0, decay_rate: float = 15.0, amp: float = 1.0, sr: int = SR) -> np.ndarray:

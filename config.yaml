@@ -1,47 +1,128 @@
-# config.yaml
+# config.yaml - MIREX Auto Improver Configuration
 
-# 評価関連のデフォルト設定
+# === サーバー設定 ===
+server:
+  # MCPサーバーの動作設定 (環境変数 MCP_* で上書き可能)
+  poll_interval_seconds: 5   # クライアントがジョブ状態をポーリングする間隔 (秒)
+  job_timeout_seconds: 600   # ジョブの最大実行時間 (秒)
+  session_timeout_seconds: 3600 # セッションの有効期限 (秒)
+  request_timeout_seconds: 60  # クライアントからのリクエストタイムアウト (秒)
+  log_level: INFO            # ログレベル (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+  # port: 5002               # サーバーポート (uvicorn起動時に指定、環境変数 MCP_PORT)
+
+# === パス設定 ===
+# 注意: 各パスはプロジェクトルートからの相対パス、または絶対パスで指定。
+#       環境変数 (MIREX_*) で上書き可能。
+#       ワークスペースパス (workspace) は get_workspace_dir() で決定されるため、ここでは定義しない。
+paths:
+  # デフォルトのデータ関連パス (ワークスペース内を想定)
+  data: data
+  audio: data/audio
+  reference: data/reference
+  # 生成されるファイルの出力先 (ワークスペース内を想定)
+  improved_versions: improved_versions
+  evaluation_results: evaluation_results
+  grid_search_results: grid_search_results
+  visualizations: visualizations
+  scientific_output: scientific_output
+  db: db # データベースファイル格納ディレクトリ
+  # ソースコード関連 (get_detector_path などで参照)
+  detectors_src: src/detectors
+  # templates: templates # プロンプトテンプレートなど (現状 .env で設定)
+
+# === リソース制限 ===
+resource_limits:
+  # 環境変数 MCP_* で上書き可能
+  # max_concurrent_jobs: auto # 'auto' (CPU数ベース) または数値で指定
+  # max_jobs_history: 100
+  # llm_timeout: 180 # LLM API タイムアウト (秒)
+  # evaluation_timeout: 1200 # 評価ジョブタイムアウト (秒)
+  # grid_search_timeout: 1800 # グリッドサーチジョブタイムアウト (秒)
+  # job_timeout: 600 # server.job_timeout_seconds と重複？ 整理が必要
+
+# === クリーンアップ設定 ===
+cleanup:
+  # 古いセッション・ジョブ、ワークスペースファイルの自動削除設定
+  interval_seconds: 3600 # クリーンアップ実行間隔 (秒)
+  # セッションクリーンアップ
+  session_timeout_seconds: 86400 # (1日) 非アクティブセッションのタイムアウト
+  max_sessions_count: 100      # 最大保持セッション数 (古いものから削除)
+  # ジョブクリーンアップ
+  job_stuck_timeout_seconds: 3600 # (1時間) 実行中から進まないジョブのタイムアウト
+  job_completed_retention_seconds: 604800 # (7日) 完了/失敗ジョブの保持期間
+  max_jobs_count: 500          # 最大保持ジョブ数 (古いものから削除)
+  # ワークスペースファイルクリーンアップ
+  workspace:
+    enabled: true
+    retention_days: 14 # 指定日数より古いファイルを削除
+    target_dirs: # 対象ディレクトリ (paths で定義されたキー名)
+      - evaluation_results
+      - grid_search_results
+      - improved_versions
+      - visualizations
+      - scientific_output
+      # - db # DBディレクトリは通常削除しない方が安全
+
+# === 評価設定 ===
 evaluation:
   default_dataset: synthesized_v1 # デフォルトで使用するデータセット名
   default_metrics: ["note.*", "onset.*"] # デフォルトで計算するメトリック
   save_plots: true
   save_results_json: true
+  # 評価スクリプト固有の設定 (例: mir_eval の許容誤差など)
+  mir_eval_options:
+    onset_tolerance: 0.05 # 50ms
+    pitch_tolerance: 50.0 # 50 cents
+    # ... 他の mir_eval オプション ...
 
-# グリッドサーチ関連のデフォルト設定
+# === グリッドサーチ設定 ===
 grid_search:
   default_best_metric: note.f_measure
-  default_n_jobs: -1 # 利用可能な全コアを使用 (-1)
+  default_n_jobs: -1 # 利用可能な全コアを使用 (-1), 1でシングルコア
+  # デフォルトのパラメータ範囲 (アルゴリズムごとに定義可能)
+  # default_param_grid:
+  #   param_x: [0.1, 0.5, 1.0]
+  #   param_y: [10, 20, 30]
 
-# データセット定義
-datasets:
-  synthesized_v1:
-    audio_dir: datasets/synthesized/audio # path_utils で解決される相対パス or 絶対パス
-    label_dir: datasets/synthesized/labels
-    label_pattern: "*.csv"
-  # 必要に応じて他のデータセットを追加
-  # medleydb_melody:
-  #   audio_dir: /path/to/medleydb/audio
-  #   label_dir: /path/to/medleydb/annotations/melody
-  #   label_pattern: "*_MELODY1.csv"
-
-# アルゴリズム固有のデフォルトパラメータ (例)
-# detectors:
-#   MyDetector:
-#     param_a: 0.5
-#     param_b: 10
-#   AnotherDetector:
-#     threshold: 0.7
-
-# LLM settings
+# === LLM 設定 ===
 llm:
-  client_type: "ClaudeClient" # 使用するクライアントクラス (例: ClaudeClient, OpenAIClient)
-  api_key: ${ANTHROPIC_API_KEY} # 環境変数から読み込むことを推奨
-  model: "claude-3-opus-20240229"
+  # クライアント設定 (環境変数での上書きを推奨)
+  client_type: "ClaudeClient" # 使用するクライアントクラス (ClaudeClient, OpenAIClient)
+  # api_key: ${ANTHROPIC_API_KEY} # APIキー (環境変数 ANTHROPIC_API_KEY)
+  # api_key_openai: ${OPENAI_API_KEY} # OpenAI用 (環境変数 OPENAI_API_KEY)
+  model: "claude-3-opus-20240229" # 使用するモデル名
+  # --- Claude Specific --- #
   api_base: "https://api.anthropic.com"
   api_version: "2023-06-01"
-  max_tokens: 4096
-  # desktop_mode: false # デスクトップモードを使う場合 (環境変数でも設定可能)
-  # desktop_url: "http://localhost:5000"
+  # --- OpenAI Specific --- #
+  # api_base_openai: "https://api.openai.com/v1"
+  # --- Common --- #
+  max_tokens: 4096 # 生成最大トークン数
+  timeout: ${MCP_LLM_TIMEOUT:-180} # API呼び出しタイムアウト(秒、環境変数優先)
+  # retry_attempts: 3 # リトライ回数 (exception_utils で設定可能)
+  # retry_delay: 1 # リトライ遅延 (秒, exception_utils で設定可能)
+  # --- Desktop Mode (Optional, use environment vars) --- #
+  # desktop_mode: ${CLAUDE_DESKTOP_MODE:-false}
+  # desktop_url: ${CLAUDE_DESKTOP_URL:-http://localhost:5000}
 
-# Example dataset definitions
-# ... existing code ...
+# === データセット定義 ===
+datasets:
+  synthesized_v1:
+    description: "基本パターンを含む合成データセット"
+    # パスは paths セクションの値を参照するか、ここで上書き (絶対パス推奨)
+    audio_dir: ${MIREX_AUDIO_DIR:-datasets/synthesized/audio} # 環境変数優先
+    ref_dir: ${MIREX_LABEL_DIR:-datasets/synthesized/labels} # 環境変数優先
+    ref_pattern: "*.csv"
+  # --- 他のデータセット例 --- #
+  # medleydb_melody:
+  #   description: "MedleyDB メロディサブセット"
+  #   audio_dir: /path/to/your/medleydb/audio
+  #   ref_dir: /path/to/your/medleydb/annotations/melody1
+  #   ref_pattern: "*_MELODY1.csv"
+
+# === 検出器デフォルトパラメータ (任意) ===
+# detectors:
+#   CriteriaDetector:
+#     param_a: 0.5
+#   PZSTDDetector:
+#     threshold: 0.7

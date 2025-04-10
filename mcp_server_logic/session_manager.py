@@ -20,13 +20,12 @@ async def start_session(config: Dict[str, Any], db_path: Path, base_algorithm: s
     """改善セッションを開始します。"""
     session_id = utils.generate_id()
     current_time = utils.get_timestamp()
-    # 初期サイクル状態 (空の辞書)
     initial_cycle_state = {}
+
     try:
         await db_utils.db_execute_commit_async(
             db_path,
             "INSERT INTO sessions (session_id, base_algorithm, start_time, last_update, status, history, config, cycle_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            # Save initial_cycle_state as an empty JSON string '{}'
             (session_id, base_algorithm, current_time, current_time, "active", "[]", json.dumps(config, cls=JsonNumpyEncoder), json.dumps(initial_cycle_state))
         )
         logger.info(f"新しいセッションが作成されました: {session_id}")
@@ -38,32 +37,34 @@ async def start_session(config: Dict[str, Any], db_path: Path, base_algorithm: s
             "status": "active",
             "history": [],
             "config": config,
-            "cycle_state": initial_cycle_state # Return the initial dict
+            "cycle_state": initial_cycle_state
         }
-    except sqlite3.Error as db_err:
-        logger.error(f"セッション開始 DBエラー: {db_err}", exc_info=True)
-        raise StateManagementError(f"Failed to start session due to DB error: {db_err}") from db_err
+    except StateManagementError as sme:
+        logger.error(f"セッション開始 DBエラー: {sme}", exc_info=False)
+        raise sme # StateManagementError はそのまま再発生
     except Exception as e:
         logger.error(f"セッション開始中に予期せぬエラー: {e}", exc_info=True)
-        # 予期せぬエラーも StateManagementError でラップする (DB以外の問題かもしれないが、状態管理の文脈で発生)
+        # 予期せぬエラーは StateManagementError でラップ
         raise StateManagementError(f"Unexpected error starting session: {e}") from e
 
 async def get_session_info(config: Dict[str, Any], db_path: Path, session_id: str) -> Dict[str, Any]:
     """セッション情報を取得します。"""
     current_time = utils.get_timestamp()
-    # Ensure cycle_state is selected
+    row = None
     try:
         row = await db_utils.db_fetch_one_async(db_path, "SELECT * FROM sessions WHERE session_id = ?", (session_id,))
-    except sqlite3.Error as db_err:
-         logger.error(f"セッション情報取得 DBエラー ({session_id}): {db_err}", exc_info=True)
-         raise StateManagementError(f"Failed to fetch session info due to DB error: {db_err}") from db_err
+    except StateManagementError as sme:
+         logger.error(f"セッション情報取得 DBエラー ({session_id}): {sme}", exc_info=False)
+         raise sme # StateManagementError はそのまま再発生
     except Exception as e:
          logger.error(f"セッション情報取得中に予期せぬエラー ({session_id}): {e}", exc_info=True)
          raise StateManagementError(f"Unexpected error fetching session info: {e}") from e
 
     if row:
         try:
+            # last_update の更新もDB書き込みなのでエラーハンドリングが必要
             await db_utils.db_execute_commit_async(db_path, "UPDATE sessions SET last_update = ? WHERE session_id = ?", (current_time, session_id))
+
             session_info = dict(row)
             # Deserialize JSON fields
             try:
@@ -76,13 +77,11 @@ async def get_session_info(config: Dict[str, Any], db_path: Path, session_id: st
             except (json.JSONDecodeError, TypeError):
                  logger.warning(f"セッション {session_id} の設定JSON解析失敗。空辞書を返します。")
                  session_info['config'] = {}
-            # Deserialize cycle_state
             try:
                 session_info['cycle_state'] = json.loads(session_info.get('cycle_state', '{}') or '{}')
             except (json.JSONDecodeError, TypeError):
                  logger.warning(f"セッション {session_id} のサイクル状態JSON解析失敗。空辞書を返します。")
                  session_info['cycle_state'] = {}
-            # 他のJSONフィールドも同様にデシリアライズ
             for key in ['current_metrics', 'best_metrics', 'baseline_metrics']:
                 if session_info.get(key):
                     try:
@@ -91,68 +90,41 @@ async def get_session_info(config: Dict[str, Any], db_path: Path, session_id: st
                          logger.warning(f"セッション {session_id} の {key} JSON解析失敗。Noneを返します。")
                          session_info[key] = None
                 else:
-                     session_info[key] = None # キーが存在しない場合も None に
-
+                     session_info[key] = None
             return session_info
-        except sqlite3.Error as db_err:
-            logger.error(f"セッション last_update 更新 DBエラー ({session_id}): {db_err}", exc_info=True)
-            raise StateManagementError(f"Failed to update session last_update due to DB error: {db_err}") from db_err
+        except StateManagementError as sme_update: # last_update 更新時のエラー
+            logger.error(f"セッション last_update 更新 DBエラー ({session_id}): {sme_update}", exc_info=False)
+            # 更新に失敗しても取得した情報自体は返せる場合もあるが、一貫性のためエラーとする
+            raise StateManagementError(f"Failed to update session access time: {sme_update}") from sme_update
         except Exception as e:
             logger.error(f"セッション情報処理/更新中に予期せぬエラー ({session_id}): {e}", exc_info=True)
             raise StateManagementError(f"Unexpected error processing session info: {e}") from e
     else:
-        # ValueError はセッションが見つからないことを示すので、そのまま raise するのが適切
-        raise ValueError(f"セッション {session_id} が見つかりません")
+        raise ValueError(f"セッション {session_id} が見つかりません") # 見つからない場合は ValueError
 
+# _add_session_history_sync 内のエラーハンドリングは db_utils.py で StateManagementError が
+# raise されるようになったため、ここで再度ラップする必要性は低いが、
+# ValueError (Session not found) は区別して処理する。
 
+# --- 修正: add_session_history を非同期化し、ロック内で fetch & update --- #
 async def add_session_history(
-    config: Dict[str, Any],
+    config: Dict[str, Any], # config は get_session_info で使うので残す
     db_path: Path,
     session_id: str,
     event_type: str,
     event_data: Any,
     cycle_state_update: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    """セッション履歴にイベントを追加し、必要なら cycle_state も更新します (非同期)"""
-    # 同期関数を非同期で呼び出す
-    loop = asyncio.get_running_loop()
-    try:
-        # Pass cycle_state_update to the sync function
-        await loop.run_in_executor(None, _add_session_history_sync, db_path, session_id, event_type, event_data, cycle_state_update)
-        # 更新後のセッション情報を返す
-        return await get_session_info(config, db_path, session_id)
-    except (ValueError, StateManagementError) as specific_err: # _add_sync や get_session_info からのエラー
-         logger.error(f"セッション履歴追加または情報取得エラー ({session_id}): {specific_err}", exc_info=True)
-         raise # これらのエラーはそのまま上位に伝える
-    except Exception as e:
-        logger.error(f"セッション履歴追加プロセスで予期せぬエラー ({session_id}): {e}", exc_info=True)
-        # 予期せぬエラーは StateManagementError でラップ
-        raise StateManagementError(f"Unexpected error during add_session_history process: {e}") from e
-
-
-# --- Synchronous Helper for Session History (called by workers or sync parts) --- #
-
-def _add_session_history_sync(
-    db_path: Path,
-    session_id: str,
-    event_type: str,
-    event_data: Any,
-    cycle_state_update: Optional[Dict[str, Any]] = None
-):
-    """セッション履歴にイベントを追加し、cycle_state をアトミックに更新する (同期版)"""
+    """セッション履歴にイベントを追加し、cycle_state をアトミックに更新します (非同期、ロック付き)"""
     new_event = {"id": utils.generate_id(), "timestamp": utils.get_timestamp(), "type": event_type, "data": event_data}
     current_timestamp = new_event["timestamp"]
-    conn = None
-    with db_utils.db_lock: # Ensure thread safety for DB operations
-        try:
-            conn = db_utils.get_db_connection(db_path)
-            cursor = conn.cursor()
 
-            # 1. 現在の履歴と cycle_state を取得
-            cursor.execute("SELECT history, cycle_state FROM sessions WHERE session_id = ?", (session_id,))
-            row = cursor.fetchone()
+    async with db_utils.db_lock: # --- DBロック開始 --- #
+        try:
+            # 1. 現在の履歴と cycle_state を取得 (ロック内で実行)
+            row = await db_utils.db_fetch_one_async(db_path, "SELECT history, cycle_state FROM sessions WHERE session_id = ?", (session_id,))
             if not row:
-                logger.warning(f"[Sync] 履歴追加試行時にセッションが見つかりません: {session_id}")
+                logger.warning(f"履歴追加試行時にセッションが見つかりません: {session_id}")
                 raise ValueError(f"セッション {session_id} が見つかりません")
 
             # 2. 履歴をデシリアライズして更新
@@ -160,58 +132,69 @@ def _add_session_history_sync(
                 current_history = json.loads(row["history"] or '[]')
                 if not isinstance(current_history, list): current_history = []
             except (json.JSONDecodeError, TypeError):
-                logger.warning(f"[Sync] セッション {session_id} の履歴JSON解析失敗。新しいリストで初期化。", exc_info=True)
+                logger.warning(f"セッション {session_id} の履歴JSON解析失敗。新しいリストで初期化。", exc_info=True)
                 current_history = []
             current_history.append(new_event)
             updated_history_json = json.dumps(current_history, cls=JsonNumpyEncoder)
 
             # 3. cycle_state をデシリアライズして更新 (必要な場合)
+            sql = "" # UPDATE文を初期化
+            params = () # パラメータを初期化
+            log_msg_suffix = ""
+            updated_cycle_state_json = row["cycle_state"] # 更新しない場合のデフォルト値
             if cycle_state_update is not None and isinstance(cycle_state_update, dict):
                 try:
                     current_cycle_state = json.loads(row["cycle_state"] or '{}')
                     if not isinstance(current_cycle_state, dict): current_cycle_state = {}
                 except (json.JSONDecodeError, TypeError):
-                     logger.warning(f"[Sync] セッション {session_id} の cycle_state JSON解析失敗。新しい辞書で初期化。", exc_info=True)
-                     current_cycle_state = {}
-
-                # Update the state
+                    logger.warning(f"セッション {session_id} の cycle_state JSON解析失敗。新しい辞書で初期化。", exc_info=True)
+                    current_cycle_state = {}
                 current_cycle_state.update(cycle_state_update)
                 updated_cycle_state_json = json.dumps(current_cycle_state, cls=JsonNumpyEncoder)
-
-                # SQLとパラメータを更新 (history と cycle_state 両方)
+                log_msg_suffix = " および cycle_state 更新"
                 sql = "UPDATE sessions SET history = ?, cycle_state = ?, last_update = ? WHERE session_id = ?"
                 params = (updated_history_json, updated_cycle_state_json, current_timestamp, session_id)
-                log_msg_suffix = " および cycle_state 更新"
             else:
-                # cycle_state を更新しない場合 (history のみ)
+                # cycle_state を更新しない場合
                 sql = "UPDATE sessions SET history = ?, last_update = ? WHERE session_id = ?"
                 params = (updated_history_json, current_timestamp, session_id)
                 log_msg_suffix = ""
 
-            # 4. DB更新を実行
-            cursor.execute(sql, params)
-            conn.commit()
-            logger.info(f"[Sync] セッション履歴に '{event_type}' を追加しました (Session: {session_id})" + log_msg_suffix)
+            # 4. DB更新を実行 (ロック内で実行)
+            #   同期ヘルパーではなく、直接SQLとパラメータを指定
+            conn = None
+            try:
+                conn = db_utils.get_db_connection(db_path)
+                cursor = conn.cursor()
+                cursor.execute(sql, params)
+                conn.commit()
+                logger.info(f"セッション履歴に '{event_type}' を追加しました (Session: {session_id})" + log_msg_suffix)
+            except sqlite3.Error as db_err_update:
+                 logger.error(f"セッション履歴/状態更新中にDBエラー: {db_err_update}", exc_info=True)
+                 if conn: conn.rollback()
+                 raise StateManagementError(f"DB error updating session history/state: {db_err_update}") from db_err_update
+            finally:
+                 if conn: conn.close()
 
-        except sqlite3.Error as db_err:
-            logger.error(f"[Sync] セッション履歴/状態更新中にDBエラー: {db_err}", exc_info=True)
-            if conn: conn.rollback()
-            # DBエラーは StateManagementError でラップ
-            raise StateManagementError(f"DB error updating session history/state: {db_err}") from db_err
         except ValueError as ve:
-             # セッションが見つからない ValueError はそのまま raise
-             if conn: conn.rollback()
-             raise ve
+            # session not found
+            raise ve
+        except StateManagementError as sme:
+            # fetch or update error
+            raise sme
         except Exception as e:
-            logger.error(f"[Sync] セッション履歴/状態更新中に予期せぬエラー: {e}", exc_info=True)
-            if conn: conn.rollback()
-            # その他の予期せぬエラーも StateManagementError でラップ
-            raise StateManagementError(f"Unexpected error updating session history/state: {e}") from e
-        finally:
-            if conn: conn.close()
+            # JSON decode or other unexpected errors
+            logger.error(f"セッション履歴/状態更新プロセスで予期せぬエラー ({session_id}): {e}", exc_info=True)
+            raise StateManagementError(f"Unexpected error during add_session_history process: {e}") from e
+    # --- DBロック終了 --- #
 
-
-# --- Cleanup Function --- #
+    # 更新後のセッション情報を返す (ロック外で)
+    try:
+        return await get_session_info(config, db_path, session_id)
+    except (ValueError, StateManagementError) as get_err:
+        logger.error(f"履歴追加後のセッション情報取得エラー ({session_id}): {get_err}", exc_info=False)
+        # 履歴追加自体は成功している可能性があるので、エラーを返しつつ警告
+        raise StateManagementError(f"History added, but failed to retrieve updated session info: {get_err}") from get_err
 
 def cleanup_old_sessions(config: Dict[str, Any]):
     """古いセッションや最大数を超えたセッションをクリーンアップする (同期)"""
@@ -227,33 +210,39 @@ def cleanup_old_sessions(config: Dict[str, Any]):
     deleted_timeout_count = 0
     deleted_excess_count = 0
 
+    # --- DB操作は同期ヘルパー (_db_*) を使う --- 
+    #   cleanup はバックグラウンドスレッドで実行される想定なので、
+    #   async def にせず、同期ヘルパーで十分。
     try:
         # タイムアウトしたセッションを削除
         if session_timeout_seconds > 0:
             timeout_threshold = utils.get_timestamp() - session_timeout_seconds
-            deleted_timeout_count = db_utils._db_execute_commit(db_path, "DELETE FROM sessions WHERE last_update < ?", (timeout_threshold,))
+            # 同期ヘルパーを使用
+            deleted_timeout_count = db_utils._db_execute_commit_sync(db_path, "DELETE FROM sessions WHERE last_update < ?", (timeout_threshold,))
             if deleted_timeout_count and deleted_timeout_count > 0:
                 logger.info(f"{deleted_timeout_count} 件のタイムアウトしたセッションを削除しました。")
 
         # 最大数を超えたセッションを削除
         if max_sessions_count > 0:
-            row = db_utils._db_fetch_one(db_path, "SELECT COUNT(*) FROM sessions")
+            # 同期ヘルパーを使用
+            row = db_utils._db_fetch_one_sync(db_path, "SELECT COUNT(*) FROM sessions")
             current_session_count = row[0] if row else 0
             if current_session_count > max_sessions_count:
                 sessions_to_delete_count = current_session_count - max_sessions_count
                 logger.info(f"セッション数が最大保持数 {max_sessions_count} を超過 ({current_session_count} 件)。古い {sessions_to_delete_count} 件を削除します。")
-                # last_update が古い順に削除
-                deleted_excess_count = db_utils._db_execute_commit(db_path, "DELETE FROM sessions WHERE session_id IN (SELECT session_id FROM sessions ORDER BY last_update ASC LIMIT ?)", (sessions_to_delete_count,))
+                # 同期ヘルパーを使用
+                deleted_excess_count = db_utils._db_execute_commit_sync(db_path, "DELETE FROM sessions WHERE session_id IN (SELECT session_id FROM sessions ORDER BY last_update ASC LIMIT ?)", (sessions_to_delete_count,))
                 if deleted_excess_count and deleted_excess_count > 0:
                     logger.info(f"{deleted_excess_count} 件の超過セッションを削除しました。")
             else:
                  logger.info(f"現在のセッション数: {current_session_count} (最大: {max_sessions_count}) - 超過削除は不要。")
 
+        logger.info(f"セッションクリーンアップ完了。削除(タイムアウト): {deleted_timeout_count or 0}, 削除(超過): {deleted_excess_count or 0}")
+
+    except StateManagementError as sme:
+        logger.error(f"セッションクリーンアップ中にDBエラー: {sme}", exc_info=False)
     except Exception as e:
-        logger.error(f"セッションクリーンアップ中にエラー: {e}", exc_info=True)
-    finally:
-        total_deleted = (deleted_timeout_count or 0) + (deleted_excess_count or 0)
-        logger.info(f"セッションクリーンアップ完了。合計 {total_deleted} 件削除。")
+        logger.error(f"セッションクリーンアップ中に予期せぬエラー: {e}", exc_info=True)
 
 # --- Tool Registration --- #
 

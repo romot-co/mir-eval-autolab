@@ -1,59 +1,99 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
 
 [project]
-name = "mirex-detector"
-version = "0.1.0"
-description = "MIREX音楽情報検索検出器"
-readme = "MCP_README.md"
-requires-python = ">=3.8"
+name = "mirex-auto-improver"
+version = "0.2.0"
+description = "MIR Algorithm Evaluation and AI-driven Improvement Platform"
+authors = [{ name = "<あなたの名前や組織名>"}]
+readme = "README.md"
+requires-python = ">=3.8,<3.11"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+keywords = ["mir", "music information retrieval", "ai", "optimization", "evaluation"]
+
 dependencies = [
-    "numpy",
-    "scipy", 
-    "python-dotenv",
-    "librosa",
-    "matplotlib",
-    "mir_eval",
-    "pandas",
-    "scikit-learn",
-    "tensorflow >= 2.10",
-    "tqdm",
-    "pydantic",
-    "pyaudio",
-    "soundfile",
-    "seaborn",
-    "PyYAML",
-    "requests >= 2.31.0",
-    "fastapi",
-    "uvicorn[standard]",
-    "pillow",
-    "typer >= 0.9.0",
-    "tenacity",
-    "httpx >= 0.27.0",
-    "websockets >= 11.0",
-    "rich >= 13.7.0",
+    "numpy>=1.26.4,<2.0",
+    "scipy>=1.12.0",
+    "python-dotenv>=1.0.0",
+    "librosa>=0.11.0",
+    "matplotlib>=3.10.1",
+    "mir_eval>=0.8.1",
+    "pandas>=2.2.3",
+    "scikit-learn>=1.4.1.post1",
+    "tqdm>=4.66.1",
+    "pydantic>=2.5.3",
+    "soundfile>=0.12.1",
+    "seaborn>=0.13.2",
+    "PyYAML>=6.0.1",
+    "requests>=2.31.0",
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.24.0",
+    "pillow>=10.1.0",
+    "typer[all]>=0.9.0",
+    "tenacity>=8.2.3",
+    "httpx>=0.27.0",
+    "websockets>=11.0",
+    "rich>=13.7.0",
+    "mcp>=1.6.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest",
-    "pytest-cov",
-    "black",
-    "isort",
+    "pytest>=7.4.3",
+    "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.21.1",
+    "black>=24.4.0",
+    "isort>=5.13.2",
+    "ruff>=0.1.9",
+    "types-requests",
+    "types-PyYAML",
 ]
-
-[tool.hatch.build.targets.wheel]
-packages = ["src"]
+numba = ["numba>=0.59.0"]
+crepe = ["crepe>=0.0.16"]
+pyaudio = ["pyaudio"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
+plugins = ["pytest_asyncio"]
+addopts = [
+    "-ra",                # Show extra test summary info
+    "-q",                 # Quiet mode (less verbose)
+    "--cov=src",          # Measure coverage for the src directory
+    "--cov=mcp_server_logic", # Measure coverage for mcp_server_logic
+    "--cov-report=term-missing", # Show missing lines in the terminal report
+    "--cov-report=xml"   # Generate XML report (for CI/external tools)
+    # "--cov-fail-under=70" # Fail if coverage drops below 70% (adjust as needed)
+]
 
 [tool.black]
 line-length = 88
-target-version = ["py38"]
+target-version = ["py38", "py39", "py310"]
 include = '\.pyi?$'
 
 [tool.isort]
 profile = "black"
+line_length = 88
+
+[tool.ruff]
+line-length = 88
+select = ["E", "F", "W", "I", "UP", "B", "C4", "T20"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ruff.lint.isort]
+known-first-party = ["mirex_auto_improver", "src"]

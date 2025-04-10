@@ -65,6 +65,9 @@ src/detectors/**/*.*
 
 # Test
 .pytest_cache/
+coverage.xml
+.coverage
+.coverage.*
 
 # Jupyter Notebook
 .ipynb_checkpoints

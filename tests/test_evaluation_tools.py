@@ -52,12 +52,13 @@ def test_run_evaluate_success(mock_get_out_dir, mock_ensure_dir, mock_run_core, 
 
     # Assertions
     mock_ensure_dir.assert_called_once_with(Path("/fake/workspace/evaluation_results/session_test_job_123"))
-    mock_run_core.assert_called_once_with(**kwargs)
+    mock_run_core.assert_called_once_with(**kwargs, output_dir=ANY)
     assert result == expected_core_result
 
     # Check history calls
+    expected_params_started = {**kwargs, "output_dir": ANY}
     expected_calls = [
-        call("session_test", "evaluation_started", {"detector": "TestDetector", "params": kwargs}),
+        call("session_test", "evaluation_started", {"detector": "TestDetector", "params": expected_params_started}),
         call("session_test", "evaluation_complete", {"detector": "TestDetector", "f_measure": 0.85, "summary": expected_core_result["TestDetector"]["overall_metrics"]})
     ]
     mock_add_history_sync.assert_has_calls(expected_calls)
@@ -74,8 +75,9 @@ def test_run_evaluate_failure(mock_get_out_dir, mock_ensure_dir, mock_run_core, 
         evaluation_tools._run_evaluate(job_id, eval_results_dir, mock_add_history_sync, **kwargs)
 
     # Check history calls (only started and failed)
+    expected_params_started = {**kwargs, "output_dir": ANY}
     expected_calls = [
-        call("session_fail", "evaluation_started", {"detector": "FailDetector", "params": kwargs}),
+        call("session_fail", "evaluation_started", {"detector": "FailDetector", "params": expected_params_started}),
         call("session_fail", "evaluation_failed", {"detector": "FailDetector", "error": "Core eval failed"})
     ]
     mock_add_history_sync.assert_has_calls(expected_calls)
@@ -105,9 +107,10 @@ def test_execute_grid_search_success(mock_yaml_load, mock_open, mock_get_out_dir
 
     # Assertions
     mock_ensure_dir.assert_called_once_with(Path("/fake/workspace/grid_results/session_grid_job_789"))
-    mock_run_grid_core.assert_called_once_with(**kwargs)
+    mock_run_grid_core.assert_called_once_with(**kwargs, output_dir=ANY)
     # Check that output_directory is added to the result
-    expected_result_with_path = {**expected_core_result, "output_directory": "/fake/workspace/grid_results/session_grid_job_789"}
+    expected_output_path_str = "/fake/workspace/grid_results/session_grid_job_789"
+    expected_result_with_path = {**expected_core_result, "output_directory": expected_output_path_str}
     assert result == expected_result_with_path
 
     # Check history calls

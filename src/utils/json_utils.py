@@ -29,6 +29,9 @@ class NumpyEncoder(json.JSONEncoder):
         elif isinstance(obj, np.floating):
             return float(obj)
         elif isinstance(obj, np.ndarray):
+            # 複素数の配列を処理
+            if np.issubdtype(obj.dtype, np.complexfloating):
+                return [{'real': item.real, 'imag': item.imag} for item in obj.tolist()]
             return obj.tolist()
         elif isinstance(obj, np.bool_):
             return bool(obj)
@@ -37,9 +40,11 @@ class NumpyEncoder(json.JSONEncoder):
         elif hasattr(obj, 'to_json'):
             # カスタムオブジェクトのシリアライズをサポート
             return obj.to_json()
-        try:
-            # DatetimeやTimedeltaなど、NumPy以外のカスタム型も文字列に変換できる場合
-            return str(obj)
-        except:
+        # try:
+        #     # DatetimeやTimedeltaなど、NumPy以外のカスタム型も文字列に変換できる場合
+        #     # この try-except があると、意図せず str() にフォールバックしてしまい、
+        #     # シリアライズ不能な型で TypeError が発生しない原因になる
+        #     return str(obj)
+        # except:
             # その他は親クラスのdefaultメソッドに委譲
-            return super(NumpyEncoder, self).default(obj) 
+        return super(NumpyEncoder, self).default(obj) 

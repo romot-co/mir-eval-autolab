@@ -9,7 +9,7 @@ import json # Added for json.loads
 # 関連モジュールインポート
 from mcp.server.fastmcp import FastMCP
 from src.utils.path_utils import get_detector_path as get_detector_path_core
-from src.utils.path_utils import ensure_dir
+from src.utils.path_utils import ensure_dir, is_safe_path_component
 from src.utils.exception_utils import FileError, ConfigError, MirexError
 
 logger = logging.getLogger('mcp_server.code_tools')
@@ -109,6 +109,14 @@ def _run_get_code(
 ) -> str:
     """検出器コード取得ジョブ (同期)"""
     logger.info(f"[Job {job_id}] Getting code for '{detector_name}' (Version: {version or 'latest'})... Session: {session_id}")
+
+    # --- Input Validation --- #
+    if not is_safe_path_component(detector_name):
+        raise ValueError(f"Invalid detector name (unsafe characters): {detector_name}")
+    if version and not is_safe_path_component(version):
+        raise ValueError(f"Invalid version format (unsafe characters): {version}")
+    # --- Validation End --- #
+
     try:
         # Pass session_id if needed by get_detector_path in future hierarchical structure
         detector_path = get_detector_path(detectors_dir, improved_versions_dir, detector_name, version, session_id)
@@ -139,17 +147,28 @@ def _run_save_code(
     """コード保存ジョブ (同期)"""
     logger.info(f"[Job {job_id}] Saving code for '{detector_name}' (Version: {version_tag or 'auto'})... Session: {session_id}")
 
+    # --- Input Validation --- #
+    if not is_safe_path_component(detector_name):
+        raise ValueError(f"Invalid detector name (unsafe characters): {detector_name}")
+    if version_tag and not is_safe_path_component(version_tag):
+        raise ValueError(f"Invalid version tag format (unsafe characters): {version_tag}")
+    # --- Validation End --- #
+
     final_version_tag = version_tag # Keep track of the final tag used
 
     # Generate version tag if not provided or empty
     if not final_version_tag:
         final_version_tag = time.strftime("%Y%m%d_%H%M%S") # Use YYYYMMDD_HHMMSS format
         logger.info(f"[Job {job_id}] No version tag provided, generated timestamp tag: {final_version_tag}")
+        # Re-validate the generated tag (should always be safe, but good practice)
+        if not is_safe_path_component(final_version_tag):
+            err_msg = f"Generated version tag is invalid: {final_version_tag}"
+            logger.critical(f"[Job {job_id}] {err_msg}") # Critical: should not happen
+            raise ValueError(err_msg)
 
-    # Validate final version tag format (allow YYYYMMDD_HHMMSS, v<ts>, etc.)
-    # Keep existing validation flexible, but ensure it's not empty or problematic
+    # Validate final version tag format (redundant if is_safe_path_component is comprehensive, but keep for now)
     if not final_version_tag or not re.match(r"^[a-zA-Z0-9_\\-\\.]+$", final_version_tag) or '/' in final_version_tag or '\\\\' in final_version_tag:
-         err_msg = f"Invalid version tag generated or provided: '{final_version_tag}'"
+         err_msg = f"Invalid version tag format check failed: '{final_version_tag}'"
          logger.error(f"[Job {job_id}] {err_msg}")
          raise ValueError(err_msg)
 
@@ -170,6 +189,17 @@ def _run_save_code(
     # Construct filename using the final version tag
     filename = f"{detector_name}_{final_version_tag}.py"
     file_path = improved_dir / filename
+
+    # --- Final Path Validation (Optional but recommended) ---
+    # Ensure the final path is truly within the intended directory
+    # This requires validate_path_within_allowed_dirs and allowed_dirs
+    # For now, we rely on improved_dir being correct and component validation.
+    # try:
+    #     validate_path_within_allowed_dirs(file_path, [improved_dir], check_existence=False, allow_absolute=True)
+    # except (FileError, ValueError, ConfigError) as path_err:
+    #     logger.critical(f"[Job {job_id}] Security Error: Final save path {file_path} is outside allowed directory {improved_dir}: {path_err}")
+    #     raise FileError(f"Security Error: Invalid save path detected for {filename}") from path_err
+    # --- Validation End --- #
 
     try:
         with open(file_path, "w", encoding="utf-8") as f:
@@ -231,10 +261,17 @@ def register_code_tools(
     @mcp.tool("get_code")
     async def get_code_tool(detector_name: str, version: Optional[str] = None, session_id: Optional[str] = None) -> Dict[str, Any]:
         """指定された検出器のコードを取得します。バージョンが指定されない場合は最新版を取得します。"""
+        # --- API Level Validation --- #
+        if not is_safe_path_component(detector_name):
+            raise ValueError(f"Invalid detector name format: {detector_name}")
+        if version and not is_safe_path_component(version):
+            raise ValueError(f"Invalid version format: {version}")
+        # --- Validation End --- #
+
         job_id = await start_async_job_func( # Use await for async function call
             _run_get_code,
             tool_name="get_code",
-            session_id_for_job=session_id, # Pass session_id for job tracking if needed
+            session_id_for_job=session_id,
             # Task-specific arguments below
             detectors_dir=detectors_dir,
             improved_versions_dir=improved_versions_dir,
@@ -248,7 +285,14 @@ def register_code_tools(
     @mcp.tool("save_code")
     async def save_code_tool(detector_name: str, code: str, version: Optional[str] = None, session_id: Optional[str] = None) -> Dict[str, Any]: # API uses 'version'
         """指定された検出器のコードを指定されたバージョン (または自動生成) で保存します。"""
-        job_id = await start_async_job_func( # Use await for async function call
+        # --- API Level Validation --- #
+        if not is_safe_path_component(detector_name):
+            raise ValueError(f"Invalid detector name format: {detector_name}")
+        if version and not is_safe_path_component(version):
+            raise ValueError(f"Invalid version format: {version}")
+        # --- Validation End --- #
+
+        job_id = await start_async_job_func(
             _run_save_code,
             tool_name="save_code",
             session_id_for_job=session_id,
@@ -257,7 +301,7 @@ def register_code_tools(
             add_history_sync_func=add_history_sync_func,
             detector_name=detector_name,
             code=code,
-            version_tag=version, # Pass API 'version' as 'version_tag' to task func
+            version_tag=version, # Pass API 'version' as 'version_tag' to task
             session_id=session_id
         )
         return {"job_id": job_id, "status": "pending"}

@@ -13,13 +13,45 @@ from mcp_server_logic.utils import generate_id, get_timestamp
 @pytest.fixture
 def in_memory_db_session(monkeypatch):
     """Fixture for in-memory DB for session tests."""
-    db_path = ":memory:"
-    conn = sqlite3.connect(db_path)
+    db_path_id = ":memory:"
+    # Create the in-memory connection
+    conn = sqlite3.connect(db_path_id, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    original_get_conn = db_utils.get_db_connection
-    monkeypatch.setattr(db_utils, 'get_db_connection', lambda path: conn if path == db_path else original_get_conn(path))
-    db_utils.initialize_database(db_path)
-    yield db_path, conn
+
+    # --- Directly create schema in the in-memory DB --- #
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY, base_algorithm TEXT, start_time REAL,
+            last_update REAL, status TEXT, history TEXT, config TEXT,
+            current_metrics TEXT, best_metrics TEXT, best_code_version TEXT,
+            best_code_path TEXT, baseline_metrics TEXT, cycle_state TEXT
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            job_id TEXT PRIMARY KEY, session_id TEXT, tool_name TEXT, status TEXT,
+            start_time REAL, end_time REAL, result TEXT, error_details TEXT,
+            task_args TEXT, worker_id TEXT,
+            FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+        )
+        """)
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        pytest.fail(f"DB schema creation failed in fixture: {e}")
+    # --- Schema creation done --- #
+
+    # Mock get_db_connection to *always* return the in-memory connection
+    def mock_get_conn_always(path: Path):
+        return conn
+    monkeypatch.setattr(db_utils, 'get_db_connection', mock_get_conn_always)
+
+    # Mock init_database to do nothing
+    monkeypatch.setattr(db_utils, 'init_database', lambda *args, **kwargs: None)
+
+    yield db_path_id, conn
     conn.close()
 
 # Mock config dictionary for tests

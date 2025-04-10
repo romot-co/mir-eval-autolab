@@ -20,7 +20,7 @@ from .job_manager import job_queue, active_jobs # job_queueとactive_jobsをイ�
 from .serialization_utils import JsonNumpyEncoder # JsonNumpyEncoder をインポート
 import traceback # トレースバック用に追加
 # StateManagementError, FileError をインポート
-from src.utils.exception_utils import StateManagementError, FileError
+from src.utils.exception_utils import StateManagementError, FileError, ConfigError # ConfigError を追加
 import sqlite3 # DBエラー用
 
 logger = logging.getLogger('mcp_server.core')
@@ -31,87 +31,267 @@ logger = logging.getLogger('mcp_server.core')
 
 # --- Configuration Loading and Setup (Moved & Modified from mcp_server.py) ---
 load_environment_variables() # .env をロード
-PROJECT_ROOT = get_project_root()
+PROJECT_ROOT = get_project_root() # ここで ConfigError の可能性あり
 
-def load_config(config_path: Optional[Path] = None) -> dict:
-    """設定ファイルを読み込む (デフォルトパス or 指定パス)"""
-    if config_path is None:
-        config_path = PROJECT_ROOT / 'config.yaml'
-
-    if config_path.exists():
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config_data = yaml.safe_load(f) or {}
-            logger.info(f"設定ファイル {config_path} を読み込みました。")
-        except Exception as e:
-            logger.warning(f"{config_path} の読み込みに失敗しました: {e}")
-            config_data = {}
-    else:
-        logger.warning(f"{config_path} が見つかりません。デフォルト設定を使用します。")
-        config_data = {}
-
-    # --- デフォルト値、パス、リソース制限、タイムアウト、クリーンアップ設定の適用 ---
-    # workspace_dir の確定
-    workspace_dir_str = os.environ.get("MIREX_WORKSPACE") or config_data.get('paths', {}).get('workspace')
-    if not workspace_dir_str:
-        workspace_dir_str = str(PROJECT_ROOT / 'mcp_workspace')
-        logger.warning(f"ワークスペースパスが未指定のため、デフォルト ({workspace_dir_str}) を使用します。")
-    workspace_dir = Path(workspace_dir_str).resolve()
-
-    # デフォルトパス
-    default_paths = {
-        "workspace": str(workspace_dir),
-        "detectors": str(PROJECT_ROOT / "src" / "detectors"),
-        "improved_versions": str(workspace_dir / "improved_versions"),
-        "evaluation_results": str(workspace_dir / "evaluation_results"),
-        "grid_search_results": str(workspace_dir / "grid_search_results"),
-        "data": str(workspace_dir / "data"),
-        "audio": str(workspace_dir / "data" / "audio"), # デフォルトを修正
-        "reference": str(workspace_dir / "data" / "reference"), # デフォルトを修正
-        "visualizations": str(workspace_dir / "visualizations"),
-        "scientific_output": str(workspace_dir / "scientific_output"),
-        "db": str(workspace_dir / "db") # DBディレクトリ
-    }
-
-    # リソース制限
-    resource_limits = configure_resource_limits()
-
-    # タイムアウト
-    default_timeouts = {
-        'llm': resource_limits['llm_timeout'],
-        'evaluation': resource_limits['evaluation_timeout'],
-        'grid_search': resource_limits['grid_search_timeout'],
-        'job': resource_limits['job_timeout']
-    }
-
-    # クリーンアップ設定
-    default_cleanup = {
-        'session_timeout_seconds': 86400, 'job_stuck_timeout_seconds': 3600,
-        'job_completed_retention_seconds': 604800, 'max_sessions_count': 100,
-        'max_jobs_count': 500, 'interval_seconds': 3600,
+# --- デフォルト設定 --- #
+# config.yaml と同じ構造でデフォルト値を定義
+DEFAULT_CONFIG = {
+    'server': {
+        'poll_interval_seconds': 5,
+        'job_timeout_seconds': 600,
+        'session_timeout_seconds': 3600,
+        'request_timeout_seconds': 60,
+        'log_level': 'INFO',
+        'port': 5002 # uvicorn 起動時にも参照される
+    },
+    'paths': {
+        'data': 'data',
+        'audio': 'data/audio',
+        'reference': 'data/reference',
+        'improved_versions': 'improved_versions',
+        'evaluation_results': 'evaluation_results',
+        'grid_search_results': 'grid_search_results',
+        'visualizations': 'visualizations',
+        'scientific_output': 'scientific_output',
+        'db': 'db',
+        'detectors_src': 'src/detectors'
+    },
+    'resource_limits': { # デフォルトは configure_resource_limits で動的に決定
+        # 'max_concurrent_jobs': 'auto',
+        # 'max_jobs_history': 100,
+        # 'llm_timeout': 180,
+        # 'evaluation_timeout': 1200,
+        # 'grid_search_timeout': 1800,
+        # 'job_timeout': 600
+    },
+    'cleanup': {
+        'interval_seconds': 3600,
+        'session_timeout_seconds': 86400,
+        'max_sessions_count': 100,
+        'job_stuck_timeout_seconds': 3600,
+        'job_completed_retention_seconds': 604800,
+        'max_jobs_count': 500,
         'workspace': {
-            'enabled': True, 'retention_days': 14,
-            'target_dirs': ['evaluation_results', 'grid_search_results', 'improved_versions', 'visualizations', 'scientific_output', 'db'] # dbも追加
+            'enabled': True,
+            'retention_days': 14,
+            'target_dirs': [
+                'evaluation_results', 'grid_search_results', 'improved_versions',
+                'visualizations', 'scientific_output'
+            ]
         }
-    }
+    },
+    'evaluation': {
+        'default_dataset': 'synthesized_v1',
+        'default_metrics': ['note.*', 'onset.*'],
+        'save_plots': True,
+        'save_results_json': True,
+        'mir_eval_options': {
+            'onset_tolerance': 0.05,
+            'pitch_tolerance': 50.0
+        }
+    },
+    'grid_search': {
+        'default_best_metric': 'note.f_measure',
+        'default_n_jobs': -1
+    },
+    'llm': {
+        'client_type': 'ClaudeClient',
+        'api_key': None, # APIキーは環境変数での設定を強く推奨
+        'api_key_openai': None,
+        'model': 'claude-3-opus-20240229',
+        'api_base': 'https://api.anthropic.com',
+        'api_version': '2023-06-01',
+        'api_base_openai': 'https://api.openai.com/v1',
+        'max_tokens': 4096,
+        'timeout': 180,
+        'desktop_mode': False,
+        'desktop_url': 'http://localhost:5000'
+    },
+    'datasets': { # デフォルトのデータセット定義は最小限に
+        'synthesized_v1': {
+            'description': 'Basic synthesized dataset',
+            'audio_dir': 'datasets/synthesized/audio', # paths.audio を参照する方が良いかも
+            'ref_dir': 'datasets/synthesized/labels',   # paths.reference を参照する方が良いかも
+            'ref_pattern': '*.csv'
+        }
+    },
+    'detectors': {}
+}
 
-    # --- 設定のマージ ---
-    final_config = {}
-    final_config['paths'] = {**default_paths, **config_data.get('paths', {})}
-    final_config['resource_limits'] = {**resource_limits, **config_data.get('resource_limits', {})}
-    final_config['timeouts'] = {**default_timeouts, **config_data.get('timeouts', {})}
-    final_config['cleanup'] = {**default_cleanup, **config_data.get('cleanup', {})} # Deep merge is better
-    final_config['server'] = config_data.get('server', {})
-    final_config['llm'] = config_data.get('llm', {})
-    final_config['evaluation'] = config_data.get('evaluation', {})
-    final_config['grid_search'] = config_data.get('grid_search', {})
-    final_config['datasets'] = config_data.get('datasets', {})
-    # ... 他のトップレベル設定 ...
+def _deep_update(source: Dict, overrides: Dict) -> Dict:
+    """辞書を再帰的に更新する"""
+    for key, value in overrides.items():
+        if isinstance(value, dict):
+            # get node or create one
+            node = source.setdefault(key, {})
+            _deep_update(node, value)
+        else:
+            source[key] = value
+    return source
 
-    # 環境変数による上書き (例: APIキー、タイムアウト)
-    final_config['llm']['api_key'] = os.environ.get("ANTHROPIC_API_KEY", final_config['llm'].get('api_key'))
-    final_config['timeouts']['llm'] = int(os.environ.get('MCP_LLM_TIMEOUT', final_config['timeouts']['llm']))
-    # ... 他の環境変数上書き ...
+def _get_env_var_override(config: Dict, prefix: str = 'MCP') -> Dict:
+    """環境変数から設定を上書きする辞書を生成する"""
+    overrides = {}
+    separator = '__' # ネストを示すセパレータ
+
+    def find_and_set(cfg_dict: Dict, current_prefix: str):
+        for key, default_value in cfg_dict.items():
+            env_var_name = f"{current_prefix}{separator}{key.upper()}"
+            env_value = os.environ.get(env_var_name)
+
+            if env_value is not None:
+                # 型変換を試みる
+                original_type = type(default_value)
+                try:
+                    if original_type == bool:
+                        converted_value = env_value.lower() in ['true', '1', 'yes']
+                    elif original_type == int:
+                        converted_value = int(env_value)
+                    elif original_type == float:
+                        converted_value = float(env_value)
+                    elif original_type == list:
+                        # カンマ区切りの文字列をリストに変換 (要素の型は維持しない)
+                        converted_value = [item.strip() for item in env_value.split(',') if item.strip()]
+                    else: # str や NoneType など
+                        converted_value = env_value
+
+                    # ネストされた辞書構造を再現
+                    keys = current_prefix.replace(prefix + separator, '').lower().split(separator)
+                    if keys == ['']: keys = []
+                    keys.append(key)
+
+                    temp_dict = overrides
+                    for i, k_part in enumerate(keys):
+                        if i == len(keys) - 1:
+                            temp_dict[k_part] = converted_value
+                        else:
+                            temp_dict = temp_dict.setdefault(k_part, {})
+
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"環境変数 '{env_var_name}' の値 '{env_value}' を型 '{original_type.__name__}' に変換できませんでした: {e}")
+
+            # 再帰的に処理
+            if isinstance(default_value, dict):
+                find_and_set(default_value, env_var_name)
+
+    find_and_set(config, prefix)
+    return overrides
+
+def load_config(config_path_str: Optional[str] = None) -> Dict[str, Any]:
+    """設定ファイルを読み込み、デフォルト値、YAMLファイル、環境変数でマージする。
+
+    優先順位:
+    1. 環境変数 (MCP__GROUP__KEY 形式)
+       - 例: `server.log_level` は環境変数 `MCP__SERVER__LOG_LEVEL` で上書き可能。
+       - ネストされたキーは `__` で連結します。
+       - 値は元の設定値の型 (bool, int, float, list[str], str) に変換されます。
+       - bool: 'true', '1', 'yes' (小文字) が True。
+       - list[str]: カンマ区切りの文字列。
+    2. YAMLファイル (config_path_str で指定)
+    3. デフォルト値 (DEFAULT_CONFIG)
+
+    Parameters
+    ----------
+    config_path_str : Optional[str], optional
+        設定ファイル (config.yaml) のパス文字列, by default None
+
+    Returns
+    -------
+    Dict[str, Any]
+        最終的な設定辞書
+
+    Raises
+    ------
+    ConfigError
+        設定ファイルの読み込みや解析に失敗した場合
+    """
+    # 1. デフォルト設定をロード
+    final_config = DEFAULT_CONFIG.copy()
+
+    # --- resource_limits の動的設定 --- #
+    # configure_resource_limits は環境変数も考慮するため、
+    # 環境変数オーバーライドの前に実行する。
+    dynamic_limits = configure_resource_limits()
+    _deep_update(final_config.setdefault('resource_limits', {}), dynamic_limits)
+
+    # 2. YAML ファイルを読み込んで上書き
+    if config_path_str:
+        config_path = Path(config_path_str)
+        if config_path.exists():
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    yaml_config = yaml.safe_load(f) or {}
+                _deep_update(final_config, yaml_config)
+                logger.info(f"設定ファイル {config_path} を読み込み、デフォルト値を上書きしました。")
+            except yaml.YAMLError as e:
+                msg = f"設定ファイル {config_path} の解析に失敗しました: {e}"
+                logger.error(msg)
+                raise ConfigError(msg) from e
+            except Exception as e:
+                msg = f"設定ファイル {config_path} の読み込み中に予期せぬエラー: {e}"
+                logger.error(msg, exc_info=True)
+                raise ConfigError(msg) from e
+        else:
+            logger.warning(f"指定された設定ファイルが見つかりません: {config_path}。デフォルト値と環境変数のみ使用します。")
+    else:
+        # デフォルトの config.yaml を試す
+        default_yaml_path = PROJECT_ROOT / 'config.yaml'
+        if default_yaml_path.exists():
+            try:
+                with open(default_yaml_path, 'r', encoding='utf-8') as f:
+                    yaml_config = yaml.safe_load(f) or {}
+                _deep_update(final_config, yaml_config)
+                logger.info(f"デフォルト設定ファイル {default_yaml_path} を読み込み、デフォルト値を上書きしました。")
+            except yaml.YAMLError as e:
+                logger.warning(f"デフォルト設定ファイル {default_yaml_path} の解析に失敗: {e}。無視します。")
+            except Exception as e:
+                 logger.warning(f"デフォルト設定ファイル {default_yaml_path} の読み込みエラー: {e}。無視します。")
+        else:
+             logger.info("デフォルト設定ファイル config.yaml が見つかりません。デフォルト値を使用します。")
+
+    # 3. 環境変数で上書き
+    env_overrides = _get_env_var_override(DEFAULT_CONFIG) # デフォルト構造を元に探索
+    if env_overrides:
+        _deep_update(final_config, env_overrides)
+        logger.info(f"環境変数 (MCP__* 形式) で設定を上書きしました。")
+        # logger.debug(f"環境変数による上書き内容: {json.dumps(env_overrides, indent=2)}")
+
+    # 4. パスの絶対パス化 (ワークスペース基準 or プロジェクトルート基準)
+    #    get_workspace_dir は config を必要とする場合があるので、ここで実行
+    try:
+        workspace_dir = get_workspace_dir(final_config)
+    except (FileError, PermissionError, ConfigError) as path_err:
+         # ワークスペースが準備できない場合は致命的エラー
+         logger.critical(f"ワークスペースディレクトリの準備に失敗: {path_err}")
+         raise ConfigError(f"ワークスペースディレクトリの準備に失敗: {path_err}") from path_err
+
+    final_config['paths']['workspace'] = str(workspace_dir) # 確定したパスを設定
+
+    for key, value in final_config.get('paths', {}).items():
+        if key == 'workspace': continue # 既に絶対パス
+        if value: # 空でないパスのみ処理
+             p = Path(value)
+             if not p.is_absolute():
+                 # デフォルトではワークスペースからの相対パスとみなす
+                 # (detectors_src など一部はプロジェクトルート基準が良いかもしれない)
+                 base_dir = workspace_dir
+                 if key == 'detectors_src': # 例外的にプロジェクトルート基準
+                      base_dir = PROJECT_ROOT
+                 final_config['paths'][key] = str((base_dir / p).resolve())
+             else:
+                  # 絶対パス指定の場合はそのまま (resolve で正規化)
+                  final_config['paths'][key] = str(p.resolve())
+
+    # datasets 内のパスも同様に絶対パス化 (環境変数展開後)
+    for name, dataset_cfg in final_config.get('datasets', {}).items():
+        for key in ['audio_dir', 'ref_dir']:
+            if key in dataset_cfg and dataset_cfg[key]:
+                 p = Path(dataset_cfg[key])
+                 if not p.is_absolute():
+                      # デフォルトではプロジェクトルート基準とみなす (データセットはプロジェクト内に置かれる想定)
+                      dataset_cfg[key] = str((PROJECT_ROOT / p).resolve())
+                 else:
+                      dataset_cfg[key] = str(p.resolve())
 
     return final_config
 
@@ -202,71 +382,116 @@ async def job_worker(worker_id: int, config: Dict[str, Any]):
         logger.info(f"[Worker {worker_id}] [Job {job_id}] ジョブ '{kwargs.get('tool_name', 'unknown')}' を取得しました。")
         if job_id not in active_jobs:
             logger.warning(f"[Worker {worker_id}] [Job {job_id}] Job info not found in active_jobs dict.")
-            active_jobs[job_id] = {'status': 'pending', 'tool_name': kwargs.get('tool_name', 'unknown')}
+            # 見つからない場合でも、初期情報を active_jobs に作成
+            active_jobs[job_id] = {
+                'status': 'pending',
+                'tool_name': kwargs.get('tool_name', 'unknown'),
+                'start_time': None,
+                'end_time': None,
+                'result': None,
+                'error_details': None,
+                'worker_id': None,
+                'task_args': kwargs # kwargs全体を保存するか検討
+            }
 
         active_jobs[job_id]['status'] = 'running'
         active_jobs[job_id]['worker_id'] = worker_id
         start_time_mono = time.monotonic()
         start_time_ts = get_timestamp()
+        active_jobs[job_id]['start_time'] = start_time_ts
+
+        job_result = None
+        job_error = None
+        error_details_dict = None # エラー詳細を格納する辞書
 
         try:
-            # DBにジョブ開始を記録 (エラーハンドリング追加)
+            # DBにジョブ開始を記録 (エラーハンドリング修正)
             try:
                 await db_utils.db_execute_commit_async(
                     db_path,
                     "UPDATE jobs SET status = 'running', start_time = ?, worker_id = ? WHERE job_id = ?",
                     (start_time_ts, str(worker_id), job_id)
                 )
-            except (sqlite3.Error, Exception) as db_err:
-                 # ログ記録の失敗はジョブ自体の成否に影響させない
-                 logger.error(f"[Worker {worker_id}] [Job {job_id}] ジョブ開始DB記録エラー: {db_err}", exc_info=True)
-                 # StateManagementError を raise しない
+            except StateManagementError as db_err:
+                 # DB記録エラーは警告ログを出すが、ジョブ実行は試みる
+                 logger.warning(f"[Worker {worker_id}] [Job {job_id}] ジョブ開始DB記録エラー: {db_err}", exc_info=False)
+                 # 致命的ではないので、ここでは raise しない
 
-            # コルーチン関数を実行
-            result = await task_coro_func(job_id, *args, **kwargs)
+            # --- コルーチン関数を実行 --- #
+            job_result = await task_coro_func(job_id, *args, **kwargs)
+            # --- 実行ここまで --- #
 
             end_time_mono = time.monotonic()
             duration = end_time_mono - start_time_mono
             end_time_ts = get_timestamp()
             logger.info(f"[Worker {worker_id}] [Job {job_id}] ジョブ完了。実行時間: {duration:.2f}秒")
             active_jobs[job_id]['status'] = 'completed'
-            active_jobs[job_id]['result'] = result
+            active_jobs[job_id]['result'] = job_result
             active_jobs[job_id]['end_time'] = end_time_ts # メモリにも終了時間を記録
 
-            # DBにジョブ完了を記録 (エラーハンドリング追加)
+            # DBにジョブ完了を記録 (エラーハンドリング修正)
             try:
-                await db_utils.db_execute_commit_async(
-                    db_path,
-                    "UPDATE jobs SET status = 'completed', end_time = ?, result = ? WHERE job_id = ?",
-                    (end_time_ts, json.dumps(result, cls=JsonNumpyEncoder), job_id)
-                )
-            except (sqlite3.Error, Exception) as db_err:
-                 logger.error(f"[Worker {worker_id}] [Job {job_id}] ジョブ完了DB記録エラー: {db_err}", exc_info=True)
+                result_json = json.dumps(job_result, cls=JsonNumpyEncoder)
+                update_sql = "UPDATE jobs SET status = ?, result = ?, completed_at = ? WHERE job_id = ?"
+                async with db_utils.db_lock:
+                    await db_utils.db_execute_commit_async(
+                        db_path,
+                        update_sql,
+                        ('completed', result_json, end_time_ts, job_id)
+                    )
+                logger.debug(f"ジョブ {job_id} の状態を completed に更新")
+            except StateManagementError as db_err:
+                 # DB記録エラーは警告ログを出すが、ジョブ自体は完了扱い
+                 logger.warning(f"[Worker {worker_id}] [Job {job_id}] ジョブ完了DB記録エラー: {db_err}", exc_info=False)
+                 # ここでも raise しない
 
         except Exception as e:
+            # --- ジョブ実行中のエラー処理 --- #
+            job_error = e # エラーオブジェクトを保持
             end_time_mono = time.monotonic()
             duration = end_time_mono - start_time_mono
             end_time_ts = get_timestamp()
-            error_message = f"Error in job {job_id} ({kwargs.get('tool_name', 'unknown')}): {type(e).__name__}: {e}"
-            error_traceback = traceback.format_exc()
-            logger.error(f"[Worker {worker_id}] {error_message}", exc_info=True)
-            active_jobs[job_id]['status'] = 'failed'
-            active_jobs[job_id]['error'] = error_message
-            active_jobs[job_id]['traceback'] = error_traceback
-            active_jobs[job_id]['end_time'] = end_time_ts # メモリにも終了時間とエラー情報を記録
+            error_message = f"Error in job {job_id} ({kwargs.get('tool_name', 'unknown')})" # 基本メッセージ
+            tb_str = traceback.format_exc() # トレースバックを取得
 
-            # DBにジョブ失敗を記録 (エラーハンドリング追加)
+            # StateManagementError かどうかでログレベルとメッセージを調整
+            if isinstance(e, StateManagementError):
+                logger.error(f"[Worker {worker_id}] [Job {job_id}] 状態管理エラー発生: {e}。実行時間: {duration:.2f}秒", exc_info=False) # トレースバックは別途記録
+                error_message = f"State Management Error: {e}"
+            else:
+                logger.error(f"[Worker {worker_id}] [Job {job_id}] 予期せぬエラー発生: {type(e).__name__}: {e}。実行時間: {duration:.2f}秒", exc_info=False)
+                error_message = f"Unexpected Error: {type(e).__name__}: {e}"
+
+            # メモリ上のジョブ情報を更新
+            active_jobs[job_id]['status'] = 'failed'
+            active_jobs[job_id]['end_time'] = end_time_ts
+            active_jobs[job_id]['result'] = None # 失敗時は result は None
+            # エラー詳細を辞書に格納
+            error_details_dict = {
+                 "error_type": type(e).__name__,
+                 "error_message": str(e),
+                 "traceback": tb_str
+            }
+            active_jobs[job_id]['error_details'] = error_details_dict
+
+            # DBにジョブ失敗を記録 (エラーハンドリング修正)
             try:
-                await db_utils.db_execute_commit_async(
-                    db_path,
-                    "UPDATE jobs SET status = 'failed', end_time = ?, result = ? WHERE job_id = ?",
-                    (end_time_ts, json.dumps({"error": error_message, "traceback": error_traceback}), job_id)
-                )
-            except (sqlite3.Error, Exception) as db_err:
-                 logger.error(f"[Worker {worker_id}] [Job {job_id}] ジョブ失敗DB記録エラー: {db_err}", exc_info=True)
+                error_details_json = json.dumps(error_details_dict)
+                update_sql = "UPDATE jobs SET status = ?, error = ?, completed_at = ? WHERE job_id = ?"
+                async with db_utils.db_lock:
+                    await db_utils.db_execute_commit_async(
+                        db_path,
+                        update_sql,
+                        ('failed', error_details_json, end_time_ts, job_id)
+                    )
+                logger.debug(f"ジョブ {job_id} の状態を failed に更新 (エラー)")
+            except StateManagementError as db_err:
+                 # DB記録エラーは警告ログを出す (ジョブ失敗は既に確定)
+                 logger.warning(f"[Worker {worker_id}] [Job {job_id}] ジョブ失敗DB記録エラー: {db_err}", exc_info=False)
 
         finally:
             job_queue.task_done()
+            logger.debug(f"[Worker {worker_id}] [Job {job_id}] Task marked as done.")
 
 async def start_job_workers(num_workers: int, config: Dict[str, Any]):
     """指定された数のジョブワーカーを起動 (Moved from mcp_server.py)"""

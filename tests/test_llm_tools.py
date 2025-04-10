@@ -1,6 +1,7 @@
 import pytest
 import asyncio
 import json
+import os
 from unittest.mock import patch, MagicMock, AsyncMock
 import httpx
 
@@ -196,7 +197,7 @@ def test_extract_code_from_text():
     assert llm_tools.extract_code_from_text(text1) == "def hello():\n  pass"
 
     text2 = "```\nJust code here\n```"
-    assert llm_tools.extract_code_from_text(text2) == "Just code here"
+    assert llm_tools.extract_code_from_text(text2) is None
 
     text3 = "No code block here."
     assert llm_tools.extract_code_from_text(text3) is None

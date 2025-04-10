@@ -16,6 +16,7 @@ import inspect
 from typing import Dict, List, Any, Tuple, Optional, Type, Union, Callable
 import numpy as np
 import warnings
+import traceback
 
 from src.detectors.base_detector import BaseDetector
 from src.utils.detection_result import DetectionResult
@@ -28,12 +29,12 @@ logger = logging.getLogger(__name__)
 
 def get_detector_class(detector_name: str) -> Type[BaseDetector]:
     """
-    検出器クラスをレジストリから名前で取得する
+    検出器名からクラスオブジェクトを取得します。
 
     Parameters
     ----------
     detector_name : str
-        検出器の名前（大文字小文字は区別しない）
+        検出器名
 
     Returns
     -------
@@ -52,16 +53,21 @@ def get_detector_class(detector_name: str) -> Type[BaseDetector]:
             raise ValueError(f"検出器 '{detector_name}' がレジストリに見つかりません")
             
         # BaseDetectorのサブクラスであることは登録時にチェック済みだが念のため
-        if not issubclass(detector_class, BaseDetector):
-            # レジストリが正しく管理されていれば、この場合は発生しないはず
-            raise TypeError(f"'{detector_name}'に登録されたクラスがBaseDetectorを継承していません。")
+        try:
+            if not issubclass(detector_class, BaseDetector):
+                # レジストリが正しく管理されていれば、この場合は発生しないはず
+                raise TypeError(f"'{detector_name}'に登録されたクラスがBaseDetectorを継承していません。")
+        except TypeError as e:
+            # issubclassが型チェックエラーを起こした場合（クラスオブジェクトでない可能性）
+            raise ImportError(f"検出器 '{detector_name}' はBaseDetectorのサブクラスではありません: {e}")
+            
         return detector_class
-    except ValueError as e: # get_registered_detectorはValueErrorを発生させる
-        # 元の実装との整合性のためImportErrorとして再発生
+    except ValueError as e:
+        # get_registered_detectorがValueErrorを発生させた場合
         raise ImportError(f"検出器 '{detector_name}' がレジストリに見つかりません: {e}")
     except Exception as e:
-        # 取得中のその他の潜在的なエラーを処理
-        raise ImportError(f"検出器 '{detector_name}' の取得中に予期せぬエラーが発生しました: {e}")
+        # その他の予期せぬエラーを処理
+        raise ImportError(f"検出器 '{detector_name}' の取得中にエラーが発生しました: {e}")
 
 
 def normalize_detection_result(detection_result: Dict[str, Any], sr: int = None) -> Dict[str, Any]:
@@ -196,107 +202,172 @@ def normalize_detection_result(detection_result: Dict[str, Any], sr: int = None)
         }
 
 
-def ensure_detector_output_format(detector_output: Dict[str, Any]) -> Dict[str, Any]:
+def ensure_detector_output_format(detector_output):
     """
-    検出器の出力が評価に必要な全てのキーを持っていることを確認し、
-    必要に応じて標準フォーマットに変換する。
+    検出器の出力フォーマットを検証し、標準化します。
+    
+    必須キー:
+    - intervals: 音符の開始時間と終了時間を含む2次元配列
+    - note_pitches: 各音符のピッチ値を含む1次元配列
+    
+    任意キー:
+    - frame_times: フレームの時間情報を含む1次元配列
+    - frame_frequencies: 各フレームの周波数情報を含む1次元配列
+    - 追加フィールド: 他の任意のフィールドは保持されます
     
     Parameters
     ----------
-    detector_output : Dict[str, Any]
-        検出器からの生の出力
+    detector_output : dict
+        検出器の出力辞書
         
     Returns
     -------
-    Dict[str, Any]
-        すべての必要なキーを持つ変換済み出力
+    dict
+        検証済みで標準化された検出器出力
     """
-    try:
-        # 標準フォーマットに正規化
-        normalized = normalize_detection_result(detector_output)
-        
-        # 必須キーの定義
-        required_keys = {
-            'intervals': {'type': np.ndarray, 'shape': (None, 2), 'dtype': np.float64},
-            'note_pitches': {'type': np.ndarray, 'shape': (None,), 'dtype': np.float64}
-        }
-        
-        # 各必須キーの検証と修正
-        for key, specs in required_keys.items():
-            if key not in normalized:
-                if specs['shape'][0] is None:
-                    normalized[key] = np.array([], dtype=specs['dtype'])
+    # detector_outputがNoneまたは辞書でない場合はNoneを返す（normalizeで行うため不要かも）
+    if detector_output is None or not isinstance(detector_output, dict):
+        logger.warning("ensure_detector_output_format に無効な入力が与えられました。空の辞書を返します。")
+        return normalize_detection_result({}) # 空の結果を正規化して返す
+
+    logger.debug(f"ensure_detector_output_format: 受信したキー: {list(detector_output.keys())}") # list()で囲む
+    for key, value in detector_output.items():
+        if hasattr(value, 'shape') and hasattr(value, 'dtype'): # NumPy配列かチェック
+            logger.debug(f"  - {key}: 型={type(value).__name__}, 形状={value.shape}, dtype={value.dtype}")
+        elif isinstance(value, (list, tuple)):
+            logger.debug(f"  - {key}: 型={type(value).__name__}, 長さ={len(value)}")
+        else:
+            logger.debug(f"  - {key}: 型={type(value).__name__}")
+
+    result_dict = {}
+    
+    # 必須キーの存在確認とNumPy配列への変換
+    required_keys = ['intervals', 'note_pitches']
+    for key in required_keys:
+        if key not in detector_output:
+            # warnings.warn(f"検出結果に必須キー '{key}' がありません。空の配列を使用します。") # loggerに変更
+            logger.warning(f"検出結果に必須キー '{key}' がありません。空の配列を使用します。")
+            if key == 'intervals':
+                result_dict[key] = np.empty((0, 2), dtype=np.float64) # dtype指定
+            else:
+                result_dict[key] = np.empty(0, dtype=np.float64) # dtype指定
+        else:
+            try:
+                # NumPy配列への変換を試みる
+                converted_array = np.asarray(detector_output[key], dtype=np.float64)
+                # intervals の形状チェック (N, 2)
+                if key == 'intervals' and converted_array.ndim == 2 and converted_array.shape[1] != 2:
+                    logger.error(f"キー '{key}' の形状が不正です ({converted_array.shape})。期待される形状: (N, 2)。空の配列を使用します。")
+                    result_dict[key] = np.empty((0, 2), dtype=np.float64)
+                elif key == 'intervals' and converted_array.ndim != 2:
+                    logger.error(f"キー '{key}' の次元が不正です ({converted_array.ndim})。期待される次元: 2。空の配列を使用します。")
+                    result_dict[key] = np.empty((0, 2), dtype=np.float64)
+                # note_pitches の形状チェック (N,)
+                elif key == 'note_pitches' and converted_array.ndim != 1:
+                    logger.error(f"キー '{key}' の次元が不正です ({converted_array.ndim})。期待される次元: 1。空の配列を使用します。")
+                    result_dict[key] = np.empty(0, dtype=np.float64)
                 else:
-                    normalized[key] = np.array([]).reshape(0, *specs['shape'][1:])
-                logger.warning(f"必須キー '{key}' が存在しないため、空の配列を作成しました")
-                continue
-            
-            value = normalized[key]
-            
-            # 型の検証と変換
-            if not isinstance(value, specs['type']):
-                try:
-                    value = np.asarray(value, dtype=specs['dtype'])
-                    normalized[key] = value
-                    logger.debug(f"キー '{key}' を適切な型に変換しました")
-                except Exception as e:
-                    logger.error(f"キー '{key}' の型変換に失敗: {str(e)}")
-                    if specs['shape'][0] is None:
-                        normalized[key] = np.array([], dtype=specs['dtype'])
-                    else:
-                        normalized[key] = np.array([]).reshape(0, *specs['shape'][1:])
-                    continue
-            
-            # 形状の検証
-            if len(specs['shape']) != len(value.shape):
-                logger.error(f"キー '{key}' の次元数が不正: 期待={len(specs['shape'])}, 実際={len(value.shape)}")
-                if specs['shape'][0] is None:
-                    normalized[key] = np.array([], dtype=specs['dtype'])
+                    result_dict[key] = converted_array
+            except Exception as e:
+                # 変換エラーの場合、ログを記録して空の配列を設定
+                logger.error(f"キー '{key}' の値をNumPy配列に変換できませんでした: {e}。入力値: {detector_output[key]}。空の配列を使用します。")
+                if key == 'intervals':
+                    result_dict[key] = np.empty((0, 2), dtype=np.float64)
                 else:
-                    normalized[key] = np.array([]).reshape(0, *specs['shape'][1:])
-                continue
-            
-            for i, (expected, actual) in enumerate(zip(specs['shape'][1:], value.shape[1:])):
-                if expected is not None and expected != actual:
-                    logger.error(f"キー '{key}' の形状が不正: 軸{i+1}で期待={expected}, 実際={actual}")
-                    if specs['shape'][0] is None:
-                        normalized[key] = np.array([], dtype=specs['dtype'])
-                    else:
-                        normalized[key] = np.array([]).reshape(0, *specs['shape'][1:])
-                    break
-        
-        # データの整合性チェック
-        if len(normalized['intervals']) != len(normalized['note_pitches']):
-            min_len = min(len(normalized['intervals']), len(normalized['note_pitches']))
-            logger.warning(f"インターバルとピッチの長さが一致しません。短い方 ({min_len}) に合わせます。")
-            normalized['intervals'] = normalized['intervals'][:min_len]
-            normalized['note_pitches'] = normalized['note_pitches'][:min_len]
-        
-        # 時間の単調性チェック
-        if len(normalized['intervals']) > 0:
-            # オンセット時刻の単調性
-            if not np.all(np.diff(normalized['intervals'][:, 0]) >= 0):
-                logger.warning("オンセット時刻が単調増加していません")
-            
-            # 各音符の区間の妥当性
-            invalid_intervals = normalized['intervals'][:, 1] <= normalized['intervals'][:, 0]
-            if np.any(invalid_intervals):
-                logger.warning(f"{np.sum(invalid_intervals)}個の音符で終了時刻が開始時刻以前になっています")
-        
-        # ピッチ値の範囲チェック
-        if len(normalized['note_pitches']) > 0:
-            invalid_pitches = (normalized['note_pitches'] < 0) | (normalized['note_pitches'] > 20000)
-            if np.any(invalid_pitches):
-                logger.warning(f"{np.sum(invalid_pitches)}個のピッチ値が不正な範囲です")
-        
-        return normalized
-        
-    except Exception as e:
-        logger.error(f"検出器出力の検証中に予期せぬエラーが発生: {str(e)}")
-        return {
-            'intervals': np.array([]).reshape(0, 2),
-            'note_pitches': np.array([])
-        }
+                    result_dict[key] = np.empty(0, dtype=np.float64)
+
+    # 任意キーの処理 (NumPy配列に変換可能なものは変換)
+    optional_keys = ['frame_times', 'frame_frequencies']
+    for key in optional_keys:
+        if key in detector_output:
+            try:
+                converted_array = np.asarray(detector_output[key], dtype=np.float64)
+                # 形状チェック (M,)
+                if converted_array.ndim != 1:
+                    logger.error(f"キー '{key}' の次元が不正です ({converted_array.ndim})。期待される次元: 1。Noneを使用します。")
+                    result_dict[key] = np.empty(0, dtype=np.float64)
+                else:
+                    result_dict[key] = converted_array
+            except Exception as e:
+                logger.error(f"キー '{key}' の値をNumPy配列に変換できませんでした: {e}。入力値: {detector_output[key]}。Noneを使用します。")
+                result_dict[key] = np.empty(0, dtype=np.float64)
+        else:
+            result_dict[key] = np.empty(0, dtype=np.float64)
+
+    # その他の追加キーをそのままコピー
+    for key, value in detector_output.items():
+        if key not in required_keys and key not in optional_keys:
+            result_dict[key] = value
+
+    logger.debug(f"変換後のキー: {list(result_dict.keys())}") # list()で囲む
+
+    # intervals と note_pitches の長さチェックと調整
+    intervals = result_dict.get('intervals')
+    pitches = result_dict.get('note_pitches')
+
+    # Noneチェックを追加
+    if intervals is None or pitches is None:
+        logger.error("intervals または note_pitches の変換に失敗したため、長さの比較ができません。")
+        # この場合、両方を空にするか、エラーを伝播させるか検討。
+        # ここでは両方を空にする
+        result_dict['intervals'] = np.empty((0, 2), dtype=np.float64)
+        result_dict['note_pitches'] = np.empty(0, dtype=np.float64)
+        intervals = result_dict['intervals'] # 更新
+        pitches = result_dict['note_pitches'] # 更新
+
+    len_intervals = len(intervals)
+    len_pitches = len(pitches)
+
+    if len_intervals != len_pitches:
+        # warnings.warn(f"intervalsの長さ ({len_intervals}) と note_pitchesの長さ ({len_pitches}) が一致しません。短い方に合わせます。") # loggerに変更
+        logger.warning(f"intervalsの長さ ({len_intervals}) と note_pitchesの長さ ({len_pitches}) が一致しません。短い方に合わせます。")
+        min_len = min(len_intervals, len_pitches)
+        result_dict['intervals'] = intervals[:min_len]
+        result_dict['note_pitches'] = pitches[:min_len]
+
+    # --- ここに単調性チェックやピッチ範囲チェックを追加可能 ---
+    # 例:
+    # final_intervals = result_dict['intervals']
+    # if len(final_intervals) > 1:
+    #     onset_times = final_intervals[:, 0]
+    #     if not np.all(np.diff(onset_times) >= 0):
+    #         logger.warning("オンセット時刻が単調増加していません")
+    #     invalid_intervals = final_intervals[:, 1] < final_intervals[:, 0]
+    #     if np.any(invalid_intervals):
+    #         logger.warning(f"{np.sum(invalid_intervals)}個の音符の開始時間が終了時間よりも後になっています。")
+    #
+    # final_pitches = result_dict['note_pitches']
+    # invalid_pitch_mask = (final_pitches <= 0) | (final_pitches > 20000) # 例: 0Hz以下と20kHz超
+    # if np.any(invalid_pitch_mask):
+    #     logger.warning(f"{np.sum(invalid_pitch_mask)}個のピッチ値が不正な範囲です")
+    # ----------------------------------------------------------
+
+    # フレーム情報の長さチェック (任意キーなのでエラーではなく警告)
+    frame_times = result_dict.get('frame_times')
+    frame_frequencies = result_dict.get('frame_frequencies')
+
+    if frame_times is not None and frame_frequencies is not None:
+        if len(frame_times) != len(frame_frequencies):
+             logger.warning(f"frame_times の長さ ({len(frame_times)}) と frame_frequencies の長さ ({len(frame_frequencies)}) が一致しません。そのまま保持します。")
+
+    # 最終的な音符数とフレーム数をログに出力
+    final_note_count = len(result_dict.get('intervals', np.empty((0, 2), dtype=np.float64)))
+    # final_frame_count = len(result_dict.get('frame_times', [])) # ここでエラーが発生していた
+    # frame_timesがNoneでないことを確認してからlen()を呼ぶ
+    final_frame_count = len(result_dict.get('frame_times', np.empty(0, dtype=np.float64)))
+    logger.debug(f"出力: 音符数={final_note_count}, フレーム数={final_frame_count}")
+
+    # DetectionResultオブジェクトではなく辞書を返すように変更（関数名に合わせる）
+    # return DetectionResult(
+    #     intervals=result_dict.get('intervals', np.empty((0, 2))),\
+    #     note_pitches=result_dict.get('note_pitches', np.empty(0)),\
+    #     frame_times=result_dict.get('frame_times'),\
+    #     frame_frequencies=result_dict.get('frame_frequencies'),\
+    #     detector_name=result_dict.get('detector_name', 'Unknown'),\
+    #     detection_time=result_dict.get('detection_time', 0.0),\
+    #     additional_data={k: v for k, v in result_dict.items() if k not in required_keys and k not in optional_keys and k not in ['detector_name', 'detection_time']}\
+    # )\n    return result_dict\n\ndef detection_result_to_dict(detection_result: DetectionResult) -> Dict[str, Any]:\n    \"\"\"\n
+    return result_dict
 
 
 def detection_result_to_dict(detection_result: DetectionResult) -> Dict[str, Any]:
