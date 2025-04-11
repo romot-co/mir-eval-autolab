@@ -22,27 +22,15 @@ logger = logging.getLogger('mcp_server_main')
 try:
     from src.mcp_server_logic import (
         core, db_utils, session_manager, job_manager, llm_tools,
-        evaluation_tools, code_tools, improvement_loop, visualization_tools, utils
+        evaluation_tools, code_tools, improvement_loop, utils
     )
     # 必要なら json_utils 等も
-    from src.mcp_server_logic.core import JsonNumpyEncoder # If needed globally
 except ImportError as e:
     logger.critical(f"必須モジュールのインポートに失敗しました: {e}", exc_info=True)
     logger.critical("PYTHONPATHを確認し、依存関係が正しくインストールされているか確認してください。")
     print(f"FATAL: Failed to import required modules: {e}", file=sys.stderr)
     print("Check PYTHONPATH and ensure dependencies are installed correctly.", file=sys.stderr)
     sys.exit(1)
-
-# --- Optional: Import Extensions --- #
-try:
-    # import src.mcp_server_extensions as mcp_server_extensions
-    from src.mcp_server_logic import mcp_server_extensions
-    has_extensions = True
-    logger.info("MCP拡張機能をインポートしました")
-except ImportError:
-    has_extensions = False
-    logger.warning("MCP拡張機能 (mcp_server_extensions.py) が見つかりません。拡張機能は無効になります。")
-
 
 # --- Main Application Logic --- #
 async def main() -> int:
@@ -81,13 +69,13 @@ async def main() -> int:
     )
 
     # --- Prepare Dependencies for Tool Registration --- #
-    db_path = Path(config['paths']['db']) / db_utils.DB_FILENAME
+    db_path = Path(config['paths']['db_dir']) / db_utils.DB_FILENAME
 
     # Curry functions with necessary dependencies (config, db_path)
     start_async_job_func = lambda task_coro_func, tool_name, session_id=None, *args, **kwargs: \
-        core.start_async_job(config, task_coro_func, tool_name, session_id, *args, **kwargs)
+        job_manager.start_async_job(config, db_path, task_coro_func, tool_name, session_id, *args, **kwargs)
 
-    add_history_async_func: Callable[..., Awaitable[Dict[str, Any]]] = \
+    add_history_async_func: Callable[..., Awaitable[None]] = \
         lambda session_id, event_type, event_data, cycle_state_update=None: \
             session_manager.add_session_history(config, db_path, session_id, event_type, event_data, cycle_state_update)
 
@@ -100,21 +88,11 @@ async def main() -> int:
         evaluation_tools.register_evaluation_tools(mcp, config, start_async_job_func, add_history_async_func)
         code_tools.register_code_tools(mcp, config, start_async_job_func, add_history_async_func)
         improvement_loop.register_loop_tools(mcp, config, start_async_job_func, add_history_async_func)
-        visualization_tools.register_visualization_tools(mcp, config, start_async_job_func, add_history_async_func)
+        # visualization_tools registration removed
 
-        # Register extensions if available
-        if has_extensions:
-            logger.info("Registering tools from mcp_server_extensions...")
-            # Assuming register_extension_tools exists and accepts similar args
-            if hasattr(mcp_server_extensions, 'register_extension_tools'):
-                 mcp_server_extensions.register_extension_tools(
-                     mcp, config, db_path, start_async_job_func, add_history_async_func
-                 )
-                 logger.info("Extension tools registered.")
-            else:
-                 logger.warning("mcp_server_extensions found, but register_extension_tools function is missing.")
+        # Register extensions section removed
 
-        logger.info("All tools registered successfully.")
+        logger.info("All required tools registered successfully.") # メッセージ修正
     except Exception as e:
         logger.critical(f"ツール登録中にエラー: {e}", exc_info=True)
         print(f"FATAL: Tool registration failed: {e}", file=sys.stderr)
@@ -126,7 +104,8 @@ async def main() -> int:
         # Start Job Workers
         num_workers = config.get('resource_limits', {}).get('max_concurrent_jobs', 2)
         logger.info(f"Starting {num_workers} job workers...")
-        asyncio.create_task(core.start_job_workers(num_workers, config))
+        db_path_startup = Path(config['paths']['db_dir']) / db_utils.DB_FILENAME
+        asyncio.create_task(job_manager.start_job_workers(num_workers, config, db_path_startup))
         logger.info("Job workers scheduled to start.")
 
         # Start Cleanup Thread
@@ -196,9 +175,9 @@ async def main() -> int:
     sys.exit(exit_code)
 
 if __name__ == "__main__":
-    # Optional: Set global JSON encoder if needed outside MCP context
+    # Optional: Set global JSON encoder if needed outside MCP context (非推奨)
     # _original_encoder = json._default_encoder
-    # json._default_encoder = JsonNumpyEncoder()
+    # json._default_encoder = NumpyEncoder() # <-- ここも変更
 
     exit_code = main()
 

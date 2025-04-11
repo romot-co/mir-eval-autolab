@@ -86,10 +86,10 @@ async def init_database(config: dict):
             start_time REAL,
             end_time REAL,
             result TEXT, -- JSON serialized result or error message
-            error_details TEXT, # エラー詳細フィールド追加 (result と分ける)
+            error_details TEXT, -- JSON blob for detailed error info (e.g., traceback)
             task_args TEXT, -- JSON serialized args for the task
             worker_id TEXT, -- ID of the worker that processed the job
-            FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+            created_at REAL DEFAULT (strftime('%s', 'now')) -- レコード作成時刻 (デバッグ用)
         )
         """)
 
@@ -133,25 +133,33 @@ async def init_database(config: dict):
 # --- Async DB Wrapper Functions を aiosqlite 直接使用に書き換え ---
 async def db_execute_commit_async(db_path: Path, sql: str, params: tuple = ()) -> Optional[int]:
     """DB書き込み操作を非同期で実行 (ロック付き)"""
-    last_row_id = None
+    rows_affected = None
     db = None
+    logger.debug(f"Attempting to acquire DB lock for write: {sql[:50]}...")
     async with db_lock: # 非同期ロックを取得
+        logger.debug(f"Acquired DB lock for write: {sql[:50]}...")
         try:
+            logger.debug(f"Connecting to DB (write): {db_path}")
             # aiosqlite を直接使用
             db = await aiosqlite.connect(str(db_path), timeout=20.0)
             await db.execute("PRAGMA journal_mode=WAL;") # 必要に応じて設定
             await db.execute("PRAGMA busy_timeout = 10000;")
             async with db.execute(sql, params) as cursor:
-                last_row_id = cursor.lastrowid
+                rows_affected = cursor.rowcount
             await db.commit()
             logger.debug(f"Async Executed and committed: {sql[:50]}... with params {params}")
         except aiosqlite.Error as db_err:
             logger.error(f"Async DB Execute Error: {db_err} for SQL: {sql}", exc_info=True)
-            if db: await db.rollback()
+            if db:
+                logger.debug("Rolling back transaction due to error.")
+                await db.rollback()
             raise StateManagementError(f"DB実行エラー (非同期): {db_err}") from db_err
         finally:
-            if db: await db.close()
-    return last_row_id
+            if db:
+                logger.debug(f"Closing DB connection (write): {db_path}")
+                await db.close()
+            logger.debug(f"Released DB lock for write: {sql[:50]}...")
+    return rows_affected
 
 
 async def db_fetch_one_async(db_path: Path, sql: str, params: tuple = ()) -> Optional[aiosqlite.Row]:
@@ -159,7 +167,9 @@ async def db_fetch_one_async(db_path: Path, sql: str, params: tuple = ()) -> Opt
     row: Optional[aiosqlite.Row] = None
     db = None
     # 読み取りはロックなし
+    logger.debug(f"Attempting DB fetch one (no lock): {sql[:50]}...")
     try:
+        logger.debug(f"Connecting to DB (read one): {db_path}")
         db = await aiosqlite.connect(str(db_path), timeout=20.0)
         # 読み取り操作なので WAL/timeout 設定は必須ではないかもしれないが、念のため
         await db.execute("PRAGMA journal_mode=WAL;")
@@ -173,14 +183,18 @@ async def db_fetch_one_async(db_path: Path, sql: str, params: tuple = ()) -> Opt
         logger.error(f"Async DB Fetch One Error: {db_err} for SQL: {sql}", exc_info=True)
         raise StateManagementError(f"DB読み取りエラー (一件・非同期): {db_err}") from db_err
     finally:
-        if db: await db.close()
+        if db:
+            logger.debug(f"Closing DB connection (read one): {db_path}")
+            await db.close()
 
 async def db_fetch_all_async(db_path: Path, sql: str, params: tuple = ()) -> List[aiosqlite.Row]:
     """DB読み取り(複数)操作を非同期で実行 (ロックなし)"""
     rows: List[aiosqlite.Row] = []
     db = None
     # 読み取りはロックなし
+    logger.debug(f"Attempting DB fetch all (no lock): {sql[:50]}...")
     try:
+        logger.debug(f"Connecting to DB (read all): {db_path}")
         db = await aiosqlite.connect(str(db_path), timeout=20.0)
         # 読み取り操作なので WAL/timeout 設定は必須ではないかもしれないが、念のため
         await db.execute("PRAGMA journal_mode=WAL;")
@@ -194,4 +208,6 @@ async def db_fetch_all_async(db_path: Path, sql: str, params: tuple = ()) -> Lis
         logger.error(f"Async DB Fetch All Error: {db_err} for SQL: {sql}", exc_info=True)
         raise StateManagementError(f"DB読み取りエラー (複数・非同期): {db_err}") from db_err
     finally:
-        if db: await db.close() 
+        if db:
+            logger.debug(f"Closing DB connection (read all): {db_path}")
+            await db.close() 

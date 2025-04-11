@@ -33,6 +33,8 @@ import yaml
 from functools import partial
 from typing import Optional, Dict, Any, List, Tuple, Union
 import datetime
+import multiprocessing as mp
+from collections import defaultdict
 
 # ★ 修正: exception_utils のインポートを元に戻す
 from src.utils.exception_utils import log_exception, create_error_result, ConfigError, FileError
@@ -41,24 +43,24 @@ from src.utils.audio_utils import load_audio_file, load_reference_data, make_out
 from src.utils.json_utils import NumpyEncoder
 from src.utils.detection_result import DetectionResult
 from src.utils.detector_utils import get_detector_class, normalize_detection_result
-from src.utils.path_utils import ensure_dir
-from src.evaluation.evaluation_io import create_summary_dataframe, save_evaluation_result, print_summary_statistics
+from src.utils.path_utils import ensure_dir, get_dataset_paths, find_files
+from src.evaluation.evaluation_io import create_summary_dataframe, save_evaluation_result, print_summary_statistics, save_detection_plot as save_detection_plot_io
 
 import mir_eval
 import mir_eval.transcription
 
 import logging
+logger = logging.getLogger(__name__) # モジュールレベルでロガーを定義
 
-# プロット関連のインポート
-plot_module_imported = False
+# プロット関連のインポート (エラーハンドリング付き)
 try:
-    from src.visualization.plots import plot_detection_results
-    plot_module_imported = True
+    # from src.visualization.plots import plot_detection_results # コメントアウト
+    plot_module_imported = False # 直接 False に設定
 except ImportError:
-    pass
+    plot_module_imported = False
+    logger.warning("matplotlib または関連モジュールが見つかりません。プロット機能は無効になります。")
 
-logger = logging.getLogger(__name__)
-
+# グローバル設定のロード
 CONFIG = {}
 def load_global_config():
     global CONFIG
@@ -78,12 +80,14 @@ def load_global_config():
 
 load_global_config()
 
-def evaluate_detection_result(detected_intervals, detected_pitches, 
+def evaluate_detection_result(detected_intervals, detected_pitches,
                              reference_intervals, reference_pitches,
                              evaluator_config: Optional[Dict[str, Any]] = None,
                              detector_result: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, float]]:
     """
     検出結果を評価し、各種評価指標を計算します。
+
+    mir_eval ライブラリの関数を利用して、ノートベースおよびフレームベースの指標を計算します。
 
     Parameters
     ----------
@@ -97,11 +101,12 @@ def evaluate_detection_result(detected_intervals, detected_pitches,
         参照ノートピッチの配列 (M,) 周波数(Hz)
     evaluator_config : Optional[Dict[str, Any]], optional
         評価設定の辞書, by default None
-        - onset_tolerance: オンセット許容誤差（秒）
-        - pitch_tolerance: ピッチ許容誤差（セント）
-        - offset_ratio: オフセット許容誤差の比率
+        - tolerance_onset: オンセット許容誤差（秒）
+        - tolerance_pitch: ピッチ許容誤差（セント）
+        - offset_ratio: オフセット許容誤差の比率 (offset_min_toleranceも考慮)
         - offset_min_tolerance: オフセット許容誤差の最小値（秒）
-        - use_pitch_chroma: ピッチクラスのみで評価するかどうか
+        - use_pitch_chroma: ピッチクラスのみで評価するかどうか (現在未使用)
+        - use_strict_offset: オフセットも評価に含めるかどうか (Trueの場合、`mir_eval.transcription.precision_recall_f1_overlap`を使用。Falseの場合、`mir_eval.transcription.precision_recall_f1`を使用)
     detector_result : Optional[Dict[str, Any]], optional
         検出器の出力結果の辞書, by default None
         - frame_times: フレーム時刻の配列
@@ -111,35 +116,36 @@ def evaluate_detection_result(detected_intervals, detected_pitches,
     -------
     Dict[str, Dict[str, float]]
         評価結果の辞書。以下のキーを含みます：
-        - note: ノートベースの評価結果
-            - precision: 適合率
-            - recall: 再現率
-            - f_measure: F値
-        - pitch: ピッチベースの評価結果
-            - precision: 適合率
-            - recall: 再現率
-            - f_measure: F値
-        - frame_pitch: フレームベースの評価結果（フレームデータがある場合のみ）
-            - precision: 適合率
-            - recall: 再現率
-            - f_measure: F値
-            - accuracy: 正解率
+        - onset: オンセットのみの評価 (`mir_eval.transcription.onset_precision_recall_f1`)
+            - precision, recall, f_measure
+        - offset: オフセットのみの評価 (`mir_eval.transcription.offset_precision_recall_f1`)
+            - precision, recall, f_measure
+        - note: ノートベース評価（オンセット、ピッチ、オプションでオフセット）
+                 (`mir_eval.transcription.precision_recall_f1_overlap` または `mir_eval.transcription.precision_recall_f1`)
+            - precision, recall, f_measure, overlap_ratio (overlap使用時のみ)
+        - pitch: ピッチのみの評価 (現在`note`と同じ関数で計算、将来的に分離可能性あり)
+            - precision, recall, f_measure
+        - frame_pitch: フレームベースの評価結果 (`mir_eval.melody.evaluate`) (フレームデータがある場合のみ)
+            - raw_pitch_accuracy: 生のピッチ正解率
+            - raw_chroma_accuracy: クロマ正解率
+            - voicing_recall: 有声区間再現率
+            - voicing_false_alarm: 有声区間誤検出率
+            - overall_accuracy: 全体正解率
 
     注意
     ----
-    この関数は2種類の評価を行います：
+    この関数は主に2種類の評価を行います：
 
-    1. ノートベース評価（note, pitch）:
-       - mir_eval.transcriptionを使用し、ポリフォニー（複数ノートの同時発音）を正しく評価します。
-       - 参照ノートリストと推定ノートリスト間の最適なマッチングを行い、和音や独立した複数のメロディラインを
-         適切に評価できます。
-       - 主要な評価指標として使用してください。
+    1. ノートベース評価 (onset, offset, note, pitch):
+       - `mir_eval.transcription` モジュールの関数を使用します。
+       - `note` および `pitch` の指標は、`use_strict_offset` パラメータに応じて、オフセットを含めるか (`precision_recall_f1_overlap`)、含めないか (`precision_recall_f1`) を切り替えます。
+       - ポリフォニックなデータ（和音など）を評価することを意図しています。
 
-    2. フレームベース評価（frame_pitch）:
-       - 各時間フレームで単一のピッチのみを評価します。
-       - ポリフォニーの場合、各フレームで最も顕著なピッチのみが評価され、他のピッチは無視されます。
-       - 補助的な評価指標として使用してください。
-       - フレームデータが提供されない場合は計算されません。
+    2. フレームベース評価 (frame_pitch):
+       - `mir_eval.melody.evaluate` 関数を使用します。
+       - 各時間フレームにおける単一のピッチ（基本周波数 F0）を評価します。ポリフォニーは考慮されません。
+       - `detector_result` に `frame_times` と `frame_frequencies` が含まれている場合にのみ計算されます。
+       - ノートベース評価とは異なる側面を評価するため、**補助的な指標**として参照してください。
     """
     if evaluator_config is None:
         evaluator_config = {}
@@ -455,7 +461,7 @@ def _evaluate_file_for_detector(
 
 def run_evaluation(
     detector_names: Union[str, List[str]],
-    output_dir: str, # 必須引数 - detector_names の直後に配置
+    output_dir: str,
     # --- 以下、デフォルト値あり引数 ---
     audio_paths: Optional[Union[str, List[str]]] = None,
     ref_paths: Optional[Union[str, List[str]]] = None,
@@ -466,54 +472,71 @@ def run_evaluation(
     save_results_json: bool = True,
     plot_config: Optional[Dict[str, Any]] = None,
     dataset_name: Optional[str] = None,
-    num_procs: Optional[int] = None
+    num_procs: Optional[int] = None,
+    num_folds: Optional[int] = None, # ★ 追加: クロスバリデーション用
+    fold_index: Optional[int] = None # ★ 追加: クロスバリデーション用
 ) -> Dict[str, Any]:
     """
-    指定されたファイルまたはデータセットに対して、指定された検出器を用いて評価を実行します。
+    指定された検出器とデータセット/ファイルリストで評価を実行します。
+
+    検出器の出力を参照データと比較し、各種評価指標を計算します。
+    結果は指定されたディレクトリにJSONファイルとして保存され、
+    オプションでプロットも保存できます。
+    クロスバリデーションのためのフォールド指定も可能です。
 
     Parameters
     ----------
     detector_names : Union[str, List[str]]
-        評価する検出器の名前（単一またはリスト）。
+        評価する検出器クラス名のリストまたは単一の文字列。
     output_dir : str
-        評価結果（JSON、プロット、サマリー）を保存するディレクトリ。
-        MCPサーバーからジョブ固有のディレクトリパスが渡されることを想定しています。
-        例: /path/to/output/evaluation_<job_id>
+        評価結果 (JSON, プロットなど) を保存するディレクトリ。
     audio_paths : Optional[Union[str, List[str]]], optional
-        評価する音声ファイルのパス（単一またはリスト）。dataset_name指定時は無視されます。
+        評価対象の音声ファイルパスのリストまたは単一の文字列。
+        `dataset_name` が指定されていない場合に必須。
     ref_paths : Optional[Union[str, List[str]]], optional
-        参照ファイルのパス（単一またはリスト）。audio_paths と同じ順序である必要があります。
-        dataset_name指定時は無視されます。
+        評価対象の参照ファイルパスのリストまたは単一の文字列。
+        `dataset_name` が指定されていない場合に必須。
     detector_params : Optional[Dict[str, Dict[str, Any]]], optional
-        検出器ごとのパラメータ設定 (例: {'DetectorA': {'param1': 10}}), by default None
+        検出器ごとのパラメータ設定を含む辞書。キーは検出器名。
     evaluator_config : Optional[Dict[str, Any]], optional
-        mir_evalで使用する評価設定, by default None
+        `mir_eval` に渡す評価設定 (例: onset_tolerance)。
+        省略した場合、config.yaml のデフォルト値を使用。
     save_plots : bool, optional
-        各ファイルの評価結果のプロットを保存するかどうか, by default False
+        評価結果のプロットを保存するかどうか。デフォルトは False。
     plot_format : str, optional
-        プロットの保存形式 ('png', 'pdf', etc.), by default 'png'
+        保存するプロットの形式 (例: 'png', 'pdf')。デフォルトは 'png'。
     save_results_json : bool, optional
-        各ファイルの評価結果をJSONファイルとして保存するかどうか, by default True
+        個々のファイル評価結果をJSONで保存するかどうか。デフォルトは True。
     plot_config : Optional[Dict[str, Any]], optional
-        プロット生成のための追加設定, by default None
+        プロット生成関数に渡す追加設定。
     dataset_name : Optional[str], optional
-        config.yamlで定義されたデータセット名。指定された場合、audio_paths/ref_pathsは無視されます。
+        config.yaml で定義されたデータセット名。
+        指定された場合、`audio_paths` と `ref_paths` は無視されます。
     num_procs : Optional[int], optional
-        評価に使用するプロセス数。Noneの場合は利用可能なCPUコア数を使用, by default None
+        評価を並列実行するプロセス数。
+        None の場合は利用可能なCPUコア数を使用。
+        1 の場合は逐次実行。
+    num_folds : Optional[int], optional
+        クロスバリデーションで使用するフォールド数。
+        指定する場合、`fold_index` も必須。デフォルトは None (CVなし)。
+    fold_index : Optional[int], optional
+        クロスバリデーションで評価対象とするフォールドのインデックス (0始まり)。
+        `num_folds` が指定された場合に必須。デフォルトは None。
 
     Returns
     -------
     Dict[str, Any]
-        評価全体のサマリー結果を含む辞書。
+        評価結果のサマリーと、全ファイルの詳細な評価結果を含む辞書。
+        {'summary': dict, 'all_results': list}
 
     Raises
-    -------
+    ------
     ValueError
-        入力パスの数や形式が不正な場合。
-    FileNotFoundError
-        指定されたファイルやディレクトリが見つからない場合。
+        引数が不正な場合 (例: 必須引数不足、パス不一致、不正なフォールド指定)。
     ConfigError
-        設定ファイルに問題がある場合。
+        設定ファイルの読み込みや解釈に失敗した場合。
+    FileError
+        ファイル/ディレクトリが見つからない場合。
     """
     start_time_overall = time.time()
     logger.info(f"Starting evaluation process...")
@@ -528,42 +551,40 @@ def run_evaluation(
     if not output_dir:
         raise ValueError("Output directory (output_dir) must be provided.")
 
-    # output_dir を Path オブジェクトに変換し、存在確認 (ensure_dir は呼び出し元で行う想定だが念のため)
+    # ★ クロスバリデーション引数検証
+    if num_folds is not None:
+        if fold_index is None:
+            raise ValueError("fold_index must be specified when num_folds is set.")
+        if not isinstance(num_folds, int) or num_folds < 2:
+            raise ValueError(f"num_folds must be an integer >= 2, but got {num_folds}.")
+        if not isinstance(fold_index, int) or not (0 <= fold_index < num_folds):
+            raise ValueError(f"fold_index must be an integer between 0 and {num_folds - 1}, but got {fold_index}.")
+        logger.info(f"Cross-validation enabled: Evaluating Fold {fold_index + 1} of {num_folds}.")
+    elif fold_index is not None:
+        raise ValueError("num_folds must be specified when fold_index is set.")
+
+    # output_dir を Path オブジェクトに変換し、存在確認
     try:
         output_dir_path = Path(output_dir).resolve()
-        ensure_dir(output_dir_path) # ここでディレクトリがなければ作成
+        ensure_dir(output_dir_path)
     except Exception as e:
          raise ValueError(f"Invalid or inaccessible output directory: {output_dir}. Error: {e}") from e
 
-    # evaluator_config のデフォルトを CONFIG から取得 (あれば)
+    # evaluator_config のデフォルトを CONFIG から取得
     if evaluator_config is None:
         evaluator_config = CONFIG.get('evaluation', {}).get('mir_eval_options', {})
         logger.info(f"Using default evaluator config: {evaluator_config}")
 
     # --- ファイルリストの準備 --- #
-    audio_ref_pairs: List[Tuple[str, str]] = []
+    audio_ref_pairs_path: List[Tuple[Path, Path]] = []
     if dataset_name:
         logger.info(f"Loading file list from dataset: {dataset_name}")
         try:
-            from src.utils.path_utils import get_dataset_paths
-            # データセット設定からパスとパターンを取得
-            audio_dir, ref_dir, audio_pattern, ref_pattern = get_dataset_paths(CONFIG, dataset_name)
-            # ファイルペアを検索
-            audio_files = sorted(list(audio_dir.glob(audio_pattern)))
-            if not audio_files:
-                 raise FileNotFoundError(f"No audio files found in {audio_dir} matching '{audio_pattern}'")
-            for audio_path in audio_files:
-                # 対応する参照ファイルを探す (拡張子を除いたファイル名が一致すると仮定)
-                base_name = audio_path.stem
-                expected_ref_name = ref_pattern.replace('*', base_name)
-                ref_path = ref_dir / expected_ref_name
-                if ref_path.exists():
-                    audio_ref_pairs.append((str(audio_path), str(ref_path)))
-                else:
-                    logger.warning(f"Reference file not found for {audio_path}: {ref_path}. Skipping this pair.")
-            if not audio_ref_pairs:
-                 raise FileNotFoundError(f"No matching audio/reference pairs found for dataset '{dataset_name}'")
-            logger.info(f"Found {len(audio_ref_pairs)} audio/reference pairs in dataset '{dataset_name}'.")
+            audio_dir, label_dir, file_pairs = get_dataset_paths(CONFIG, dataset_name)
+            audio_ref_pairs_path = file_pairs
+            if not audio_ref_pairs_path:
+                 raise FileNotFoundError(f"No valid audio/reference file pairs found for dataset '{dataset_name}'.")
+            logger.info(f"Found {len(audio_ref_pairs_path)} audio/reference pairs in dataset '{dataset_name}'.")
         except (KeyError, FileNotFoundError, ConfigError) as e:
             logger.error(f"Failed to load dataset '{dataset_name}': {e}")
             raise
@@ -574,33 +595,52 @@ def run_evaluation(
             ref_paths = [ref_paths]
         if len(audio_paths) != len(ref_paths):
             raise ValueError("Number of audio paths and reference paths must match.")
-        # パスの存在確認 (ここでは行わない、_evaluate_file_for_detector 内で行う)
         for audio_p, ref_p in zip(audio_paths, ref_paths):
-             audio_ref_pairs.append((str(Path(audio_p).resolve()), str(Path(ref_p).resolve())))
-        logger.info(f"Using {len(audio_ref_pairs)} explicitly provided audio/reference pairs.")
+             audio_ref_pairs_path.append((Path(audio_p).resolve(), Path(ref_p).resolve()))
+        logger.info(f"Using {len(audio_ref_pairs_path)} explicitly provided audio/reference pairs.")
     else:
         raise ValueError("Either 'dataset_name' or both 'audio_paths' and 'ref_paths' must be provided.")
 
+    # ★ クロスバリデーション: ファイルリストのフィルタリング
+    if num_folds is not None and fold_index is not None:
+        n_files = len(audio_ref_pairs_path)
+        if n_files < num_folds:
+            # フォールド数よりファイル数が少ない場合のエラー処理
+            raise ValueError(f"Number of files ({n_files}) is less than the number of folds ({num_folds}). Cannot perform cross-validation.")
+        
+        # ファイルリストをソートして再現性を確保 (例: オーディオファイルパスでソート)
+        audio_ref_pairs_path.sort(key=lambda pair: pair[0])
+        
+        # フォールドに分割 (np.array_split を使うか、手動で分割)
+        # 手動での分割例 (np.array_splitがなければこちらを使用)
+        fold_size = n_files // num_folds
+        remainder = n_files % num_folds
+        start_index = fold_index * fold_size + min(fold_index, remainder)
+        end_index = start_index + fold_size + (1 if fold_index < remainder else 0)
+        
+        selected_files = audio_ref_pairs_path[start_index:end_index]
+        
+        logger.info(f"Applying cross-validation: Using fold {fold_index + 1}/{num_folds}. Selected {len(selected_files)} out of {n_files} files.")
+        audio_ref_pairs_path = selected_files # 評価対象を絞り込んだリストで上書き
+
     # --- 評価タスクの準備 --- #
     tasks = []
+    if not audio_ref_pairs_path:
+        logger.warning("No files selected for evaluation after filtering (or initially).")
+        # 空の結果を返す処理を追加することも検討
+        # return {"summary": {"warning": "No files evaluated"}, "all_results": []}
+        # ここでは後続の処理で空リストとして扱われるようにする
+
     for detector_name in detector_names:
         params = detector_params.get(detector_name) if detector_params else None
-        for i, (audio_file, ref_file) in enumerate(audio_ref_pairs):
-            # ファイル固有の評価IDを生成 (例: 001_filename)
-            # eval_id = f"{i:03d}_{Path(audio_file).stem}"
-            eval_id = Path(audio_file).stem # シンプルにファイル名ステムを使用
-
-            # このファイル評価用の出力ディレクトリパスを作成 (run_evaluation の output_dir の下に)
-            # eval_output_dir = output_dir_path / eval_id # 以前はこの階層があった
-            # 今回の変更: _evaluate_file_for_detector には run_evaluation の output_dir をそのまま渡す
-            # evaluate_detector がファイル名を付けて保存する
-
+        for i, (audio_file_path, ref_file_path) in enumerate(audio_ref_pairs_path):
+            eval_id = audio_file_path.stem
             task_args = {
                 'detector_name': detector_name,
                 'params': params,
-                'audio_ref_tuple': (audio_file, ref_file),
-                'output_dir': output_dir_path, # run_evaluation の output_dir を渡す
-                'eval_id': eval_id, # ファイル識別子として渡す
+                'audio_ref_tuple': (str(audio_file_path), str(ref_file_path)),
+                'output_dir': output_dir_path,
+                'eval_id': eval_id,
                 'evaluator_config': evaluator_config,
                 'save_plots': save_plots,
                 'plot_format': plot_format,
@@ -609,7 +649,7 @@ def run_evaluation(
             }
             tasks.append(task_args)
 
-    logger.info(f"Prepared {len(tasks)} evaluation tasks for {len(detector_names)} detectors across {len(audio_ref_pairs)} files.")
+    logger.info(f"Prepared {len(tasks)} evaluation tasks for {len(detector_names)} detectors across {len(audio_ref_pairs_path)} files.")
 
     # --- 並列評価の実行 --- #
     results: List[Dict[str, Any]] = []
@@ -621,25 +661,10 @@ def run_evaluation(
         if num_procs > 1 and len(tasks) > 1:
             logger.info(f"Running evaluations in parallel with {num_procs} processes...")
             with multiprocessing.Pool(processes=num_procs) as pool:
-                # functools.partial を使って _evaluate_file_for_detector をラップし、引数を固定
-                # map や imap_unordered は単一引数の関数を期待するため、タプルや辞書をそのまま渡せない
-                # -> タプルのリストを作成し、それを展開するヘルパー関数を使うか、Pool.starmapを使う
-                #    または、各タスク引数を辞書のまま渡し、ワーカー関数で受け取る
+                def worker_wrapper(task_dict):
+                     return _evaluate_file_for_detector(**task_dict)
 
-                # starmap を使う場合: _evaluate_file_for_detector が引数を直接受け取る必要がある
-                # -> 現在の実装ではキーワード引数を受け取るので starmap は適さない
-
-                # map/imap_unordered を使う場合: タスク引数を辞書のまま渡す
-                # func_wrapper = partial(_evaluate_file_for_detector, **common_args) # これは間違い
-
-                # tqdm を使って進捗を表示
                 with tqdm(total=len(tasks), desc="Evaluating Files") as pbar:
-                    # imap_unordered で結果を非同期に取得
-                    # 各タスク引数 (辞書) をそのまま map/imap_unordered に渡すことはできない
-                    # -> 各タスク引数を展開して関数に渡すラッパーが必要
-                    def worker_wrapper(task_dict):
-                         return _evaluate_file_for_detector(**task_dict)
-
                     for result in pool.imap_unordered(worker_wrapper, tasks):
                         results.append(result)
                         pbar.update(1)
@@ -650,17 +675,14 @@ def run_evaluation(
 
     except KeyboardInterrupt:
         logger.warning("Evaluation process interrupted by user.")
-        # プールを適切に終了させる (必要であれば)
-        # if 'pool' in locals(): pool.terminate()
-        raise # 中断を上位に伝える
+        raise
 
     except Exception as e:
          logger.error(f"An error occurred during parallel evaluation: {e}", exc_info=True)
-         # if 'pool' in locals(): pool.terminate()
-         # ここで部分的な結果を返すか、エラーを発生させるか
          raise RuntimeError(f"Parallel evaluation failed: {e}") from e
 
     logger.info(f"Finished evaluating all {len(tasks)} tasks.")
+
 
     # --- 結果の集計と保存 --- #
     if not results:
@@ -668,17 +690,27 @@ def run_evaluation(
         return {"summary": {}, "all_results": []}
 
     try:
-        summary = _calculate_evaluation_summary(results)
-        summary["evaluation_config"] = evaluator_config # Add config used
-        summary["num_files_evaluated"] = len(results)
+        # ★ 修正: results リスト内のファイル数を計算 (エラーも含む可能性あり)
+        num_evaluated = len(set((res.get('audio_file'), res.get('detector_name')) for res in results if res.get('audio_file')))
+        # 有効な結果のみでサマリーを計算することも検討可能
+        # valid_results = [res for res in results if res.get('status') != 'error' and res.get('metrics')]
+        # summary = _calculate_evaluation_summary(valid_results)
+
+        summary = _calculate_evaluation_summary(results) # 現状維持: エラー結果も含めて集計
+        summary["evaluation_config"] = evaluator_config
+        # summary["num_files_evaluated"] = len(results) # これはタスク数になる
+        summary["num_files_processed"] = len(audio_ref_pairs_path) # 処理対象ファイル数 (フィルタリング後)
+        summary["num_tasks_executed"] = len(tasks) # 実行タスク数
         summary["detector_names"] = detector_names
         summary["dataset_name"] = dataset_name or "Custom files"
         summary["timestamp"] = datetime.datetime.now().isoformat()
         summary["total_duration_seconds"] = time.time() - start_time_overall
+        if num_folds is not None:
+             summary["cross_validation"] = {"num_folds": num_folds, "fold_index": fold_index}
 
         # サマリーをJSONファイルに保存
         summary_json_path = output_dir_path / "summary.json"
-        save_result_json(summary, str(summary_json_path))
+        save_evaluation_result(summary, str(summary_json_path))
         logger.info(f"Overall evaluation summary saved to {summary_json_path}")
 
         # サマリーを表形式 (CSV) でも保存 (オプション)
@@ -696,14 +728,10 @@ def run_evaluation(
         except Exception as df_err:
              logger.error(f"Failed to create or save summary dataframe: {df_err}", exc_info=True)
 
-        # 全結果もサマリーに含める（ただし大きなデータになる可能性あり）
-        # summary['all_results'] = results # オプション：必要なら含める
-
-        return {"summary": summary, "all_results": results} # all_results も返す
+        return {"summary": summary, "all_results": results}
 
     except Exception as e:
         logger.error(f"Error calculating or saving evaluation summary: {e}", exc_info=True)
-        # サマリー計算に失敗しても、個々の結果は返す
         return {"summary": {"error": f"Summary calculation failed: {e}"}, "all_results": results}
 
 def _calculate_evaluation_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -894,46 +922,6 @@ def save_evaluation_result(result: Dict[str, Any], output_path: str) -> None:
     except Exception as e:
         logger.error(f"Failed to save evaluation result to {output_path}: {e}", exc_info=True)
 
-def save_detection_plot(
-    audio_data: np.ndarray,
-    sr: int,
-    detection_result: Dict[str, Any],
-    reference: Dict[str, Any],
-    output_path: str, # Required arg
-    # --- Optional args follow ---
-    plot_format: str = 'png',
-    plot_config: Optional[Dict[str, Any]] = None
-):
-    """Save detection result plot."""
-    if not plot_module_imported:
-        logger.warning("Plotting module not found, skipping plot generation.")
-        return
-
-    try:
-        logger.info(f"プロットを {output_path} に保存しています...")
-        # Call plot_detection_results with the corrected keyword argument
-        plot_detection_results(
-            audio_data=audio_data,
-            sr=sr,
-            detection_result=detection_result, # Use 'detection_result'
-            reference=reference,
-            output_path=output_path,
-            plot_config=plot_config,
-            plot_format=plot_format
-        )
-        logger.info(f"プロットを {output_path} に保存しました。")
-    except Exception as e:
-        logger.error(f"Failed to save detection plot to {output_path}: {e}", exc_info=True)
-
-def save_result_json(result, output_path):
-    """Save result dictionary to a JSON file using NumpyEncoder."""
-    try:
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(result, f, cls=NumpyEncoder, indent=2)
-        logger.debug(f"Result saved to {output_path}")
-    except Exception as e:
-        logger.error(f"Failed to save JSON to {output_path}: {e}", exc_info=True)
-
 def evaluate_detector(
     detector_name: str,
     detector_params: Optional[Dict[str, Any]],
@@ -968,7 +956,6 @@ def evaluate_detector(
         Dict[str, Any]: 評価結果の辞書。
     """
     start_time = time.time()
-    eval_id = Path(audio_file).stem # ファイル名ステムを評価IDとして使用
     logger.info(f"Evaluating {detector_name} on {eval_id}...")
 
     try:
@@ -988,27 +975,31 @@ def evaluate_detector(
         detection_duration = time.time() - detection_start_time
 
         # 4. 検出結果の正規化
-        #    (detector_result に 'intervals', 'pitches', 'frame_times', 'frame_frequencies' を含む辞書にする)
-        normalized_intervals, normalized_pitches = normalize_detection_result(
+        #    (戻り値は DetectionResult オブジェクト)
+        normalized_detection_result: DetectionResult = normalize_detection_result(
             detection_result_raw,
-            detector_name=detector_name,
-            audio_file=audio_file
+            sr=sr # sr が必要なら渡す
         )
+        # 検証を追加: 正規化が成功したか
+        if not isinstance(normalized_detection_result, DetectionResult):
+             raise TypeError(f"正規化の結果がDetectionResultではありません: {type(normalized_detection_result)}")
 
         # 5. 参照データの読み込み
         reference_data = load_reference_data(ref_file)
         if reference_data is None:
             raise FileNotFoundError(f"Failed to load reference data from {ref_file}")
 
-        # 6. 評価の実行
+        # 6. 評価の実行 (DetectionResultオブジェクトの属性を使用)
         evaluation_metrics = evaluate_detection_result(
-            detected_intervals=normalized_intervals,
-            detected_pitches=normalized_pitches,
+            detected_intervals=normalized_detection_result.intervals,       # 修正後
+            detected_pitches=normalized_detection_result.note_pitches,   # 修正後
             reference_intervals=reference_data['intervals'],
             reference_pitches=reference_data['pitches'],
-            detection_result_dict=detection_result_raw,
-            reference_dict=reference_data,
-            evaluator_config=evaluator_config
+            evaluator_config=evaluator_config,
+            # detector_result は正規化前の生の辞書を渡すか、
+            # 正規化後の DetectionResult を渡すか、evaluate_detection_result の実装による
+            # ここでは DetectionResult を辞書に変換して渡す（フレーム評価用）
+            detector_result=normalized_detection_result.to_dict() if normalized_detection_result else {} # 修正後
         )
 
         # 7. 結果辞書の作成
@@ -1018,7 +1009,7 @@ def evaluate_detector(
             'ref_file': os.path.basename(ref_file),
             'detector_name': detector_name,
             'detector_params': detector_params,
-            'evaluation_metrics': evaluation_metrics,
+            'metrics': evaluation_metrics,  # 'evaluation_metrics' -> 'metrics' に変更（一貫性のため）
             'detection_time': detection_duration,
             'valid': True, # Mark as valid if no exception occurred so far
             'error_message': None
@@ -1028,7 +1019,7 @@ def evaluate_detector(
         if save_results_json:
             json_filename = f"{eval_id}_evaluation.json"
             json_output_path = output_dir / json_filename
-            save_result_json(result, str(json_output_path))
+            save_evaluation_result(result, str(json_output_path))
             result['json_file'] = json_filename # Store relative path
             logger.debug(f"Saved evaluation results to {json_output_path}")
 
@@ -1036,11 +1027,17 @@ def evaluate_detector(
         if save_plots:
             plot_filename = f"{eval_id}_detection_plot.{plot_format}"
             plot_output_path = output_dir / plot_filename
-            save_detection_plot(
+            # プロット関数が DetectionResult を受け取るように想定（必要なら io 側で調整）
+
+            # reference_data も DetectionResult に変換
+            reference_result_obj = DetectionResult.from_dict(reference_data) if reference_data else None
+
+            save_detection_plot_io( # 修正後 (ioモジュールの関数を呼び出す, エイリアス使用)
                 audio_data=audio_data,
                 sr=sr,
-                detection_result=detection_result_raw,
-                reference=reference_data,
+                detection_result=normalized_detection_result,
+                # reference=reference_data, # 修正前
+                reference=reference_result_obj, # 修正後: DetectionResult オブジェクトを渡す
                 output_path=str(plot_output_path),
                 plot_format=plot_format,
                 plot_config=plot_config
@@ -1081,11 +1078,29 @@ def frame_evaluate_wrapper(detection_result, reference_data):
     est_freq = np.maximum(est_freq, 0)
 
     try:
+        # mir_evalのframe評価を実行
         frame_metrics = mir_eval.melody.evaluate(ref_time=ref_time, ref_freq=ref_freq, 
                                                 est_time=est_time, est_freq=est_freq)
-        # Convert numpy types to standard python types for JSON serialization
-        serializable_metrics = {k: float(v) if isinstance(v, (np.float32, np.float64)) else v 
-                                for k, v in frame_metrics.items()}
+        
+        # mir_evalのキー名を一貫したスネークケースに変換
+        # 例: 'Voicing Recall' -> 'voicing_recall'
+        key_mapping = {
+            'Voicing Recall': 'voicing_recall',
+            'Voicing False Alarm': 'voicing_false_alarm',
+            'Raw Pitch Accuracy': 'raw_pitch_accuracy',
+            'Raw Chroma Accuracy': 'raw_chroma_accuracy',
+            'Overall Accuracy': 'overall_accuracy'
+        }
+        
+        # 変換と値の正規化を同時に行う
+        serializable_metrics = {}
+        for orig_key, value in frame_metrics.items():
+            # キー変換 (マッピングにあれば変換、なければそのまま使用)
+            norm_key = key_mapping.get(orig_key, orig_key.lower().replace(' ', '_'))
+            # 値の正規化 (numpy型をfloatに変換)
+            norm_value = float(value) if isinstance(value, (np.float32, np.float64)) else value
+            serializable_metrics[norm_key] = norm_value
+            
         return serializable_metrics
     except Exception as e:
         logger.error(f"Error during frame-based evaluation: {e}", exc_info=True)

@@ -6,10 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "mirex-auto-improver"
 version = "0.2.0"
 description = "MIR Algorithm Evaluation and AI-driven Improvement Platform"
-authors = [{ name = "<あなたの名前や組織名>"}]
+authors = [{ name = "Romot"}]
 readme = "README.md"
 requires-python = ">=3.8,<3.11"
-license = { text = "MIT" }
+license = { text = "Unlicense" }
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
@@ -46,6 +46,8 @@ dependencies = [
     "websockets>=11.0",
     "rich>=13.7.0",
     "mcp>=1.6.0",
+    "aiosqlite>=0.19.0",
+    "jinja2>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -67,6 +69,8 @@ pyaudio = ["pyaudio"]
 testpaths = ["tests"]
 python_files = "test_*.py"
 plugins = ["pytest_asyncio"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 pythonpath = [".", "src"]
 addopts = [
     "-ra",                # Show extra test summary info
@@ -78,7 +82,7 @@ addopts = [
     # "--cov-fail-under=70" # Fail if coverage drops below 70% (adjust as needed)
 ]
 log_cli = true
-log_cli_level = "INFO"
+log_cli_level = "DEBUG"
 log_cli_format = "%(asctime)s [%(levelname)8s] %(name)s: %(message)s (%(filename)s:%(lineno)s)"
 log_cli_date_format = "%Y-%m-%d %H:%M:%S"
 filterwarnings = [

@@ -328,6 +328,7 @@ def generate_noise_perc_sound(duration_sec: float = 0.2, bandpass_freqs: Optiona
             # raise SynthesizerError(f"Bandpass filtering failed: {e}") from e
             pass # Continue with unfiltered noise for now
 
+    t = np.linspace(0., duration_sec, duration_samples, endpoint=False) # Add this line
     envelope = np.exp(-decay_rate * t)
     perc = noise * envelope
     return perc * amp

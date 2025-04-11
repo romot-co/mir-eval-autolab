@@ -7,11 +7,12 @@ JSONシリアライズ関連のユーティリティ関数
 
 import json
 import numpy as np
+from pathlib import Path
 
 
 class NumpyEncoder(json.JSONEncoder):
     """
-    NumPy配列やndarray型などをJSON形式に変換するためのエンコーダー
+    NumPy配列やndarray型、PathオブジェクトなどをJSON形式に変換するためのエンコーダー
     
     Examples
     --------
@@ -40,6 +41,8 @@ class NumpyEncoder(json.JSONEncoder):
         elif hasattr(obj, 'to_json'):
             # カスタムオブジェクトのシリアライズをサポート
             return obj.to_json()
+        elif isinstance(obj, Path):
+            return str(obj)
         # try:
         #     # DatetimeやTimedeltaなど、NumPy以外のカスタム型も文字列に変換できる場合
         #     # この try-except があると、意図せず str() にフォールバックしてしまい、

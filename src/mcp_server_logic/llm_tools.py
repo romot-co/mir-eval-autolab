@@ -12,20 +12,62 @@ from typing import Dict, Any, Optional, Callable, Coroutine, Type, List, Union, 
 import abc # 抽象基底クラスのためにインポート
 import traceback # エラーログ用に追加
 from pathlib import Path # Pathオブジェクトのため
+from functools import partial # Import partial
 
 # 関連モジュールインポート
 from mcp.server.fastmcp import FastMCP
-from .serialization_utils import JsonNumpyEncoder # JSONエンコーダー
-from src.utils.exception_utils import retry_on_exception, LLMError # 例外とリトライ
+from src.utils.json_utils import NumpyEncoder # JSONエンコーダー (旧 JsonNumpyEncoder)
+from src.utils.exception_utils import retry_on_exception, LLMError, ConfigError # 例外とリトライ
 # from anthropic import Anthropic, APIError, APIStatusError # httpx を使うため不要に
 from . import db_utils # 履歴保存用 DBアクセス関数
 # session_manager から非同期の履歴追加関数をインポート
 # 注意: 循環インポートを避けるため、実際の呼び出しはregister関数経由で行うか、
 #       依存関係を見直す必要があるかもしれない。ここでは関数シグネチャのみ利用。
-# from .session_manager import add_session_history
+from .session_manager import add_session_history # ★ 非同期関数を直接インポート (依存性注入が理想)
 from src.utils.path_utils import validate_path_within_allowed_dirs, get_workspace_dir, get_output_base_dir, get_dataset_paths, get_project_root, ensure_dir, get_db_dir # Ensure all needed funcs are imported
 
+# Phase 2 imports
+from jinja2 import Environment, FileSystemLoader, select_autoescape, TemplateNotFound
+import pydantic
+# --- 追加: 履歴イベントスキーマ --- #
+from .schemas import (
+    # Tool Input Schemas
+    ImproveCodeInput, SuggestParametersInput, AnalyzeEvaluationInput,
+    # Tool Output/Result Schemas
+    ParameterSuggestion,
+    CodeCritique,
+    EvaluationAnalysis,
+    ImproveCodeResultData, # ★ 追加
+    # History Event Data Schemas
+    ImproveCodeStartedData,
+    ImproveCodeCompleteData,
+    ImproveCodeFailedData,
+    ParameterSuggestionStartedData,
+    ParameterSuggestionCompleteData,
+    ParameterSuggestionFailedData,
+    AnalyzeEvaluationStartedData,
+    AnalyzeEvaluationCompleteData,
+    AnalyzeEvaluationFailedData,
+    # HypothesesGeneratedData, # TODO: スキーマ定義後に追加
+    # AssessImprovementData, # TODO: スキーマ定義後に追加
+)
+
 logger = logging.getLogger('mcp_server.llm_tools')
+
+# --- Jinja2 Environment Setup (Phase 2) --- #
+# Use Path object for template directory
+prompt_template_dir = Path(__file__).parent / "prompts"
+try:
+    jinja_env = Environment(
+        loader=FileSystemLoader(prompt_template_dir),
+        autoescape=select_autoescape(['html', 'xml']) # Basic autoescaping, adjust if needed
+    )
+    logger.info(f"Jinja2 environment loaded from: {prompt_template_dir}")
+except Exception as e:
+    logger.critical(f"Failed to initialize Jinja2 environment from {prompt_template_dir}: {e}", exc_info=True)
+    # Fallback or raise critical error?
+    # For now, let it potentially fail later if templates are needed.
+    jinja_env = None # Indicate failure
 
 # --- Helper Functions --- #
 
@@ -200,27 +242,20 @@ class ClaudeClient(BaseLLMClient):
                     else:
                          processed_text = llm_response_text
 
-                    # JSONパースは同期的なので Executor を使う
-                    loop = asyncio.get_running_loop()
-                    json_response = await loop.run_in_executor(None, json.loads, processed_text)
-
-                    if not isinstance(json_response, (dict, list)):
-                        logger.warning(f"Claude JSON応答が辞書またはリストではありません: {type(json_response)}")
-                        raise json.JSONDecodeError("応答が有効なJSONオブジェクト/配列ではありません", processed_text, 0)
+                    # 応答からJSONを抽出
+                    json_response = json.loads(processed_text)
                     return json_response
                 except json.JSONDecodeError as json_err:
-                    logger.warning(f"Claudeが要求にも関わらず有効なJSONを返しませんでした。エラー: {json_err}. Raw text: '{llm_response_text[:100]}...'")
-                    # JSONパース失敗時のフォールバック
-                    loop = asyncio.get_running_loop()
-                    code = await loop.run_in_executor(None, extract_code_from_text, llm_response_text)
-                    if code:
-                        return {"improved_code": code, "summary": "Raw text response (JSON parse failed).", "changes": [], "error": "JSON parse failed, extracted code as fallback."}
-                    else:
-                        return {"error": "JSON parse failed and no code block found", "raw_response": llm_response_text[:500]}
+                    logger.warning(f"Failed to find code block, returning raw response: {llm_response_text[:100]}...")
+                    # コードブロックが見つからない場合は、応答全体をそのまま返す
+                    code = extract_code_from_text(llm_response_text)
+                    if not code:
+                        logger.warning("Could not extract code even after attempt, returning raw text.")
+                    return {"error": "JSON parse failed and no code block found", "raw_response": llm_response_text[:500]}
             else:
-                # JSONを要求しない場合、コード抽出を試みる
+                # ★ JSONを要求しない場合、コード抽出を非同期化
                 loop = asyncio.get_running_loop()
-                code = await loop.run_in_executor(None, extract_code_from_text, llm_response_text)
+                code = loop.run_in_executor(None, extract_code_from_text, llm_response_text)
                 return code if code else llm_response_text
 
         except httpx.TimeoutException as e:
@@ -242,6 +277,7 @@ class ClaudeClient(BaseLLMClient):
 
 
 # --- LLM Client Factory --- #
+# (コメント: サーバー起動時に生成し、DIするのが望ましい)
 _llm_client_instance: Optional[BaseLLMClient] = None
 
 def get_llm_client(llm_config: Dict[str, Any], timeouts: Dict[str, Any]) -> BaseLLMClient:
@@ -260,422 +296,532 @@ def get_llm_client(llm_config: Dict[str, Any], timeouts: Dict[str, Any]) -> Base
     return _llm_client_instance
 
 
-# --- Async Task Functions (修正版) --- #
+# --- Helper function to get LLM Client --- #
+# (コメント: 上記 Factory または DI に統合すべき)
+def _get_llm_client(config: dict) -> BaseLLMClient:
+    llm_config = config.get('llm', {})
+    api_provider = llm_config.get('provider', 'anthropic').lower()
+    api_key = llm_config.get('api_key')
+    model_name = llm_config.get('model', 'claude-3-opus-20240229')
+
+    if not api_key:
+        raise ConfigError("LLM API key is not configured.")
+
+    if api_provider == 'anthropic':
+        return ClaudeClient(api_key=api_key, default_model=model_name)
+    # Add other providers like OpenAI here
+    # elif api_provider == 'openai':
+    #     return OpenAIClient(api_key=api_key, default_model=model_name)
+    else:
+        raise ConfigError(f"Unsupported LLM provider: {api_provider}")
+
+# --- Helper function to render prompt (Phase 2) --- #
+async def _render_prompt(
+    template_name: str,
+    context: Dict[str, Any],
+    session_id: Optional[str] = None,
+    config: Optional[dict] = None, # Needed for history summary
+    db_path: Optional[Path] = None # Needed for history summary
+) -> str:
+    """Jinja2 テンプレートを非同期でレンダリングし、履歴サマリーを含める"""
+    if not jinja_env:
+        raise LLMError("Jinja2 environment is not initialized.")
+
+    # セッション履歴サマリーを取得 (非同期で)
+    session_history_summary = "No session history available or feature disabled."
+    if session_id and config and db_path:
+        try:
+            # session_manager モジュールからヘルパー関数を呼び出す (依存関係注意)
+            from .session_manager import get_session_summary_for_prompt
+            session_history_summary = await get_session_summary_for_prompt(
+                config=config,
+                db_path=db_path,
+                session_id=session_id
+                # max_summary_length=config.get('strategy', {}).get('prompt_history_limit', 2000)
+            )
+        except ImportError:
+            logger.error("Could not import get_session_summary_for_prompt from session_manager. Skipping history summary.")
+        except Exception as e:
+            logger.error(f"Error fetching session summary for prompt: {e}", exc_info=True)
+            session_history_summary = f"Error fetching session history: {e}"
+
+    # コンテキストに履歴サマリーを追加
+    full_context = context.copy()
+    full_context['session_history_summary'] = session_history_summary
+
+    try:
+        template = jinja_env.get_template(f"{template_name}.j2")
+        # ★ レンダリングは同期的だが、CPUバウンドの可能性があるので Executor を使う
+        loop = asyncio.get_running_loop()
+        # template.render は同期関数
+        prompt = template.render(full_context)
+        logger.debug(f"Rendered prompt ({template_name}):\n{prompt[:500]}...")
+        return prompt
+    except TemplateNotFound:
+        logger.error(f"Prompt template not found: {template_name}.j2 in {prompt_template_dir}")
+        raise LLMError(f"Prompt template '{template_name}.j2' not found.")
+    except Exception as e:
+        logger.error(f"Error rendering prompt template '{template_name}': {e}", exc_info=True)
+        raise LLMError(f"Error rendering prompt template '{template_name}': {e}") from e
+
+# --- LLM Tool Task Functions (Refactored for Phase 2) --- #
 
 async def _run_improve_code(
-    job_id: str,
-    add_history_async_func: Callable[..., Awaitable[Dict[str, Any]]], # 履歴追加関数 (非同期)
-    llm_config: Dict[str, Any], # LLM設定
-    timeouts: Dict[str, Any], # タイムアウト設定
-    db_path: Path, # DBパス
-    session_id: Optional[str], # セッションID
-    original_code: str, # 対象コード
-    target_issue: Optional[str] = None, # 改善目標
-    context: Optional[Dict[str, Any]] = None # 追加コンテキスト
-) -> Dict[str, Any]:
-    """LLMを使用してコードを改善する非同期タスク"""
-    logger.info(f"[Job {job_id}] Running improve_code task... Session: {session_id}")
-    get_timestamp = time.time
+    job_id: str, # job_id を追加
+    config: dict,
+    add_history_func: Callable[..., Awaitable[None]], # ★ 戻り値を None に
+    # --- スキーマに合わせて引数変更 --- #
+    session_id: str,
+    code: str, # detector_code -> code
+    suggestion: str, # user_goal や hypotheses を統合した指示
+    # evaluation_results: Optional[Dict[str, Any]] = None, # 必要なら追加
+    # --- ここまで --- #
+    original_code_version_hash: Optional[str] = None # 履歴用
+) -> ImproveCodeResultData: # ★ 戻り値をスキーマに
+    """LLMにコード改善を依頼し、結果の ImproveCodeResultData を返す（非同期、履歴記録強化）"""
+    logger.info(f"[Job {job_id}] Starting code improvement... Session: {session_id}")
+    start_time = time.time()
+    db_path = Path(config['paths']['db_path'])
+    llm_client = _get_llm_client(config)
+    # hypothesis_to_test は suggestion に含まれる想定
 
-    # 履歴追加: 開始
-    if session_id:
-        try:
-             await add_history_async_func(session_id, "llm_improve_started", {"target_issue": target_issue, "context": context})
-        except Exception as hist_e:
-             logger.warning(f"[Job {job_id}] Failed to add improve_code started history: {hist_e}")
-
+    # --- 開始履歴 --- #
     try:
-        llm_client = get_llm_client(llm_config, timeouts)
-        # プロンプト生成
-        prompt = f"""Improve the following Python code. Address the target issue: '{target_issue or "General improvement"}'.
-Context: {json.dumps(context, cls=JsonNumpyEncoder) if context else "None"}
+        start_event_data = ImproveCodeStartedData(
+            job_id=job_id,
+            original_code_version_hash=original_code_version_hash,
+            # hypothesis_to_test は suggestion の一部として記録するか？
+            # prompt_used は後で記録
+        )
+        await add_history_func(session_id, "improve_code_started", start_event_data.model_dump(exclude_none=True))
+    except Exception as hist_e:
+        logger.warning(f"[Job {job_id}] Failed to add improve_code_started history: {hist_e}")
 
-Original Code:
-```python
-{original_code}
-```
+    prompt = "" # スコープ外で参照できるように初期化
+    raw_response: Optional[str] = None
+    try:
+        # プロンプトをレンダリング
+        context = {
+            "code_to_improve": code,
+            "improvement_suggestion": suggestion,
+            # evaluation_results や user_goal も必要ならコンテキストに追加
+        }
+        prompt = await _render_prompt("improve_code", context, session_id, config, db_path)
 
-Return ONLY the improved Python code block within ```python ... ```, optionally preceded by a brief summary of changes (max 3 bullet points)."
-"""
-
-        # LLM呼び出し (コードブロックを期待)
+        # LLM呼び出し (コード文字列を期待)
         raw_response = await llm_client.generate(prompt, request_json=False)
 
-        # コードブロック抽出
+        # レスポンスからコードを抽出
         improved_code = extract_code_from_text(raw_response)
-
         if not improved_code:
-            logger.warning(f"[Job {job_id}] LLM did not return a valid Python code block. Using raw response as fallback.")
-            # フォールバックとして、生の応答を使うか、エラーにするか？
-            # ここでは生の応答を含めてエラー扱いとする
-            result = {
-                 "status": "failed",
-                 "error": "LLM did not return a valid Python code block.",
-                 "raw_response": raw_response[:1000] # 応答の一部を記録
-            }
-            if session_id:
-                try:
-                     await add_history_async_func(session_id, "llm_improve_failed", {"error": result["error"], "raw_response_preview": result["raw_response"][:200]})
-                except Exception as hist_e:
-                    logger.warning(f"[Job {job_id}] Failed to add history for LLM code block error: {hist_e}")
-            return result
+            raise LLMError("LLM response did not contain a valid Python code block.", raw_response=raw_response)
 
-        # 成功時の結果
-        result = {
-            "status": "completed",
-            "improved_code": improved_code,
-            # "summary": "..." # 応答からサマリーを抽出するロジックを追加可能
+        # 構文チェック
+        import ast
+        try:
+            ast.parse(improved_code)
+        except SyntaxError as se:
+            raise LLMError(f"Generated code has syntax errors: {se}", raw_response=raw_response, error_type="SyntaxError") from se
+
+        elapsed_time = time.time() - start_time
+        logger.info(f"[Job {job_id}] Code improvement successful ({elapsed_time:.2f}s). Session: {session_id}")
+
+        # TODO: LLM応答から変更サマリーを抽出するロジック
+        changes_summary = f"Improved code based on suggestion: {suggestion[:50]}..." # 仮
+
+        # 結果をスキーマに格納
+        result_data = ImproveCodeResultData(code=improved_code, summary=changes_summary)
+
+        # --- 完了履歴 --- #
+        try:
+            complete_event_data = ImproveCodeCompleteData(
+                job_id=job_id,
+                original_code_version_hash=original_code_version_hash,
+                new_code_version_hash=None, # save_code ツールが責任を持つ
+                hypothesis_tested=None, # suggestion から抽出 or 別途管理
+                changes_summary=changes_summary,
+                llm_response_raw=raw_response,
+            )
+            await add_history_func(session_id, "improve_code_complete", complete_event_data.model_dump(exclude_none=True))
+        except Exception as hist_e:
+            logger.warning(f"[Job {job_id}] Failed to add improve_code_complete history: {hist_e}")
+
+        return result_data
+
+    except LLMError as llm_err:
+        elapsed_time = time.time() - start_time
+        logger.error(f"[Job {job_id}] LLM error during code improvement ({elapsed_time:.2f}s): {llm_err}", exc_info=False)
+        try:
+            fail_event_data = ImproveCodeFailedData(
+                job_id=job_id,
+                original_code_version_hash=original_code_version_hash,
+                # hypothesis_tested=hypothesis_to_test,
+                error=str(llm_err),
+                error_type=llm_err.error_type or 'LLMError',
+                prompt_used=prompt,
+                llm_response_raw=llm_err.raw_response or raw_response
+            )
+            await add_history_func(session_id, "improve_code_failed", fail_event_data.model_dump(exclude_none=True))
+        except Exception as hist_e:
+            logger.warning(f"[Job {job_id}] Failed to add improve_code_failed history (LLMError): {hist_e}")
+        raise llm_err
+    except Exception as e:
+        elapsed_time = time.time() - start_time
+        error_type = type(e).__name__
+        logger.error(f"[Job {job_id}] Unexpected {error_type} during code improvement ({elapsed_time:.2f}s): {e}", exc_info=True)
+        try:
+            fail_event_data = ImproveCodeFailedData(
+                job_id=job_id,
+                original_code_version_hash=original_code_version_hash,
+                # hypothesis_tested=hypothesis_to_test,
+                error=str(e),
+                error_type=error_type,
+                prompt_used=prompt,
+                llm_response_raw=raw_response
+            )
+            await add_history_func(session_id, "improve_code_failed", fail_event_data.model_dump(exclude_none=True))
+        except Exception as hist_e:
+            logger.warning(f"[Job {job_id}] Failed to add improve_code_failed history (Unexpected): {hist_e}")
+        raise LLMError(f"Unexpected error during code improvement: {e}") from e
+
+async def _run_suggest_parameters(
+    job_id: str,
+    config: dict,
+    add_history_func: Callable[..., Awaitable[None]], # ★ 戻り値を None に
+    # --- スキーマに合わせて引数変更 --- #
+    session_id: str,
+    analysis_results: Optional[Dict[str, Any]] = None,
+    current_metrics: Optional[Dict[str, Any]] = None,
+    cycle_state: Optional[Dict[str, Any]] = None, # SessionCycleState 辞書
+    # detector_code: str, # 不要？ サーバー側で取得可能か
+    # user_goal: Optional[str] = None
+    # --- ここまで --- #
+) -> ParameterSuggestion: # ★ 戻り値をスキーマに
+    """LLMにパラメータ提案を依頼し、結果の ParameterSuggestion を返す（非同期、履歴スキーマ使用）"""
+    logger.info(f"[Job {job_id}] Starting parameter suggestion... Session: {session_id}")
+    start_time = time.time()
+    db_path = Path(config['paths']['db_path'])
+    llm_client = _get_llm_client(config)
+
+    # --- 開始履歴 --- #
+    try:
+        start_event_data = ParameterSuggestionStartedData(job_id=job_id)
+        await add_history_func(session_id, "parameter_suggestion_started", start_event_data.model_dump(exclude_none=True))
+    except Exception as hist_e:
+        logger.warning(f"[Job {job_id}] Failed to add parameter_suggestion_started history: {hist_e}")
+
+    prompt = "" # スコープ外で参照できるように初期化
+    raw_response: Optional[Any] = None
+    try:
+        # TODO: 必要なら detector_code をDBから取得
+        detector_code = "# Detector code not fetched in this version"
+        # プロンプトをレンダリング
+        context = {
+            "detector_code": detector_code,
+            "analysis_results": analysis_results,
+            "current_metrics": current_metrics,
+            "cycle_state": cycle_state,
+            # "user_goal": user_goal
         }
+        prompt = await _render_prompt("suggest_parameters", context, session_id, config, db_path)
 
-        # 履歴追加: 完了
-        if session_id:
-            try:
-                await add_history_async_func(session_id, "llm_improve_complete", {
-                    "result_preview": improved_code[:200] + "..." # コードの一部を記録
-                    # "summary": result.get("summary")
-                })
-            except Exception as hist_e:
-                logger.warning(f"[Job {job_id}] Failed to add improve_code complete history: {hist_e}")
+        # LLM呼び出し (JSON応答を期待)
+        raw_response = await llm_client.generate(prompt, request_json=True)
 
-        return result
+        # Pydanticモデルで検証
+        try:
+            validated_response = ParameterSuggestion.model_validate(raw_response)
+        except pydantic.ValidationError as val_err:
+            logger.warning(f"LLM response failed validation for ParameterSuggestion: {val_err}")
+            raise LLMError(f"LLM response validation failed: {val_err}", raw_response=raw_response, error_type="ValidationError") from val_err
+
+        elapsed_time = time.time() - start_time
+        logger.info(f"[Job {job_id}] Parameter suggestion successful ({elapsed_time:.2f}s). Session: {session_id}")
+
+        # --- 完了履歴 --- #
+        try:
+            complete_event_data = ParameterSuggestionCompleteData(
+                job_id=job_id,
+                suggestion=validated_response,
+                prompt_used=prompt,
+                llm_response_raw=raw_response
+            )
+            await add_history_func(session_id, "parameter_suggestion_complete", complete_event_data.model_dump(exclude_none=True))
+        except Exception as hist_e:
+            logger.warning(f"[Job {job_id}] Failed to add parameter_suggestion_complete history: {hist_e}")
+
+        return validated_response # ★ スキーマオブジェクトを返す
 
     except LLMError as llm_err:
-        logger.error(f"[Job {job_id}] LLMError during improve_code: {llm_err}", exc_info=True)
-        if session_id:
-            try: await add_history_async_func(session_id, "llm_improve_failed", {"error": f"LLMError: {llm_err}"})
-            except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add history for LLMError: {hist_e}")
-        raise # LLMError はそのまま上位に伝播させる (job_worker で failed にする)
+        elapsed_time = time.time() - start_time
+        logger.error(f"[Job {job_id}] LLM error during parameter suggestion ({elapsed_time:.2f}s): {llm_err}", exc_info=False)
+        try:
+            fail_event_data = ParameterSuggestionFailedData(
+                job_id=job_id,
+                error=str(llm_err),
+                error_type=llm_err.error_type or 'LLMError',
+                prompt_used=prompt,
+                llm_response_raw=llm_err.raw_response or raw_response
+            )
+            await add_history_func(session_id, "parameter_suggestion_failed", fail_event_data.model_dump(exclude_none=True))
+        except Exception as hist_e:
+            logger.warning(f"[Job {job_id}] Failed to add parameter_suggestion_failed history (LLMError): {hist_e}")
+        raise llm_err
     except Exception as e:
-        logger.error(f"[Job {job_id}] Unexpected error during improve_code: {e}", exc_info=True)
-        if session_id:
-            try: await add_history_async_func(session_id, "llm_improve_failed", {"error": f"Unexpected Error: {e}"})
-            except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add history for unexpected error: {hist_e}")
-        raise # 他の例外も上位に伝播
+        elapsed_time = time.time() - start_time
+        error_type = type(e).__name__
+        logger.error(f"[Job {job_id}] Unexpected {error_type} during parameter suggestion ({elapsed_time:.2f}s): {e}", exc_info=True)
+        try:
+            fail_event_data = ParameterSuggestionFailedData(
+                job_id=job_id,
+                error=str(e),
+                error_type=error_type,
+                prompt_used=prompt,
+                llm_response_raw=raw_response
+            )
+            await add_history_func(session_id, "parameter_suggestion_failed", fail_event_data.model_dump(exclude_none=True))
+        except Exception as hist_e:
+            logger.warning(f"[Job {job_id}] Failed to add parameter_suggestion_failed history (Unexpected): {hist_e}")
+        raise LLMError(f"Unexpected error during parameter suggestion: {e}") from e
 
-async def _run_suggest_improvement(
+async def _run_analyze_evaluation_results(
     job_id: str,
-    add_history_async_func: Callable[..., Awaitable[Dict[str, Any]]],
-    llm_config: Dict[str, Any],
-    timeouts: Dict[str, Any],
-    db_path: Path,
-    session_id: Optional[str],
-    code: str,
-    context: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
-    """コードの改善点を提案する非同期タスク"""
-    logger.info(f"[Job {job_id}] Running suggest_improvement task... Session: {session_id}")
-    get_timestamp = time.time
+    config: dict,
+    add_history_func: Callable[..., Awaitable[None]], # ★ 戻り値を None に
+    # --- スキーマに合わせて引数変更 --- #
+    session_id: str,
+    evaluation_results: Dict[str, Any],
+    # detector_code: Optional[str] = None, # 不要？
+    # user_goal: Optional[str] = None
+    # --- ここまで --- #
+) -> EvaluationAnalysis: # ★ 戻り値をスキーマに
+    """評価結果を分析し、EvaluationAnalysis を返す（非同期、履歴スキーマ使用）"""
+    logger.info(f"[Job {job_id}] Starting evaluation analysis... Session: {session_id}")
+    start_time = time.time()
+    db_path = Path(config['paths']['db_path'])
+    llm_client = _get_llm_client(config)
+    schema_class = EvaluationAnalysis
 
-    if session_id:
-        try: await add_history_async_func(session_id, "llm_suggest_started", {"context": context})
-        except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add suggest_improvement started history: {hist_e}")
-
+    # --- 開始履歴 --- #
     try:
-        llm_client = get_llm_client(llm_config, timeouts)
-        prompt = f"""Analyze the following Python code and suggest specific improvements, focusing on performance, readability, and robustness. Provide suggestions as a JSON list of objects, each with 'suggestion' (str) and 'priority' (int, 1-3, 3=high).
-Context: {json.dumps(context, cls=JsonNumpyEncoder) if context else "None"}
+        start_event_data = AnalyzeEvaluationStartedData(job_id=job_id)
+        await add_history_func(session_id, "analyze_evaluation_results_started", start_event_data.model_dump(exclude_none=True))
+    except Exception as hist_e:
+        logger.warning(f"[Job {job_id}] Failed to add analyze_evaluation_results_started history: {hist_e}")
 
-Code:
-```python
-{code}
-```
+    prompt = "" # スコープ外で参照できるように初期化
+    raw_response: Optional[Any] = None
+    try:
+        # TODO: 必要なら detector_code をDBから取得
+        detector_code = "# Detector code not fetched in this version"
+        # プロンプトをレンダリング
+        context = {
+            'evaluation_results': evaluation_results,
+            'detector_code': detector_code,
+            # 'user_goal': user_goal
+        }
+        prompt = await _render_prompt('analyze_evaluation_results', context, session_id, config, db_path)
 
-Respond ONLY with the valid JSON list.
-"""
-        # LLM呼び出し (JSONを期待)
-        suggestions = await llm_client.generate(prompt, request_json=True)
+        # LLM呼び出し (JSON応答を期待)
+        raw_response = await llm_client.generate(prompt, request_json=True)
 
-        if not isinstance(suggestions, list):
-            logger.warning(f"[Job {job_id}] LLM did not return a valid JSON list for suggestions. Response type: {type(suggestions)}")
-            result = {"status": "failed", "error": "LLM did not return a valid JSON list.", "raw_response": str(suggestions)[:1000]}
-            if session_id:
-                 try: await add_history_async_func(session_id, "llm_suggest_failed", {"error": result["error"], "raw_response_preview": result["raw_response"][:200]})
-                 except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add history for LLM list error: {hist_e}")
-            return result
+        # Pydanticモデルで検証
+        try:
+            validated_response = schema_class.model_validate(raw_response)
+            logger.info(f"[Job {job_id}] LLM analysis passed validation")
+        except pydantic.ValidationError as e:
+            logger.error(f"[Job {job_id}] LLM analysis failed validation: {e}")
+            raise LLMError(f"LLM analysis response failed validation: {e}", raw_response=raw_response, error_type="ValidationError") from e
+        except Exception as e:
+            logger.error(f"[Job {job_id}] Error parsing/validating LLM analysis response: {e}", exc_info=True)
+            raise LLMError(f"Failed to parse or validate LLM analysis JSON response: {e}", raw_response=raw_response, error_type="ParsingError")
 
-        result = {"status": "completed", "suggestions": suggestions}
+        elapsed_time = time.time() - start_time
+        logger.info(f"[Job {job_id}] Evaluation analysis successful ({elapsed_time:.2f}s). Session: {session_id}")
 
-        if session_id:
-             try: await add_history_async_func(session_id, "llm_suggest_complete", {"suggestion_count": len(suggestions)})
-             except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add suggest_improvement complete history: {hist_e}")
+        # --- 完了履歴 --- #
+        try:
+            complete_event_data = AnalyzeEvaluationCompleteData(
+                job_id=job_id,
+                analysis=validated_response,
+                prompt_used=prompt,
+                llm_response_raw=raw_response
+            )
+            await add_history_func(session_id, 'analyze_evaluation_results_complete', complete_event_data.model_dump(exclude_none=True))
+        except Exception as hist_e:
+            logger.warning(f"[Job {job_id}] Failed to add analyze_evaluation_results_complete history: {hist_e}")
 
-        return result
+        return validated_response # ★ スキーマオブジェクトを返す
 
     except LLMError as llm_err:
-        logger.error(f"[Job {job_id}] LLMError during suggest_improvement: {llm_err}", exc_info=True)
-        if session_id:
-            try: await add_history_async_func(session_id, "llm_suggest_failed", {"error": f"LLMError: {llm_err}"})
-            except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add history for LLMError: {hist_e}")
-        raise
+        elapsed_time = time.time() - start_time
+        logger.error(f"[Job {job_id}] LLM error during evaluation analysis ({elapsed_time:.2f}s): {llm_err}", exc_info=False)
+        try:
+            fail_event_data = AnalyzeEvaluationFailedData(
+                job_id=job_id,
+                error=str(llm_err),
+                error_type=llm_err.error_type or 'LLMError',
+                prompt_used=prompt,
+                llm_response_raw=llm_err.raw_response or raw_response
+            )
+            await add_history_func(session_id, 'analyze_evaluation_results_failed', fail_event_data.model_dump(exclude_none=True))
+        except Exception as hist_e:
+            logger.warning(f"[Job {job_id}] Failed to add analyze_evaluation_results_failed history (LLMError): {hist_e}")
+        raise llm_err
     except Exception as e:
-        logger.error(f"[Job {job_id}] Unexpected error during suggest_improvement: {e}", exc_info=True)
-        if session_id:
-            try: await add_history_async_func(session_id, "llm_suggest_failed", {"error": f"Unexpected Error: {e}"})
-            except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add history for unexpected error: {hist_e}")
-        raise
+        elapsed_time = time.time() - start_time
+        error_type = type(e).__name__
+        logger.error(f"[Job {job_id}] Unexpected {error_type} during evaluation analysis ({elapsed_time:.2f}s): {e}", exc_info=True)
+        try:
+            fail_event_data = AnalyzeEvaluationFailedData(
+                job_id=job_id,
+                error=str(e),
+                error_type=error_type,
+                prompt_used=prompt,
+                llm_response_raw=raw_response
+            )
+            await add_history_func(session_id, 'analyze_evaluation_results_failed', fail_event_data.model_dump(exclude_none=True))
+        except Exception as hist_e:
+            logger.warning(f"[Job {job_id}] Failed to add analyze_evaluation_results_failed history (Unexpected): {hist_e}")
+        raise LLMError(f"Unexpected error during evaluation analysis: {e}") from e
 
-async def _run_summarize_code(
-    job_id: str,
-    add_history_async_func: Callable[..., Awaitable[Dict[str, Any]]],
-    llm_config: Dict[str, Any],
-    timeouts: Dict[str, Any],
-    db_path: Path,
-    session_id: Optional[str],
-    code: str
-) -> Dict[str, Any]:
-    """コードの概要を生成する非同期タスク"""
-    logger.info(f"[Job {job_id}] Running summarize_code task... Session: {session_id}")
-    get_timestamp = time.time
-
-    if session_id:
-        try: await add_history_async_func(session_id, "llm_summarize_started", {})
-        except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add summarize_code started history: {hist_e}")
-
-    try:
-        llm_client = get_llm_client(llm_config, timeouts)
-        prompt = f"""Provide a concise summary (max 100 words) of the following Python code, explaining its purpose and main functionality.
-
-Code:
-```python
-{code}
-```
-
-Respond ONLY with the summary text.
-"""
-        summary_text = await llm_client.generate(prompt, request_json=False)
-
-        result = {"status": "completed", "summary": summary_text}
-
-        if session_id:
-            try: await add_history_async_func(session_id, "llm_summarize_complete", {"summary_preview": summary_text[:100] + "..."})
-            except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add summarize_code complete history: {hist_e}")
-
-        return result
-
-    except LLMError as llm_err:
-        logger.error(f"[Job {job_id}] LLMError during summarize_code: {llm_err}", exc_info=True)
-        if session_id:
-            try: await add_history_async_func(session_id, "llm_summarize_failed", {"error": f"LLMError: {llm_err}"})
-            except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add history for LLMError: {hist_e}")
-        raise
-    except Exception as e:
-        logger.error(f"[Job {job_id}] Unexpected error during summarize_code: {e}", exc_info=True)
-        if session_id:
-            try: await add_history_async_func(session_id, "llm_summarize_failed", {"error": f"Unexpected Error: {e}"})
-            except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add history for unexpected error: {hist_e}")
-        raise
-
-async def _run_critique_code(
-    job_id: str,
-    add_history_async_func: Callable[..., Awaitable[Dict[str, Any]]],
-    llm_config: Dict[str, Any],
-    timeouts: Dict[str, Any],
-    db_path: Path,
-    session_id: Optional[str],
-    code: str
-) -> Dict[str, Any]:
-    """コードの潜在的な問題を批評する非同期タスク"""
-    logger.info(f"[Job {job_id}] Running critique_code task... Session: {session_id}")
-    get_timestamp = time.time
-
-    if session_id:
-        try: await add_history_async_func(session_id, "llm_critique_started", {})
-        except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add critique_code started history: {hist_e}")
-
-    try:
-        llm_client = get_llm_client(llm_config, timeouts)
-        prompt = f"""Critique the following Python code for potential issues such as bugs, performance bottlenecks, security vulnerabilities, and style inconsistencies. Provide feedback as a JSON list of objects, each with 'issue' (str) and 'severity' (str: 'low', 'medium', 'high').
-
-Code:
-```python
-{code}
-```
-
-Respond ONLY with the valid JSON list.
-"""
-        critique_list = await llm_client.generate(prompt, request_json=True)
-
-        if not isinstance(critique_list, list):
-            logger.warning(f"[Job {job_id}] LLM did not return a valid JSON list for critique. Response type: {type(critique_list)}")
-            result = {"status": "failed", "error": "LLM did not return a valid JSON list.", "raw_response": str(critique_list)[:1000]}
-            if session_id:
-                try: await add_history_async_func(session_id, "llm_critique_failed", {"error": result["error"], "raw_response_preview": result["raw_response"][:200]})
-                except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add history for LLM list error: {hist_e}")
-            return result
-
-        result = {"status": "completed", "critique": critique_list}
-
-        if session_id:
-            try: await add_history_async_func(session_id, "llm_critique_complete", {"critique_count": len(critique_list)})
-            except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add critique_code complete history: {hist_e}")
-
-        return result
-
-    except LLMError as llm_err:
-        logger.error(f"[Job {job_id}] LLMError during critique_code: {llm_err}", exc_info=True)
-        if session_id:
-            try: await add_history_async_func(session_id, "llm_critique_failed", {"error": f"LLMError: {llm_err}"})
-            except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add history for LLMError: {hist_e}")
-        raise
-    except Exception as e:
-        logger.error(f"[Job {job_id}] Unexpected error during critique_code: {e}", exc_info=True)
-        if session_id:
-            try: await add_history_async_func(session_id, "llm_critique_failed", {"error": f"Unexpected Error: {e}"})
-            except Exception as hist_e: logger.warning(f"[Job {job_id}] Failed to add history for unexpected error: {hist_e}")
-        raise
-
-
-# --- Tool Registration --- #
+# --- MCPツール登録 --- #
 
 def register_llm_tools(
     mcp: FastMCP,
-    config: Dict[str, Any],
-    start_async_job_func: Callable[..., Coroutine[Any, Any, str]],
-    add_history_async_func: Callable[..., Awaitable[Dict[str, Any]]],
-    # db_path は不要？ task関数に渡すように修正
+    config: dict,
+    start_async_job_func: Callable[..., Awaitable[Dict[str, str]]], # ★ 戻り値修正
+    add_history_async_func: Callable[..., Awaitable[None]] # ★ 戻り値修正
 ):
-    """MCPサーバーにLLM関連のツールを登録"""
+    """LLM関連タスクをMCPツールとして登録します。"""
     logger.info("Registering LLM tools...")
 
-    llm_config = config.get('llm', {})
-    timeouts = config.get('resource_limits', {})
+    # --- Helper to start jobs --- #
+    async def _start_llm_job(
+        task_coroutine_factory: Callable[..., Coroutine],
+        tool_name: str,
+        session_id: Optional[str] = None,
+        **kwargs
+    ) -> Dict[str, Any]: # ★ JobStartResponse 形式
+        """LLMタスクを開始し、JobStartResponse 辞書を返すヘルパー"""
+        job_description = f"LLM {tool_name} job" + (f" for session {session_id}" if session_id else "")
+        logger.info(f"Requesting to start {job_description} with args: {kwargs}")
+        try:
+            # job_id は start_async_job_func で生成される想定
+            task_coroutine = task_coroutine_factory(**kwargs)
+            # ★ tool_name, session_id を渡すように変更
+            job_start_response = await start_async_job_func(task_coroutine, tool_name=tool_name, session_id=session_id)
+            logger.info(f"Successfully requested {job_description}. Job info: {job_start_response}")
+            return job_start_response
+        except Exception as e:
+            logger.error(f"Failed to start {job_description}: {e}", exc_info=True)
+            from .schemas import JobStatus # Local import to avoid potential circular dep
+            return {"error": f"Failed to start {tool_name} job: {e}", "status": JobStatus.FAILED.value}
 
-    # DBパスを取得 (タスク関数に渡すため)
-    try:
-        db_path = get_db_dir(config)
-    except (ConfigError, FileError) as e:
-        logger.critical(f"Failed to get DB path during LLM tool registration: {e}. LLM tools may fail to record history.")
-        # DBパスが取得できない場合でもツール自体は登録するが、警告を出す
-        # 代替パスを設定 (非推奨)
-        db_path = Path("./fallback_mcp_state.db")
-        logger.error(f"Using fallback DB path for LLM tools: {db_path}")
-        # raise ConfigError(f"Failed to initialize DB path for LLM tools: {e}") from e
-
-    # パス検証用の許可リスト (LLMツールは通常コード文字列を扱うが、将来用に設定)
-    allowed_base_dirs: List[Path] = []
-    try:
-        project_root = get_project_root()
-        workspace_dir = get_workspace_dir(config)
-        output_base_dir = get_output_base_dir(config)
-        allowed_base_dirs = [project_root, workspace_dir, output_base_dir]
-        logger.info(f"LLM tools: Allowed base directories for future path validation: {[str(p) for p in allowed_base_dirs]}")
-    except (ConfigError, FileError) as e:
-        logger.warning(f"Failed to determine allowed base directories for LLM tools: {e}")
-        # 許可リストがなくてもツール自体は登録できる
-
-    # --- Improve Code Tool --- #
-    @mcp.tool("improve_code")
+    # --- improve_code ツール --- #
+    improve_code_factory = partial(
+        _run_improve_code,
+        config=config,
+        add_history_func=add_history_async_func
+    )
+    # ★ 入力スキーマ適用
+    @mcp.tool(
+        name="improve_code",
+        description="Asks the LLM to improve the provided Python code based on a suggestion. Returns the improved code.",
+        input_schema=ImproveCodeInput # ★ スキーマ指定
+    )
     async def improve_code_tool(
-        original_code: str,
-        target_issue: Optional[str] = None,
-        context: Optional[Dict[str, Any]] = None,
-        session_id: str = ""
-    ) -> Dict[str, Any]:
-        """LLMを使用して指定されたPythonコードを改善します。"""
-        logger.info(f"Tool 'improve_code' called. Session: {session_id}")
-        try:
-            job_id = await start_async_job_func(
-                _run_improve_code, # 非同期タスク関数
-                "improve_code", # ツール名
-                session_id,
-                # --- _run_improve_code への引数 --- #
-                job_id=None, # start_async_job_func が生成？
-                add_history_async_func=add_history_async_func,
-                llm_config=llm_config,
-                timeouts=timeouts,
-                db_path=db_path,
-                session_id=session_id,
-                original_code=original_code,
-                target_issue=target_issue,
-                context=context
-            )
-            return {"job_id": job_id, "status": "pending"}
-        except (StateManagementError, Exception) as e:
-            logger.error(f"Failed to start improve_code job: {e}", exc_info=True)
-            return {"error": f"Failed to start job: {e}"}
-
-    # --- Suggest Improvement Tool --- #
-    @mcp.tool("suggest_improvement")
-    async def suggest_improvement_tool(
+        # ★ シグネチャをスキーマに合わせる
+        session_id: str,
         code: str,
-        context: Optional[Dict[str, Any]] = None,
-        session_id: str = ""
-    ) -> Dict[str, Any]:
-        """LLMを使用してコードの改善点を提案します（JSON形式）。"""
-        logger.info(f"Tool 'suggest_improvement' called. Session: {session_id}")
-        try:
-            job_id = await start_async_job_func(
-                _run_suggest_improvement,
-                "suggest_improvement",
-                session_id,
-                # --- _run_suggest_improvement への引数 --- #
-                job_id=None,
-                add_history_async_func=add_history_async_func,
-                llm_config=llm_config,
-                timeouts=timeouts,
-                db_path=db_path,
-                session_id=session_id,
-                code=code,
-                context=context
-            )
-            return {"job_id": job_id, "status": "pending"}
-        except (StateManagementError, Exception) as e:
-            logger.error(f"Failed to start suggest_improvement job: {e}", exc_info=True)
-            return {"error": f"Failed to start job: {e}"}
+        suggestion: str,
+        # detector_code: str, # 旧引数削除
+        # evaluation_results: Optional[Dict[str, Any]] = None,
+        # user_goal: Optional[str] = None,
+        # hypotheses: Optional[list[str]] = None,
+        # previous_feedback: Optional[str] = None,
+        original_code_version_hash: Optional[str] = None # 履歴用なので残す
+    ) -> Dict[str, Any]: # ★ JobStartResponse 形式
+        # スキーマ検証済み引数を渡す
+        kwargs = {
+            "session_id": session_id,
+            "code": code,
+            "suggestion": suggestion,
+            "original_code_version_hash": original_code_version_hash
+        }
+        return await _start_llm_job(
+            improve_code_factory,
+            "improve_code",
+            session_id=session_id,
+            **kwargs
+        )
 
-    # --- Summarize Code Tool --- #
-    @mcp.tool("summarize_code")
-    async def summarize_code_tool(
-        code: str,
-        session_id: str = ""
-    ) -> Dict[str, Any]:
-        """LLMを使用してコードの概要を生成します。"""
-        logger.info(f"Tool 'summarize_code' called. Session: {session_id}")
-        try:
-            job_id = await start_async_job_func(
-                _run_summarize_code,
-                "summarize_code",
-                session_id,
-                # --- _run_summarize_code への引数 --- #
-                job_id=None,
-                add_history_async_func=add_history_async_func,
-                llm_config=llm_config,
-                timeouts=timeouts,
-                db_path=db_path,
-                session_id=session_id,
-                code=code
-            )
-            return {"job_id": job_id, "status": "pending"}
-        except (StateManagementError, Exception) as e:
-            logger.error(f"Failed to start summarize_code job: {e}", exc_info=True)
-            return {"error": f"Failed to start job: {e}"}
+    # --- suggest_parameters ツール --- #
+    suggest_parameters_factory = partial(
+        _run_suggest_parameters,
+        config=config,
+        add_history_func=add_history_async_func
+    )
+    # ★ 入力スキーマ適用
+    @mcp.tool(
+        name="suggest_parameters",
+        description="Asks the LLM to suggest parameters to explore based on analysis. Returns a JSON object with suggestions.",
+        input_schema=SuggestParametersInput # ★ スキーマ指定
+    )
+    async def suggest_parameters_tool(
+        # ★ シグネチャをスキーマに合わせる
+        session_id: str,
+        analysis_results: Optional[Dict[str, Any]] = None,
+        current_metrics: Optional[Dict[str, Any]] = None,
+        cycle_state: Optional[Dict[str, Any]] = None,
+        # detector_code: str, # 旧引数削除
+        # evaluation_results: Optional[Dict[str, Any]] = None,
+        # user_goal: Optional[str] = None
+    ) -> Dict[str, Any]: # ★ JobStartResponse 形式
+        kwargs = {
+            "session_id": session_id,
+            "analysis_results": analysis_results,
+            "current_metrics": current_metrics,
+            "cycle_state": cycle_state,
+        }
+        return await _start_llm_job(
+            suggest_parameters_factory,
+            "suggest_parameters",
+            session_id=session_id,
+            **kwargs
+        )
 
-    # --- Critique Code Tool --- #
-    @mcp.tool("critique_code")
-    async def critique_code_tool(
-        code: str,
-        session_id: str = ""
-    ) -> Dict[str, Any]:
-        """LLMを使用してコードの潜在的な問題を批評します（JSON形式）。"""
-        logger.info(f"Tool 'critique_code' called. Session: {session_id}")
-        try:
-            job_id = await start_async_job_func(
-                _run_critique_code,
-                "critique_code",
-                session_id,
-                # --- _run_critique_code への引数 --- #
-                job_id=None,
-                add_history_async_func=add_history_async_func,
-                llm_config=llm_config,
-                timeouts=timeouts,
-                db_path=db_path,
-                session_id=session_id,
-                code=code
-            )
-            return {"job_id": job_id, "status": "pending"}
-        except (StateManagementError, Exception) as e:
-            logger.error(f"Failed to start critique_code job: {e}", exc_info=True)
-            return {"error": f"Failed to start job: {e}"}
+    # --- analyze_evaluation_results ツール --- #
+    analyze_evaluation_factory = partial(
+        _run_analyze_evaluation_results,
+        config=config,
+        add_history_func=add_history_async_func
+    )
+    # ★ 入力スキーマ適用
+    @mcp.tool(
+        name="analyze_evaluation_results",
+        description="Asks the LLM to analyze evaluation results and provide a structured analysis (JSON).",
+        input_schema=AnalyzeEvaluationInput # ★ スキーマ指定
+    )
+    async def analyze_evaluation_results_tool(
+        # ★ シグネチャをスキーマに合わせる
+        session_id: str,
+        evaluation_results: Dict[str, Any],
+        # detector_code: Optional[str] = None, # 旧引数削除
+        # user_goal: Optional[str] = None
+    ) -> Dict[str, Any]: # ★ JobStartResponse 形式
+        kwargs = {
+            "session_id": session_id,
+            "evaluation_results": evaluation_results,
+        }
+        return await _start_llm_job(
+            analyze_evaluation_factory,
+            "analyze_evaluation_results",
+            session_id=session_id,
+            **kwargs
+        )
+
+    # TODO: Add registration for generate_hypotheses, assess_improvement tools
 
     logger.info("LLM tools registered.")
 

@@ -26,42 +26,52 @@ class BaseDetector(ABC):
         self.params = kwargs
     
     @abstractmethod
-    def detect(self, audio_data: np.ndarray, sr: int) -> Dict[str, Any]:
+    def detect(self, audio_data: np.ndarray, sample_rate: int) -> Dict[str, np.ndarray]:
         """
-        音声データからノートを検出し、検出結果を返します。
+        オーディオデータから音楽情報を検出します。
+
+        サブクラスはこのメソッドを実装する必要があります。
 
         Parameters
         ----------
         audio_data : np.ndarray
-            音声データ
-        sr : int
-            サンプリングレート
+            入力オーディオデータ。形状は (サンプル数,) または (チャンネル数, サンプル数)。
+            通常はモノラル (サンプル数,) を想定します。
+        sample_rate : int
+            オーディオデータのサンプルレート (Hz)。
 
         Returns
         -------
-        Dict[str, Any]
-            検出結果の辞書。以下のキーを含む必要があります：
-            {
-                'intervals': np.ndarray,  # 形状 (N, 2), 各行は [onset, offset] (秒)
-                'note_pitches': np.ndarray,  # 形状 (N,), 各要素はHz単位のピッチ
-                'frame_times': np.ndarray,  # 形状 (M,), フレーム時刻 (秒)
-                'frame_frequencies': np.ndarray,  # 形状 (M,), フレーム周波数 (Hz)
-                'detector_name': str,  # 検出器名
-                'detection_time': float  # 検出処理時間 (秒)
-            }
-            
-            注意:
-            - フレーム評価ができない検出器は 'frame_times' と 'frame_frequencies' に空配列 np.array([]) を設定してください
-            - ノートが検出されなかった場合は 'intervals' は shape=(0,2)、'note_pitches' は shape=(0,) の空配列を返してください
-            - 無音/無声フレームの周波数は 0.0 Hz で表現してください
-            - ポリフォニー（複数ノートの同時発音）は、'intervals' 配列内で時間的に重複する複数の区間と、
-              それに対応する 'note_pitches' の要素によって表現されます。例えば、和音の場合は同じ時間区間に
-              複数のピッチが存在することになります。
-            - フレームベースの結果 ('frame_frequencies') は、各時点で最も顕著なピッチのみを返すことを
-              想定しています。複数のピッチを返す場合は、追加のキー 'frame_multi_frequencies' (shape=(M,K))
-              を使用してください。
+        Dict[str, np.ndarray]
+            検出結果を含む辞書。以下のキーを含む必要があります:
+
+            - 'intervals': np.ndarray
+                形状: (n_notes, 2)
+                各行が [開始時間 (秒), 終了時間 (秒)] を表すノートのインターバル。
+                ノートが検出されなかった場合は空の配列 (形状 (0, 2)) を返します。
+            - 'note_pitches': np.ndarray
+                形状: (n_notes,)
+                各ノートに対応するピッチ (MIDIノート番号、または Hz)。
+                'intervals' の各行に対応します。
+                ノートが検出されなかった場合は空の配列 (形状 (0,)) を返します。
+
+            以下のキーはオプションですが、提供されることが推奨されます:
+
+            - 'frame_times': np.ndarray (オプション)
+                形状: (n_frames,)
+                フレームごとの解析を行う場合、各フレームの中心時間 (秒)。
+                提供されない場合は空の配列 (形状 (0,)) またはキー自体が存在しない場合があります。
+            - 'frame_frequencies': np.ndarray (オプション)
+                形状: (n_frames,)
+                各フレームで検出された主要な周波数 (Hz)。
+                'frame_times' の各フレームに対応します。
+                提供されない場合、またはフレーム解析を行わない場合は空の配列 (形状 (0,)) またはキー自体が存在しない場合があります。
+                多声音楽の場合、この値の解釈は限定的になる可能性があります。
+
+            サブクラスは、追加の情報を独自のキーで返すことも可能です。
+            返される配列のデータ型は通常 float または int です。
         """
-        raise NotImplementedError("detect メソッドを実装してください")
+        raise NotImplementedError("サブクラスはこのメソッドを実装する必要があります。")
     
     def __str__(self) -> str:
         return self.__class__.__name__ 

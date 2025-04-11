@@ -12,16 +12,20 @@ from typing import Dict, Any, Optional, Callable, Coroutine, Tuple, AsyncGenerat
 # from concurrent.futures import ThreadPoolExecutor # 削除
 
 # 関連モジュールのインポート
-from . import db_utils, session_manager # job_manager の直接インポートは削除
-from .utils import generate_id, get_timestamp # utilsからインポート
-from src.utils.path_utils import get_project_root, load_environment_variables, get_workspace_dir, ensure_dir, get_db_dir, get_output_base_dir # path_utils からインポート
+from . import db_utils, utils # utilsからインポート
+from src.utils.misc_utils import generate_id, get_timestamp # 変更後
+from src.utils.path_utils import get_project_root, load_environment_variables, get_workspace_dir, ensure_dir, get_db_dir, get_output_base_dir, get_improved_versions_dir, validate_path_within_allowed_dirs # validate_path_within_allowed_dirs を追加
 # job_manager から必要なものをインポート
-from .job_manager import job_queue, active_jobs # job_queueとactive_jobsをインポート
-from .serialization_utils import JsonNumpyEncoder # JsonNumpyEncoder をインポート
+# from .job_manager import job_queue, active_jobs # job_queueとactive_jobsをインポート # 削除
+# job_manager モジュール自体をインポートする
+from . import job_manager
+from src.utils.json_utils import NumpyEncoder # JsonNumpyEncoder をインポート (旧 JsonNumpyEncoder)
 import traceback # トレースバック用に追加
 # StateManagementError, FileError をインポート
 from src.utils.exception_utils import StateManagementError, FileError, ConfigError # ConfigError を追加
 # import sqlite3 # DBエラー用 <- 削除
+from . import schemas # 追加
+from .db_utils import db_execute_commit_async, db_lock # 追加
 
 logger = logging.getLogger('mcp_server.core')
 
@@ -252,81 +256,69 @@ def load_config(config_path_str: Optional[str] = None) -> Dict[str, Any]:
 
     # 3. 環境変数で上書き
     env_overrides = _get_env_var_override(final_config)
-    if env_overrides:
-        _deep_update(final_config, env_overrides)
-        logger.info("環境変数から設定を上書きしました。")
+    _deep_update(final_config, env_overrides)
 
-    # 4. パスを絶対パスに解決し、存在確認・作成を行うヘルパー関数
-    def resolve_paths(cfg: Dict[str, Any]) -> Dict[str, Any]:
-        """設定内の主要なパスを絶対パスに解決し、一部は存在確認/作成する"""
-        try:
-            # Project root is already resolved
-            cfg['paths']['project_root'] = str(PROJECT_ROOT) # Add project root for reference
+    # 4. パス解決 (resolve_paths に移行せず、ここで実行)
+    # ★ resolve_paths 関数を削除し、以下のロジックをここに展開する
+    # final_config = resolve_paths(final_config)
 
-            # Workspace path (handled by get_workspace_dir)
-            workspace_path = get_workspace_dir(cfg) # Ensure directory exists and is writable
-            cfg['paths']['workspace'] = str(workspace_path)
-
-            # Output base path (handled by get_output_base_dir)
-            output_base_path = get_output_base_dir(cfg)
-            cfg['paths']['output_base'] = str(output_base_path)
-
-            # DB path (handled by get_db_dir)
-            db_dir_path = get_db_dir(cfg)
-            cfg['paths']['db_dir'] = str(db_dir_path) # Store the directory
-            cfg['paths']['db_path'] = str(db_dir_path / db_utils.DB_FILENAME) # Full path to DB file
-
-            # Improved versions path (handled by get_improved_versions_dir)
-            improved_versions_path = get_improved_versions_dir(cfg)
-            cfg['paths']['improved_versions'] = str(improved_versions_path)
-
-            # Source directories (resolve relative to project root, check existence)
-            for key in ['detectors_src', 'templates']: # Add others if needed
-                path_str = cfg['paths'].get(key)
-                if path_str:
-                    path_obj = Path(path_str)
-                    if not path_obj.is_absolute():
-                        path_obj = PROJECT_ROOT / path_obj
-                    resolved_path = path_obj.resolve()
-                    if not resolved_path.is_dir(): # Check if source dir exists
-                         logger.warning(f"設定されたソースディレクトリ '{key}' が見つかりません: {resolved_path}")
-                         # raise ConfigError(f"Source directory '{key}' not found: {resolved_path}") # Or just warn
-                    cfg['paths'][key] = str(resolved_path)
-
-            # Datasets base (resolve, check existence)
-            datasets_base_str = cfg['paths'].get('datasets_base')
-            if datasets_base_str:
-                 path_obj = Path(datasets_base_str)
-                 if not path_obj.is_absolute():
-                      path_obj = PROJECT_ROOT / path_obj
-                 resolved_path = path_obj.resolve()
-                 if not resolved_path.is_dir():
-                     logger.warning(f"データセットベースディレクトリが見つかりません: {resolved_path}")
-                     # raise ConfigError(f"Datasets base directory not found: {resolved_path}")
-                 cfg['paths']['datasets_base'] = str(resolved_path)
-
-        except (ConfigError, FileError, TypeError) as e:
-            # Path utils functions already log errors
-            raise ConfigError(f"設定内のパス解決またはディレクトリ検証中にエラーが発生しました: {e}") from e
-        except Exception as e:
-            logger.error(f"パス解決中に予期せぬエラー: {e}", exc_info=True)
-            raise ConfigError(f"パス解決中に予期せぬエラー: {e}") from e
-        return cfg
-
-    # 5. パス解決を実行
+    # --- パス解決ロジックここから (元 resolve_paths の内容) --- #
     try:
-        final_config = resolve_paths(final_config)
-    except ConfigError as e:
-         # load_config は致命的なエラーとして扱う
-         logger.critical(f"設定の読み込みとパス解決に失敗しました: {e}", exc_info=True)
-         raise
+        workspace_root = get_workspace_dir() # ここで PROJECT_ROOT が使われる
+        logger.debug(f"Workspace root identified as: {workspace_root}")
 
-    # 6. ensure_workspace_directories の呼び出しを削除
-    # ensure_workspace_directories(final_config)
+        path_cfg = final_config.get('paths', {})
 
-    # 設定完了のログ
-    logger.info("設定の読み込みとパス解決が完了しました。")
-    # logger.debug(f"Final Config: {json.dumps(final_config, cls=JsonNumpyEncoder, indent=2)}") # デバッグ用に詳細ログ
+        # 各パス設定を処理
+        for key, relative_path_str in path_cfg.items():
+            if not isinstance(relative_path_str, str):
+                logger.warning(f"パス設定 '.paths.{key}' の値が文字列ではありません: {relative_path_str}。スキップします。")
+                continue
+
+            # 絶対パスに変換 (ワークスペースルート基準)
+            absolute_path = (workspace_root / relative_path_str).resolve()
+
+            # パスの安全性を検証 (ワークスペース内に収まっているか)
+            try:
+                validate_path_within_allowed_dirs(
+                    absolute_path,
+                    [workspace_root], # 許可ディレクトリはワークスペースルートのみ
+                    check_existence=False, # 存在チェックは ensure_dir で行う
+                    allow_absolute=True # 検証対象は絶対パス
+                )
+            except (ValueError, FileError) as path_err:
+                 # 安全でないパス設定はエラーとして処理 (設定ファイルの誤り)
+                 raise ConfigError(f"パス設定 '.paths.{key}' ('{relative_path_str}') がワークスペース外または不正です: {path_err}") from path_err
+
+            # 存在確認とディレクトリ作成 (必要に応じて)
+            # DBパス、detectors_src はファイルかもしれないので is_dir=False とする
+            is_dir_expected = key not in ['db', 'detectors_src']
+            try:
+                # ensure_dir はパスがファイルでもディレクトリでも作成しようとする
+                # ディレクトリを期待する場合は is_dir=True でチェック
+                # ここではパスの解決と安全確認が主目的なので、ディレクトリ作成はオプションとする
+                # 実際にパスを使う際に ensure_dir を呼び出す方が適切かもしれない
+                # ensure_dir(absolute_path, is_dir=is_dir_expected, check_writable=is_dir_expected)
+                pass # 存在確認・作成はここでは行わない
+
+            except FileError as fe:
+                 # ディレクトリ作成失敗などのエラー
+                 raise ConfigError(f"パス設定 '.paths.{key}' ('{absolute_path}') の準備に失敗しました: {fe}") from fe
+
+            # 設定辞書のパスを絶対パス文字列で更新
+            path_cfg[key] = str(absolute_path)
+
+        # --- パス解決ロジックここまで --- #
+
+    except ConfigError: # ConfigError はそのまま上に投げる
+        raise
+    except Exception as e:
+        logger.critical(f"設定ファイルの読み込み/パス解決中に予期せぬエラー: {e}", exc_info=True)
+        raise ConfigError(f"設定処理中に予期せぬエラーが発生しました: {e}") from e
+
+    # 5. 設定内容をログ出力 (APIキーなどはマスク)
+    log_config(final_config)
+
     return final_config
 
 # --- Workspace Directory Setup (Removed - Handled in load_config via path_utils) ---
@@ -399,229 +391,35 @@ def log_config(config_dict: Dict[str, Any]):
     logger.info(_log_recursive(config_copy, sensitive_keys))
     logger.info(f"--------------------")
 
-# --- Job Execution Setup (Moved from mcp_server.py) ---
-# job_queue と active_jobs は job_manager.py に移動
+# --- Job Execution Setup (Moved to job_manager.py) ---
 # job_queue: asyncio.Queue[Tuple[str, Callable[..., Coroutine], tuple, dict]] = asyncio.Queue()
-# active_jobs: Dict[str, Dict[str, Any]] = {} # {job_id: {status: ..., future: ...}}
-# ThreadPoolExecutor はブロッキング I/O や CPU バウンドな同期タスクを実行するために使用
-# executor = ThreadPoolExecutor(max_workers=os.cpu_count()) # ワーカー数は調整可能
+# active_jobs: Dict[str, Dict[str, Any]] = {}
 
 
-async def job_worker(worker_id: int, config: Dict[str, Any]):
-    """非同期ジョブをキューから取得して実行するワーカー (Moved from mcp_server.py, DB操作エラーハンドリング修正)"""
-    db_path = Path(config['paths']['db']) / db_utils.DB_FILENAME
-    logger.info(f"ジョブワーカー {worker_id} 開始")
-    while True:
-        job_id, task_coro_func, args, kwargs = await job_queue.get()
-        tool_name = kwargs.get('tool_name', 'unknown') # tool_name を取得
-        logger.info(f"[Worker {worker_id}] [Job {job_id}] ジョブ '{tool_name}' を取得しました。")
-        if job_id not in active_jobs:
-            logger.warning(f"[Worker {worker_id}] [Job {job_id}] Job info not found in active_jobs dict.")
-            # 見つからない場合でも、初期情報を active_jobs に作成
-            active_jobs[job_id] = {
-                'status': 'pending',
-                'tool_name': tool_name,
-                'start_time': None,
-                'end_time': None,
-                'result': None,
-                'error_details': None,
-                'worker_id': None,
-                'task_args': kwargs # kwargs全体を保存するか検討
-            }
+# --- Job Worker Functions (Moved to job_manager.py) --- #
 
-        active_jobs[job_id]['status'] = 'running'
-        active_jobs[job_id]['worker_id'] = worker_id
-        start_time_mono = time.monotonic()
-        start_time_ts = get_timestamp()
-        active_jobs[job_id]['start_time'] = start_time_ts
+# async def job_worker(worker_id: int, config: Dict[str, Any]):
+#     """ジョブキューからタスクを取得して実行するワーカ"""
+#     pass # 削除
+#
+# async def start_job_workers(num_workers: int, config: Dict[str, Any]):
+#     """指定された数のジョブワーカータスクを開始する"""
+#     pass # 削除
+#
+# async def start_async_job(
+#     config: Dict[str, Any],
+#     task_coroutine_func: Callable[..., Coroutine],
+#     tool_name: str,
+#     session_id: Optional[str] = None,
+#     *args, **kwargs
+# ) -> str:
+#     """非同期ジョブを開始し、DBに登録してキューに入れる"""
+#     pass # 削除
 
-        job_result = None
-        job_error = None
-        error_details_dict = None # エラー詳細を格納する辞書
 
-        try:
-            # DBにジョブ開始を記録 (エラーハンドリング修正)
-            try:
-                # --- 修正: 開始時もロックを追加 (念のため) --- #
-                async with db_utils.db_lock:
-                    await db_utils.db_execute_commit_async(
-                        db_path,
-                        "UPDATE jobs SET status = 'running', start_time = ?, worker_id = ? WHERE job_id = ?",
-                        (start_time_ts, str(worker_id), job_id)
-                    )
-            except StateManagementError as db_err:
-                 # DB記録エラーは警告ログを出すが、ジョブ実行は試みる
-                 logger.warning(f"[Worker {worker_id}] [Job {job_id}] ジョブ開始DB記録エラー: {db_err}", exc_info=False)
-                 # 致命的ではないので、ここでは raise しない
-
-            # --- コルーチン関数を実行 --- #
-            job_result = await task_coro_func(job_id, *args, **kwargs)
-            # --- 実行ここまで --- #
-
-            end_time_mono = time.monotonic()
-            duration = end_time_mono - start_time_mono
-            end_time_ts = get_timestamp()
-            logger.info(f"[Worker {worker_id}] [Job {job_id}] ジョブ完了。実行時間: {duration:.2f}秒")
-            active_jobs[job_id]['status'] = 'completed'
-            active_jobs[job_id]['result'] = job_result
-            active_jobs[job_id]['end_time'] = end_time_ts # メモリにも終了時間を記録
-
-            # DBにジョブ完了を記録 (エラーハンドリング修正)
-            try:
-                result_json = json.dumps(job_result, cls=JsonNumpyEncoder)
-                # --- 修正: カラム名修正 (completed_at -> end_time) --- #
-                update_sql = "UPDATE jobs SET status = ?, result = ?, end_time = ? WHERE job_id = ?"
-                async with db_utils.db_lock:
-                    await db_utils.db_execute_commit_async(
-                        db_path,
-                        update_sql,
-                        ('completed', result_json, end_time_ts, job_id)
-                    )
-                logger.debug(f"ジョブ {job_id} の状態を completed に更新")
-            except StateManagementError as db_err:
-                 # DB記録エラーは警告ログを出すが、ジョブ自体は完了扱い
-                 logger.warning(f"[Worker {worker_id}] [Job {job_id}] ジョブ完了DB記録エラー: {db_err}", exc_info=False)
-                 # ここでも raise しない
-
-        except Exception as e:
-            # --- ジョブ実行中のエラー処理 --- #
-            job_error = e # エラーオブジェクトを保持
-            end_time_mono = time.monotonic()
-            duration = end_time_mono - start_time_mono
-            end_time_ts = get_timestamp()
-            error_message = f"Error in job {job_id} ({kwargs.get('tool_name', 'unknown')})" # 基本メッセージ
-            tb_str = traceback.format_exc() # トレースバックを取得
-
-            # StateManagementError かどうかでログレベルとメッセージを調整
-            if isinstance(e, StateManagementError):
-                logger.error(f"[Worker {worker_id}] [Job {job_id}] 状態管理エラー発生: {e}。実行時間: {duration:.2f}秒", exc_info=False) # トレースバックは別途記録
-                error_message = f"State Management Error: {e}"
-            else:
-                logger.error(f"[Worker {worker_id}] [Job {job_id}] 予期せぬエラー発生: {type(e).__name__}: {e}。実行時間: {duration:.2f}秒", exc_info=False)
-                error_message = f"Unexpected Error: {type(e).__name__}: {e}"
-
-            # メモリ上のジョブ情報を更新
-            active_jobs[job_id]['status'] = 'failed'
-            active_jobs[job_id]['end_time'] = end_time_ts
-            active_jobs[job_id]['result'] = None # 失敗時は result は None
-            # エラー詳細を辞書に格納
-            error_details_dict = {
-                 "error_type": type(e).__name__,
-                 "error_message": str(e),
-                 "traceback": tb_str
-            }
-            active_jobs[job_id]['error_details'] = error_details_dict
-
-            # DBにジョブ失敗を記録 (エラーハンドリング修正)
-            try:
-                error_details_json = json.dumps(error_details_dict)
-                # --- 修正: カラム名修正 (error -> error_details, completed_at -> end_time) --- #
-                update_sql = "UPDATE jobs SET status = ?, error_details = ?, end_time = ? WHERE job_id = ?"
-                async with db_utils.db_lock:
-                    await db_utils.db_execute_commit_async(
-                        db_path,
-                        update_sql,
-                        ('failed', error_details_json, end_time_ts, job_id)
-                    )
-                logger.debug(f"ジョブ {job_id} の状態を failed に更新 (エラー)")
-            except StateManagementError as db_err:
-                 # DB記録エラーは警告ログを出す (ジョブ失敗は既に確定)
-                 logger.warning(f"[Worker {worker_id}] [Job {job_id}] ジョブ失敗DB記録エラー: {db_err}", exc_info=False)
-
-        finally:
-            job_queue.task_done()
-            logger.debug(f"[Worker {worker_id}] [Job {job_id}] Task marked as done.")
-
-async def start_job_workers(num_workers: int, config: Dict[str, Any]):
-    """指定された数のジョブワーカーを起動 (Moved from mcp_server.py)"""
-    logger.info(f"{num_workers} 個のジョブワーカーを起動します...")
-    tasks = []
-    for i in range(num_workers):
-        task = asyncio.create_task(job_worker(i + 1, config))
-        tasks.append(task)
-    logger.info("ジョブワーカーが起動しました。")
-    # ワーカータスクの完了を待つ必要はない (サーバーが動いている限り動き続ける)
-
-async def start_async_job(
-    config: Dict[str, Any],
-    task_coroutine_func: Callable[..., Coroutine], # 同期関数ではなくコルーチン関数を受け取る
-    tool_name: str,
-    session_id: Optional[str] = None,
-    # session_id_for_job: Optional[str] = None, # 引数名が重複するので削除し、session_id を使う
-    *args, **kwargs
-) -> str:
-    """非同期ジョブをキューに追加し、DBに登録する"""
-    job_id = generate_id(prefix=f"{tool_name[:5]}_j")
-    logger.info(f"Queueing job {job_id} for tool '{tool_name}' (Session: {session_id})")
-    current_time = get_timestamp()
-
-    # kwargs に tool_name を追加（job_worker で利用するため）
-    kwargs_with_tool = kwargs.copy()
-    kwargs_with_tool['tool_name'] = tool_name
-
-    # ジョブをDBに登録
-    try:
-        db_path = Path(config['paths']['db_path'])
-        task_args_json = json.dumps({"args": args, "kwargs": kwargs}, cls=JsonNumpyEncoder) # 引数をJSON化
-        async with db_utils.db_lock: # INSERT もロック
-            await db_utils.db_execute_commit_async(
-                db_path,
-                "INSERT INTO jobs (job_id, tool_name, session_id, status, start_time, task_args) VALUES (?, ?, ?, ?, ?, ?)",
-                (job_id, tool_name, session_id, 'pending', current_time, task_args_json)
-            )
-    except (ConfigError, FileError, StateManagementError) as e:
-         logger.error(f"Failed to add job {job_id} to DB: {e}", exc_info=False)
-         raise StateManagementError(f"Failed to register job {job_id} in database.") from e
-    except Exception as e:
-         logger.error(f"Unexpected error registering job {job_id} in DB: {e}", exc_info=True)
-         raise StateManagementError(f"Unexpected error registering job {job_id}.") from e
-
-    # ジョブキューに追加
-    try:
-         # --- 修正: job_worker が期待する形式に合わせる --- #
-         await job_queue.put( (job_id, task_coroutine_func, args, kwargs_with_tool) ) # put_nowait を put に変更 (キューが一杯なら待機)
-         active_jobs[job_id] = {
-             'status': 'pending',
-             'tool_name': tool_name,
-             'session_id': session_id,
-             'start_time': None, # DBには登録済みだが、メモリ上はまだ開始していない
-             'task_args': {"args": args, "kwargs": kwargs}, # kwargs は tool_name を含まない元のもの
-             'queued_time': current_time
-         } # In-memory status
-         logger.debug(f"Job {job_id} successfully added to queue.")
-    except asyncio.QueueFull:
-         # put は待機するので、QueueFull は通常発生しないはずだが、念のため
-         logger.error(f"Job queue is full. Failed to queue job {job_id}.")
-         try:
-             # --- 修正: 非同期DB関数を使用 --- #
-             async with db_utils.db_lock:
-                 await db_utils.db_execute_commit_async(
-                     db_path,
-                     "UPDATE jobs SET status = 'failed', error_details = ? WHERE job_id = ?",
-                     (json.dumps({"error": "Queue full"}, cls=JsonNumpyEncoder), job_id)
-                 )
-         except Exception as db_e:
-              logger.error(f"Failed to update status for job {job_id} after queue full error: {db_e}")
-         raise StateManagementError(f"Job queue is full, cannot add job {job_id}.")
-    except Exception as e:
-         logger.error(f"Error adding job {job_id} to queue: {e}", exc_info=True)
-         # キュー追加失敗時もDBのステータスを更新
-         try:
-             async with db_utils.db_lock:
-                 await db_utils.db_execute_commit_async(
-                     db_path,
-                     "UPDATE jobs SET status = 'failed', error_details = ? WHERE job_id = ?",
-                     (json.dumps({"error": f"Queueing error: {e}"}, cls=JsonNumpyEncoder), job_id)
-                 )
-         except Exception as db_e:
-              logger.error(f"Failed to update status for job {job_id} after queueing error: {db_e}")
-         raise StateManagementError(f"Error adding job {job_id} to queue: {e}") from e
-
-    return job_id
-
-# --- Cleanup Setup (Moved & Modified from mcp_server.py) ---
+# --- Workspace Cleanup --- #
 async def cleanup_workspace_files(config: Dict[str, Any]):
-    """古いワークスペースファイルやディレクトリを削除する (非同期)"""
+    """古いワークスペースファイルを削除する"""
     cleanup_config = config.get('cleanup', {})
     workspace_cleanup_config = cleanup_config.get('workspace', {})
 
@@ -671,26 +469,27 @@ async def cleanup_workspace_files(config: Dict[str, Any]):
 
          for item in items_to_check:
              try:
-                 # サブディレクトリのみを対象とする (ファイルは無視)
-                 # is_dir() もブロッキングの可能性があるので to_thread 化
-                 is_directory = await loop.run_in_executor(None, item.is_dir)
+                 # 既存のファイルかディレクトリかチェック
+                 is_directory = item.is_dir()
                  if not is_directory:
                      continue
 
-                 # stat() もブロッキングなので to_thread 化
+                 # ファイルの場合、最終アクセス時刻をチェック
                  try:
-                     stat_result = await loop.run_in_executor(None, item.stat)
-                     item_mtime = datetime.fromtimestamp(stat_result.st_mtime)
-                 except OSError as stat_err:
-                     logger.warning(f"Could not get modification time for {item}: {stat_err}. Skipping.")
+                     stat_result = item.stat()
+                     last_access_time = stat_result.st_atime
+                 except OSError as e:
+                     logger.warning(f"stat取得エラー: {item} - {e}")
                      continue
 
-                 if item_mtime < cutoff_time:
-                     logger.info(f"Deleting old workspace directory: {item} (Last modified: {item_mtime}) ")
-                     # shutil.rmtree もブロッキングなので to_thread 化
-                     await loop.run_in_executor(None, shutil.rmtree, item)
-                     deleted_count += 1
-                 # else: logger.debug(f"Keeping recent directory: {item} (Last modified: {item_mtime})")
+                 if last_access_time < cutoff_time:
+                     logger.info(f"期限切れディレクトリを削除: {item}")
+                     try:
+                         await loop.run_in_executor(None, shutil.rmtree, item)
+                         deleted_count += 1
+                     except Exception as e:
+                         logger.error(f"Error cleaning up item {item}: {e}", exc_info=True)
+                         error_count += 1
 
              except Exception as e:
                  logger.error(f"Error cleaning up item {item}: {e}", exc_info=True)
@@ -703,42 +502,60 @@ async def cleanup_workspace_files(config: Dict[str, Any]):
 async def start_cleanup_task(
     config: Dict[str, Any],
     # 非同期化されたクリーンアップ関数を受け取る
+    # 引数の型ヒントを修正
     cleanup_sessions_func: Callable[[Dict[str, Any]], Awaitable[None]],
     cleanup_jobs_func: Callable[[Dict[str, Any]], Awaitable[None]],
     cleanup_workspace_func: Callable[[Dict[str, Any]], Awaitable[None]]
 ):
-    """定期的にクリーンアップ処理を実行する非同期タスクを開始"""
+    """定期的なクリーンアップタスクを開始する"""
     interval = config.get('cleanup', {}).get('interval_seconds', 3600)
     if interval <= 0:
-        logger.info("クリーンアップ間隔が無効なため、クリーンアップタスクは開始されません。")
-        return
+        logger.info("定期クリーンアップは無効です (interval <= 0)。")
+        return None # タスクを返さない
+
+    logger.info(f"定期クリーンアップタスクを開始します (間隔: {interval}秒)。")
 
     async def cleanup_run():
-        logger.info(f"クリーンアップタスク開始 (実行間隔: {interval}秒)")
         while True:
             try:
-                logger.info("定期クリーンアップ処理を実行中...")
-                # 非同期クリーンアップ関数を await で実行
-                await cleanup_sessions_func(config)
-                await cleanup_jobs_func(config)
-                await cleanup_workspace_func(config)
-                logger.info("定期クリーンアップ処理完了。")
-            except asyncio.CancelledError:
-                 logger.info("クリーンアップタスクがキャンセルされました。")
-                 break # キャンセルされたらループを抜ける
-            except Exception as e:
-                logger.error(f"クリーンアップ処理中にエラーが発生: {e}", exc_info=True)
-            # 次の実行まで非同期で待機
-            try:
                 await asyncio.sleep(interval)
-            except asyncio.CancelledError:
-                 logger.info("クリーンアップタスク待機中にキャンセルされました。")
-                 break # 待機中にキャンセルされた場合もループを抜ける
+                logger.info("定期クリーンアップを開始します...")
 
-    # asyncio.create_task でバックグラウンドタスクとして起動
-    task = asyncio.create_task(cleanup_run(), name="CleanupTask")
-    logger.info("クリーンアップタスクがバックグラウンドでスケジュールされました。")
-    return task # タスクオブジェクトを返す (オプション)
+                # 並列実行ではなく、順番に実行する方が安全かもしれない
+                start_time = time.monotonic()
+
+                # 1. セッションのクリーンアップ
+                logger.debug("古いセッションのクリーンアップを開始...")
+                await cleanup_sessions_func(config)
+                logger.debug("セッションのクリーンアップ完了。")
+
+                # 2. ジョブのクリーンアップ
+                logger.debug("古いジョブのクリーンアップを開始...")
+                # cleanup_jobs_func は job_manager.cleanup_old_jobs を想定
+                await cleanup_jobs_func(config)
+                logger.debug("ジョブのクリーンアップ完了。")
+
+                # 3. ワークスペースファイルのクリーンアップ
+                logger.debug("ワークスペースファイルのクリーンアップを開始...")
+                await cleanup_workspace_func(config)
+                logger.debug("ワークスペースファイルのクリーンアップ完了。")
+
+                duration = time.monotonic() - start_time
+                logger.info(f"定期クリーンアップ完了 (所要時間: {duration:.2f}秒)。次の実行は {interval}秒後。")
+
+            except asyncio.CancelledError:
+                logger.info("クリーンアップタスクがキャンセルされました。")
+                break
+            except Exception as e:
+                 logger.error(f"定期クリーンアップ実行中にエラーが発生しました: {e}", exc_info=True)
+                 # エラーが発生しても次のインターバルで再試行するためにループは継続
+                 # ただし、頻繁にエラーが発生する場合は警告を出すなどの処理を追加検討
+                 await asyncio.sleep(interval) # エラー後もインターバル待機
+
+    # クリーンアップタスクをバックグラウンドで開始
+    task = asyncio.create_task(cleanup_run(), name="cleanup_task")
+    logger.info("定期クリーンアップタスクがバックグラウンドでスケジュールされました。")
+    return task # 開始したタスクを返す
 
 # --- 古い同期スレッド開始関数は削除 --- #
 # def start_cleanup_thread(

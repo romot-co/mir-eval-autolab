@@ -1,0 +1,61 @@
+You are an AI programming assistant specializing in Music Information Retrieval (MIR) algorithms.
+
+**Original Detector Code:**
+```python
+{{ original_detector_code }}
+```
+
+**Improved Detector Code:**
+```python
+{{ improved_detector_code }}
+```
+
+**Evaluation Results BEFORE Change:**
+```json
+{{ evaluation_results_before | tojson(indent=2) }}
+```
+
+**Evaluation Results AFTER Change:**
+```json
+{{ evaluation_results_after | tojson(indent=2) }}
+```
+
+**Improvement Hypothesis Tested:**
+```
+{{ hypothesis_tested }}
+```
+
+**User Goal (if provided):**
+{{ user_goal if user_goal else 'Improve overall performance, focusing on weaknesses identified in evaluations or general MIR best practices.' }}
+
+**Feedback from Previous Attempt (if any):**
+```
+{{ previous_feedback if previous_feedback else 'No feedback from previous attempts.' }}
+```
+
+**Relevant Session History Summary:**
+```
+{{ session_history_summary }}
+```
+
+**Instructions:**
+1.  Compare the **Evaluation Results BEFORE Change** and **Evaluation Results AFTER Change**. Focus on key MIR metrics (e.g., precision, recall, F-measure for relevant classes).
+2.  Assess whether the changes implemented in the **Improved Detector Code** successfully addressed the **Improvement Hypothesis Tested**.
+3.  Evaluate if the **User Goal** was met or if progress was made towards it.
+4.  Provide a concise overall **Assessment** of the improvement's effectiveness (e.g., "Significant Improvement", "Marginal Improvement", "No Improvement", "Regression").
+5.  Generate constructive **Feedback** for the next iteration:
+    *   Explain *why* the change might have succeeded or failed based on the results and the code modifications.
+    *   If successful, suggest if further refinement is possible.
+    *   If unsuccessful or caused regressions, suggest potential reasons and alternative approaches or hypotheses.
+    *   If the hypothesis wasn't directly testable by the change, note that.
+
+**Output Format:**
+Return ONLY a JSON object with two keys: `"assessment"` (string) and `"feedback"` (string). Do not include any introductory text, explanations, or markdown formatting outside the JSON object.
+
+**Example Output:**
+```json
+{
+  "assessment": "Marginal Improvement",
+  "feedback": "The change slightly improved precision for Class A as hypothesized, but recall decreased unexpectedly. This might be due to [potential reason]. Consider reverting the change or trying [alternative approach] to address the recall drop while maintaining the precision gain."
+}
+``` 

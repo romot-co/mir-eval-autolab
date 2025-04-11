@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import List, Optional, Union, Tuple, Dict, Any
 import warnings
 from dotenv import load_dotenv, find_dotenv
+import glob # ファイル検索のため追加
 
 # .envファイルのサポートを追加（利用可能な場合）
 try:
@@ -289,7 +290,7 @@ def get_absolute_path(relative_or_absolute_path: Union[str, Path],
             base_dir = get_project_root() # プロジェクトルートを基準にする
         return (base_dir / path_obj).resolve()
 
-def ensure_dir(dir_path: Union[str, Path], *, check_writable: bool = True) -> Path:
+def ensure_dir(dir_path: Union[str, Path], *, check_writable: bool = False) -> Path:
     """
     指定されたパスのディレクトリが存在することを確認し、存在しない場合は作成する。
     オプションで書き込み可能かどうかもチェックする。
@@ -299,7 +300,7 @@ def ensure_dir(dir_path: Union[str, Path], *, check_writable: bool = True) -> Pa
     dir_path : Union[str, Path]
         確認または作成するディレクトリのパス。
     check_writable : bool, optional
-        ディレクトリが書き込み可能かどうかのチェックを行うか, by default True
+        ディレクトリが書き込み可能かどうかのチェックを行うか, by default False
 
     Returns
     -------
@@ -715,89 +716,211 @@ def get_detector_path(detector_name: str, config: Dict[str, Any], version: Optio
 
 # --- Data Paths --- #
 
-def get_dataset_paths(config: Dict[str, Any], dataset_name: str) -> Tuple[Path, Path, str, str]:
+def get_dataset_paths(
+    config: Dict[str, Any],
+    dataset_name: str
+) -> Tuple[Path, Path, List[Tuple[Path, Path]]]: # Return type changed to include file list
     """
-    指定されたデータセットの音声ディレクトリ、参照ディレクトリ、およびパターンを取得する。
-
-    `config['datasets'][dataset_name]` の設定と `config['paths']['datasets_base']` を参照する。
-    パスは絶対パスに解決される。
+    データセット名に基づいて、オーディオとラベルのディレクトリパス、およびファイルペアのリストを取得します。
+    config.yaml の datasets セクションを参照します。
+    MedleyDB や MIREX フォーマットにも対応。
 
     Parameters
     ----------
     config : Dict[str, Any]
-        アプリケーション設定辞書。
+        アプリケーション設定辞書
     dataset_name : str
-        `config['datasets']` 内のキー。
+        config.yaml の datasets セクションで定義されたデータセット名
 
     Returns
     -------
-    Tuple[Path, Path, str, str]
-        (audio_dir_path, ref_dir_path, audio_pattern, ref_pattern) のタプル。
+    Tuple[Path, Path, List[Tuple[Path, Path]]]
+        (audio_dir_path, label_dir_path, file_pairs_list)
+        file_pairs_list は (audio_path, label_path) のタプルのリストです。
 
     Raises
     ------
     ConfigError
-        設定が見つからないか、不正な場合。
+        指定されたデータセット名が config に存在しない場合、またはパス情報が不足している場合。
     FileError
-        ディレクトリが存在しない場合。
+        指定されたディレクトリやファイルリストが存在しない場合。
     """
+    logger.debug(f"データセットパスを取得中: {dataset_name}")
     datasets_config = config.get('datasets')
-    if not datasets_config or dataset_name not in datasets_config:
-        raise ConfigError(f"設定ファイルにデータセット '{dataset_name}' の定義が見つかりません。")
+    if not datasets_config or not isinstance(datasets_config, dict):
+        raise ConfigError("config.yaml に 'datasets' セクションが見つからないか、無効です。")
 
-    ds_config = datasets_config[dataset_name]
-    required_keys = ['audio_dir', 'label_dir', 'audio_pattern', 'label_pattern']
-    if not all(key in ds_config for key in required_keys):
-        missing = [key for key in required_keys if key not in ds_config]
-        raise ConfigError(f"データセット '{dataset_name}' の設定に不足しているキーがあります: {missing}")
+    dataset_info = datasets_config.get(dataset_name)
+    if not dataset_info or not isinstance(dataset_info, dict):
+        raise ConfigError(f"config.yaml の 'datasets' セクションにデータセット '{dataset_name}' の定義が見つかりません。")
 
-    # データセット固有のベースパスがあればそれを使う、なければ全体のベースパス
-    dataset_base_override = ds_config.get('datasets_base')
-    if dataset_base_override:
-         datasets_base_str = dataset_base_override
-         source = f"データセット '{dataset_name}' 固有の datasets_base"
-    else:
-         datasets_base_str = config.get('paths', {}).get('datasets_base', 'datasets')
-         source = "全体の paths.datasets_base"
+    # 設定値を取得 (存在しない場合は None)
+    audio_dir_str = dataset_info.get('audio_dir')
+    label_dir_str = dataset_info.get('label_dir')
+    filelist_path_str = dataset_info.get('filelist')
+    label_format = dataset_info.get('label_format') # 追加
+    audio_ext = dataset_info.get('audio_ext', '.wav') # 追加 (デフォルト .wav)
+    label_ext = dataset_info.get('label_ext', '.csv') # 追加 (デフォルト .csv)
 
-    logger.debug(f"{source} からデータセットベースパスを取得: {datasets_base_str}")
+    if not audio_dir_str or not label_dir_str:
+        raise ConfigError(f"データセット '{dataset_name}' の設定に 'audio_dir' または 'label_dir' がありません。")
 
-    base_dir = Path(datasets_base_str)
     project_root = get_project_root()
-    if not base_dir.is_absolute():
-        base_dir = (project_root / base_dir).resolve()
+    datasets_base_dir = Path(config.get('paths', {}).get('datasets_base', 'datasets'))
+    if not datasets_base_dir.is_absolute():
+        datasets_base_dir = project_root / datasets_base_dir
 
-    if not base_dir.is_dir():
-         # ここで ensure_dir しない方が良い (データセットディレクトリは存在している前提)
-         raise ConfigError(f"データセットのベースディレクトリが見つかりません ({source}): {base_dir}")
+    # パスを解決
+    audio_dir = Path(audio_dir_str)
+    label_dir = Path(label_dir_str)
+    if not audio_dir.is_absolute():
+        audio_dir = datasets_base_dir / audio_dir
+    if not label_dir.is_absolute():
+        label_dir = datasets_base_dir / label_dir
 
-    # 各ディレクトリパスを解決
-    try:
-        audio_dir_rel = Path(ds_config['audio_dir'])
-        audio_dir = (base_dir / audio_dir_rel).resolve() if not audio_dir_rel.is_absolute() else audio_dir_rel.resolve()
-        if not audio_dir.is_dir():
-            raise FileError(f"Audio directory not found for dataset '{dataset_name}': {audio_dir}")
+    # ディレクトリ存在確認
+    if not audio_dir.is_dir():
+        raise FileError(f"オーディオディレクトリが見つかりません: {audio_dir}")
+    if not label_dir.is_dir():
+        raise FileError(f"ラベルディレクトリが見つかりません: {label_dir}")
 
-        label_dir_rel = Path(ds_config['label_dir']) # label_dir を使用
-        label_dir = (base_dir / label_dir_rel).resolve() if not label_dir_rel.is_absolute() else label_dir_rel.resolve()
-        if not label_dir.is_dir():
-             raise FileError(f"Label directory not found for dataset '{dataset_name}': {label_dir}")
+    # ファイルリストを生成
+    file_pairs: List[Tuple[Path, Path]] = []
 
-        # パターンを取得
-        audio_pattern = ds_config['audio_pattern']
-        label_pattern = ds_config['label_pattern'] # label_pattern を使用
+    if filelist_path_str:
+        # --- filelist が指定されている場合 --- #
+        filelist_path = Path(filelist_path_str)
+        if not filelist_path.is_absolute():
+            # データセット設定ファイルからの相対パス、またはプロジェクトルートからの相対パス?
+            # -> データセットディレクトリからの相対パスと仮定
+            #    あるいは datasets_base_dir からの相対パス?
+            #    ここではプロジェクトルートからの相対と仮定する (より一般的か？)
+            filelist_path = project_root / filelist_path
 
-        if not isinstance(audio_pattern, str) or not isinstance(label_pattern, str):
-             raise ConfigError(f"データセット '{dataset_name}' の audio_pattern または label_pattern が文字列ではありません。")
+        if not filelist_path.is_file():
+            raise FileError(f"ファイルリストが見つかりません: {filelist_path}")
 
-        return audio_dir, label_dir, audio_pattern, label_pattern
+        logger.info(f"ファイルリスト {filelist_path} からファイルペアを読み込み中...")
+        with open(filelist_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                stem = line.strip()
+                if stem:
+                    # 各フォーマットに合わせて audio と label のパスを探す
+                    audio_path, label_path = _find_pair_by_stem(
+                        stem, audio_dir, label_dir, label_format, audio_ext, label_ext
+                    )
+                    if audio_path and label_path:
+                        file_pairs.append((audio_path, label_path))
+                    else:
+                        logger.warning(f"ファイルリストのステム '{stem}' に対応するファイルペアが見つかりませんでした。オーディオ: {audio_path}, ラベル: {label_path}")
+    else:
+        # --- filelist が指定されていない場合 --- #
+        logger.info(f"ラベルディレクトリ {label_dir} をスキャンしてファイルペアを生成中 (フォーマット: {label_format or 'default'})...")
+        label_files: List[Path] = []
 
-    except FileError as e:
-        # ディレクトリが存在しないエラーはそのまま送出
-        raise e
-    except Exception as e:
-        logger.error(f"データセット '{dataset_name}' のパス解決中にエラー: {e}", exc_info=True)
-        raise ConfigError(f"データセット '{dataset_name}' のパス設定の処理中にエラーが発生しました。設定を確認してください。詳細: {e}") from e
+        if label_format == 'melody1':
+            label_files = sorted(label_dir.glob('*_MELODY1.csv'))
+        elif label_format == 'melody2':
+            label_files = sorted(label_dir.glob('*_MELODY2.csv'))
+        elif label_format == 'mirex_melody':
+            label_files = sorted(label_dir.glob(f'*{label_ext}'))
+        else: # デフォルト (または label_format 未指定)
+            # 想定: ラベルファイルは任意の拡張子を持つ可能性がある
+            # -> とりあえず一般的そうな拡張子を検索
+            default_label_exts = ['.csv', '.txt', '.lab', '.tsv']
+            for ext in default_label_exts:
+                label_files.extend(label_dir.glob(f'*{ext}'))
+            label_files = sorted(list(set(label_files))) # 重複除去とソート
+
+        if not label_files:
+             logger.warning(f"ラベルディレクトリ {label_dir} で指定されたフォーマットのファイルが見つかりませんでした。")
+
+        for label_path in label_files:
+            stem = _get_stem_for_format(label_path, label_format, label_ext)
+            if stem:
+                 audio_path = _find_audio_by_stem(stem, audio_dir, audio_ext)
+                 if audio_path:
+                     file_pairs.append((audio_path, label_path))
+                 else:
+                     logger.warning(f"ラベルファイル '{label_path.name}' に対応するオーディオファイル (ステム: '{stem}', 拡張子: '{audio_ext}') が {audio_dir} に見つかりませんでした。")
+            else:
+                 logger.warning(f"ラベルファイル '{label_path.name}' からステムを取得できませんでした (フォーマット: {label_format})。")
+
+    if not file_pairs:
+        # filelist を使っても、ディレクトリをスキャンしてもファイルが見つからなかった場合
+        logger.error(f"データセット '{dataset_name}' で有効なオーディオ/ラベルファイルペアが見つかりませんでした。設定を確認してください。Audio dir: {audio_dir}, Label dir: {label_dir}, Format: {label_format}")
+        # エラーを発生させるか、空リストを返すか？ -> 空リストを返す (呼び出し元で処理)
+
+    logger.info(f"データセット '{dataset_name}': {len(file_pairs)} 個のファイルペアを取得しました。")
+    return audio_dir, label_dir, file_pairs
+
+def _find_pair_by_stem(
+    stem: str,
+    audio_dir: Path,
+    label_dir: Path,
+    label_format: Optional[str],
+    audio_ext: str,
+    label_ext: str
+) -> Tuple[Optional[Path], Optional[Path]]:
+    """指定されたステムに基づいてオーディオとラベルファイルのペアを探すヘルパー関数。"""
+    audio_path = _find_audio_by_stem(stem, audio_dir, audio_ext)
+
+    label_path: Optional[Path] = None
+    if label_format == 'melody1':
+        candidate = label_dir / f"{stem}_MELODY1.csv"
+        if candidate.is_file(): label_path = candidate
+    elif label_format == 'melody2':
+        candidate = label_dir / f"{stem}_MELODY2.csv"
+        if candidate.is_file(): label_path = candidate
+    elif label_format == 'mirex_melody':
+        candidate = label_dir / f"{stem}{label_ext}"
+        if candidate.is_file(): label_path = candidate
+        elif label_ext == '.csv': # MIREXはtxtの場合もあるのでフォールバック
+             candidate_txt = label_dir / f"{stem}.txt"
+             if candidate_txt.is_file(): label_path = candidate_txt
+    else: # デフォルト
+        # 最も一般的な拡張子から探す
+        for ext in ['.csv', '.txt', '.lab', '.tsv']:
+            candidate = label_dir / f"{stem}{ext}"
+            if candidate.is_file():
+                label_path = candidate
+                break
+
+    return audio_path, label_path
+
+def _find_audio_by_stem(stem: str, audio_dir: Path, audio_ext: str) -> Optional[Path]:
+    """指定されたステムと拡張子でオーディオファイルを探すヘルパー関数。"""
+    audio_path = audio_dir / f"{stem}{audio_ext}"
+    if audio_path.is_file():
+        return audio_path
+    else:
+        # 大文字/小文字の違いなどを考慮して検索 (オプション)
+        # glob で探す方が確実か？
+        matches = list(audio_dir.glob(f"{stem}{audio_ext.lower()}"))
+        if matches: return matches[0]
+        matches = list(audio_dir.glob(f"{stem}{audio_ext.upper()}"))
+        if matches: return matches[0]
+        # 他の一般的なオーディオ拡張子も試す？ (wav, flac, mp3...)
+        # ここでは指定された拡張子のみとする
+        return None
+
+def _get_stem_for_format(label_path: Path, label_format: Optional[str], label_ext: str) -> Optional[str]:
+    """ラベルファイルパスとフォーマットからファイルステムを取得するヘルパー関数。"""
+    name = label_path.name
+    if label_format == 'melody1':
+        if name.endswith('_MELODY1.csv'):
+            return name[:-len('_MELODY1.csv')]
+    elif label_format == 'melody2':
+        if name.endswith('_MELODY2.csv'):
+            return name[:-len('_MELODY2.csv')]
+    elif label_format == 'mirex_melody':
+        if name.endswith(label_ext):
+             return name[:-len(label_ext)]
+        elif label_ext == '.csv' and name.endswith('.txt'): # フォールバック
+             return name[:-len('.txt')]
+    else: # デフォルト
+        return label_path.stem # pathlib の stem を使う
+    return None
 
 # --- Output Directory Construction --- #
 

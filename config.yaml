@@ -31,20 +31,20 @@ paths:
   # All generated results (eval, grid, viz, reports) will go into subdirs here.
   output_base: output # Environment variable MIREX_OUTPUT_BASE can override this
 
-  # --- Workspace Subdirs (Relative to determined workspace path) ---
-  # These will be subdirectories *within* the workspace defined by MIREX_WORKSPACE or default
-  db: db # For mcp_server_state.db
-  improved_versions: improved_versions # AI-generated code
+  # --- Workspace Subdirs (Relative to determined workspace path) --- (Removed)
+  # db: db # For mcp_server_state.db (Handled by get_db_dir)
+  # improved_versions: improved_versions # AI-generated code (Handled by get_improved_versions_dir)
 
 # === リソース制限 ===
 resource_limits:
   # 環境変数 MCP_* で上書き可能
-  # max_concurrent_jobs: auto # 'auto' (CPU数ベース) または数値で指定
+  # 以下のコメントアウトされた項目は core.configure_resource_limits や server 設定で管理されるため削除
+  # max_concurrent_jobs: auto
   # max_jobs_history: 100
-  # llm_timeout: 180 # LLM API タイムアウト (秒)
-  # evaluation_timeout: 1200 # 評価ジョブタイムアウト (秒)
-  # grid_search_timeout: 1800 # グリッドサーチジョブタイムアウト (秒)
-  # job_timeout: 600 # server.job_timeout_seconds と重複？ 整理が必要
+  # llm_timeout: 180 # llm セクションに移動
+  # evaluation_timeout: 1200
+  # grid_search_timeout: 1800
+  # job_timeout: 600 # server.job_timeout_seconds を使用
 
 # === クリーンアップ設定 ===
 cleanup:
@@ -64,7 +64,7 @@ cleanup:
   workspace:
     enabled: true
     retention_days: 14 # 指定日数より古いファイルを `output_base` 内から削除
-    target_dirs: [] # `output_base` 内を対象とし、タイムスタンプやパターンで賢く削除 (実装依存)
+    # target_dirs: [] # Removed - Logic targets output_base directly
 
 # === 評価設定 ===
 evaluation:
@@ -126,6 +126,39 @@ datasets:
   #   label_dir: annotations/melody1
   #   audio_pattern: '*.wav'
   #   label_pattern: '*_MELODY1.csv'
+
+  # Configuration for evaluation datasets
+  # dataset_name: Path to audio and reference/label files
+  synthetic_v1:
+    audio_dir: "datasets/synthetic_v1/audio"
+    label_dir: "datasets/synthetic_v1/labels"
+    filelist: null # Optional: Path to a file listing specific files to use
+  synthetic_poly_v1:
+    audio_dir: "datasets/synthetic_poly_v1/audio"
+    label_dir: "datasets/synthetic_poly_v1/labels"
+    filelist: null
+  # --- 追加: MedleyDB (v1 or v2) Example --- #
+  # User needs to set the actual path to their MedleyDB dataset root
+  medleydb_v1:
+    audio_dir: "/path/to/your/MedleyDB/V1/Audio"
+    label_dir: "/path/to/your/MedleyDB/V1/Annotations/Melody_Annotations/MELODY1"
+    label_format: "melody1" # Special identifier for MedleyDB melody format
+    filelist: null # Or specify a subset file if needed
+  medleydb_v2:
+    audio_dir: "/path/to/your/MedleyDB/V2/Audio"
+    label_dir: "/path/to/your/MedleyDB/V2/Annotations/Melody_Annotations/MELODY2"
+    label_format: "melody2" # Special identifier for MedleyDB melody format 2
+    filelist: null
+  # --- 追加: MIREX Melody Example --- #
+  # Assumes audio and ref files are in the same directory, named like <stem>.wav and <stem>.csv/txt
+  mirex_melody_example:
+    audio_dir: "/path/to/your/mirex_data"
+    label_dir: "/path/to/your/mirex_data"
+    label_format: "mirex_melody" # Special identifier for MIREX melody format (csv/txt)
+    audio_ext: ".wav"
+    label_ext: ".csv" # or ".txt"
+    filelist: null
+  # Add other standard datasets here as needed...
 
 # === 検出器デフォルトパラメータ (任意) ===
 # detectors:

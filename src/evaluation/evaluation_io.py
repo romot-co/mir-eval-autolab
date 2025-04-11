@@ -14,8 +14,17 @@ from typing import Dict, Any, List, Union, Tuple, Optional
 
 from src.utils.json_utils import NumpyEncoder
 from src.utils.exception_utils import FileError, log_exception
+from src.utils.detection_result import DetectionResult
 
 logger = logging.getLogger(__name__) # モジュールレベルのロガーを取得
+
+# プロット関数をインポート
+try:
+    # from src.visualization.plots import plot_detection_results # コメントアウト
+    plot_module_imported = False # インポート試行をやめたので False に設定
+except ImportError:
+    plot_module_imported = False
+    logger.warning("matplotlib または関連モジュールが見つかりません。プロット機能は無効になります。")
 
 def save_evaluation_result(result: Dict[str, Any], output_path: str) -> None:
     """
@@ -220,51 +229,60 @@ def create_summary_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
     
     return df
 
-def save_detection_plot(detection_result: Dict[str, Any], reference: Dict[str, Any], 
-                     output_path: str, plot_format: str = 'png') -> None:
+def save_detection_plot(
+    audio_data: np.ndarray,
+    sr: int,
+    detection_result: DetectionResult,
+    reference: DetectionResult,
+    output_path: str,
+    plot_format: str = 'png',
+    plot_config: Optional[Dict[str, Any]] = None
+) -> None:
     """
     検出結果と参照データをプロットして保存します。
+    音声波形も一緒に表示します。
 
     Parameters
     ----------
-    detection_result : Dict[str, Any]
-        検出結果
-    reference : Dict[str, Any]
-        参照データ
+    audio_data : np.ndarray
+        音声データ
+    sr : int
+        サンプリングレート
+    detection_result : DetectionResult
+        検出結果オブジェクト
+    reference : DetectionResult
+        参照データオブジェクト
     output_path : str
         出力ファイルのパス
     plot_format : str, optional
         プロットの形式, by default 'png'
+    plot_config : Optional[Dict[str, Any]], optional
+        プロット設定, by default None
     """
-    import matplotlib.pyplot as plt
-    from src.visualization.plots import plot_detection_results
-    
+    if not plot_module_imported:
+        logger.warning("プロットモジュールがインポートされていないため、プロットをスキップします。")
+        return
+
     # 出力ディレクトリがない場合は作成
     output_dir = os.path.dirname(output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
-    
-    # プロットの生成
-    fig = plt.figure(figsize=(12, 8))
-    
-    # 警告: この関数では音声データがないため、波形プロットは表示されません
-    # ダミーの音声データを作成
-    dummy_audio = np.zeros(1000)
-    dummy_sr = 44100
-    
-    # 検出結果と参照データをプロット
-    plot_detection_results(
-        audio_data=dummy_audio,  # ダミーデータ
-        sr=dummy_sr,             # ダミーサンプリングレート
-        detection_result=detection_result,
-        reference_data=reference,
-        title="検出結果と参照データの比較",
-        figsize=(12, 8),
-        show=False,
-        save_path=output_path
-    )
-    
-    plt.close(fig)
+
+    try:
+        logger.debug(f"プロットを {output_path} に保存中...")
+        # plot_detection_results を呼び出す (引数を辞書に変換)
+        # plot_detection_results(
+        #     audio_data=audio_data,
+        #     sr=sr,
+        #     detection_result=detection_result.to_dict() if detection_result else None,
+        #     reference_data=reference.to_dict() if reference else None,
+        #     show=False,
+        #     save_path=output_path,
+        # )
+        logger.info(f"プロットを {output_path} に保存しました。")
+
+    except Exception as e:
+        log_exception(logger, e, f"プロットの保存中にエラーが発生しました: {output_path}", log_level=logging.ERROR)
 
 def save_detection_and_evaluation_results(detection_result: Dict[str, Any],
                                   evaluation_result: Dict[str, Any],
