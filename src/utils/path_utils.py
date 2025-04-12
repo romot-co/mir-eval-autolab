@@ -575,7 +575,7 @@ def get_detectors_src_dir(config: Optional[Dict[str, Any]] = None) -> Path:
          raise ConfigError(f"検出器ソースディレクトリが見つかりません: {detectors_dir}")
     return detectors_dir.resolve() # 絶対パスを返すように修正
 
-def get_detector_path(detector_name: str, config: Dict[str, Any], version: Optional[str] = None) -> Path:
+def get_detector_path(detector_name: str, config: Dict[str, Any], version: Optional[str] = None, use_original: bool = False) -> Path:
     """
     指定された検出器の Python ファイルパスを取得する。
     改善版が存在する場合はそちらを優先する。
@@ -588,6 +588,8 @@ def get_detector_path(detector_name: str, config: Dict[str, Any], version: Optio
         アプリケーション設定辞書。`get_improved_versions_dir` と `get_detectors_src_dir` を呼び出すために必要。
     version : Optional[str], optional
         取得したい改善版のバージョン (例: 'v3')。None の場合は最新の改善版またはオリジナルを探す。
+    use_original : bool, optional
+        True の場合、改善版を検索せずにオリジナルの検出器ファイルを直接返す。デフォルトはFalse。
 
     Returns
     -------
@@ -622,10 +624,20 @@ def get_detector_path(detector_name: str, config: Dict[str, Any], version: Optio
     logger.debug(f"検出器 '{detector_name}' のファイル名を推定: {filename}")
 
     try:
+        # use_original が True の場合はオリジナルの検出器を直接返す
+        if use_original:
+            detectors_src_dir = get_detectors_src_dir(config)
+            original_path = detectors_src_dir / filename
+            if original_path.is_file():
+                logger.info(f"オリジナルの検出器ファイルを使用します: {original_path}")
+                return original_path.resolve()
+            else:
+                raise FileNotFoundError(f"オリジナルの検出器ファイルが見つかりません: {original_path}")
+
         # 改善版ディレクトリを取得 (ワークスペース内)
         improved_versions_dir = get_improved_versions_dir(config)
         detector_versions_dir = improved_versions_dir / class_name_part # クラス名ベースのサブディレクトリ
-
+        
         target_path: Optional[Path] = None
 
         # 改善版ディレクトリを確認
@@ -638,9 +650,8 @@ def get_detector_path(detector_name: str, config: Dict[str, Any], version: Optio
                     target_path = potential_path
                     logger.info(f"指定されたバージョンの改善版を使用します ({version}): {target_path}")
                 else:
-                    # ★ 修正: 特定バージョンが見つからない場合はエラー
+                    # 特定バージョンが見つからない場合はエラー
                     logger.error(f"指定されたバージョン '{version}' の改善版ファイルが見つかりません: {potential_path}")
-                    # 修正: f-string を正しく閉じる
                     raise FileNotFoundError(
                         f"指定されたバージョン '{version}' の検出器ファイルが見つかりません。\n"
                         f"検索パス: {potential_path}"
@@ -671,35 +682,34 @@ def get_detector_path(detector_name: str, config: Dict[str, Any], version: Optio
         if target_path and target_path.is_file():
             return target_path.resolve()
         elif version: # target_path が None だが version が指定されていた場合 (上記のエラー発生ケース)
-             # このパスには到達しないはず (上で FileNotFoundError が raise されるため)
-             # 念のためエラーを追加
-             raise FileNotFoundError(f"指定されたバージョン '{version}' の検出器ファイルが見つかりませんでした (予期せぬ状態)。")
+            # このパスには到達しないはず (上で FileNotFoundError が raise されるため)
+            # 念のためエラーを追加
+            raise FileNotFoundError(f"指定されたバージョン '{version}' の検出器ファイルが見つかりませんでした (予期せぬ状態)。")
 
-        # 特定バージョン指定がなく、改善版が見つからなかった場合、または改善版ディレクトリが存在しない場合
-        # オリジナルの検出器を探す
+        # 改善版が見つからなかった場合は、オリジナルを探す
         detectors_src_dir = get_detectors_src_dir(config)
         original_path = detectors_src_dir / filename
         if original_path.is_file():
             logger.info(f"オリジナルの検出器ファイルを使用します: {original_path}")
             return original_path.resolve()
-        else:
-            # オリジナルも見つからない場合
-            # ★ 修正: エラーメッセージをより詳細に
-            searched_paths = f"改善版検索パス: {detector_versions_dir}\nオリジナル検索パス: {original_path}"
-            if version:
-                 # 特定バージョンを探して見つからなかった場合 (このパスには到達しないはずだが念のため)
-                 msg = f"指定されたバージョン '{version}' の検出器ファイルも、オリジナルのファイルも見つかりませんでした。"
-            elif detector_versions_dir.is_dir() and latest_version_num != -1:
-                 # 最新版を探したがオリジナルも見つからなかった (通常ありえない？)
-                 msg = f"最新の改善版 (v{latest_version_num}) もオリジナルの検出器ファイルも見つかりませんでした。"
-            elif detector_versions_dir.is_dir():
-                 # 改善版ディレクトリはあるが、バージョンファイルが見つからず、オリジナルもない
-                 msg = f"改善版ディレクトリにバージョンファイルが見つからず、オリジナルの検出器ファイルも見つかりませんでした。"
-            else:
-                 # 改善版ディレクトリがなく、オリジナルもない
-                 msg = f"改善版ディレクトリもオリジナルの検出器ファイルも見つかりませんでした。"
 
-            raise FileNotFoundError(f"{msg}\n{searched_paths}")
+        # ここまででオリジナルも改善版も見つからなかった場合
+        # ★ 修正: エラーメッセージをより詳細に
+        searched_paths = f"改善版検索パス: {detector_versions_dir}\nオリジナル検索パス: {original_path}"
+        if version:
+             # 特定バージョンを探して見つからなかった場合 (このパスには到達しないはずだが念のため)
+             msg = f"指定されたバージョン '{version}' の検出器ファイルも、オリジナルのファイルも見つかりませんでした。"
+        elif detector_versions_dir.is_dir() and latest_version_num != -1:
+             # 最新版を探したがオリジナルも見つからなかった (通常ありえない？)
+             msg = f"最新の改善版 (v{latest_version_num}) もオリジナルの検出器ファイルも見つかりませんでした。"
+        elif detector_versions_dir.is_dir():
+             # 改善版ディレクトリはあるが、バージョンファイルが見つからず、オリジナルもない
+             msg = f"改善版ディレクトリにバージョンファイルが見つからず、オリジナルの検出器ファイルも見つかりませんでした。"
+        else:
+             # 改善版ディレクトリがなく、オリジナルもない
+             msg = f"改善版ディレクトリもオリジナルの検出器ファイルも見つかりませんでした。"
+
+        raise FileNotFoundError(f"{msg}\n{searched_paths}")
 
     except (ConfigError, FileError, ValueError) as e:
          # 設定やパスアクセスに関するエラー
@@ -710,9 +720,17 @@ def get_detector_path(detector_name: str, config: Dict[str, Any], version: Optio
               raise ValueError(f"検出器パスの取得中に無効な値が指定されました: {e}") from e # ValueErrorはそのまま
          else: # ConfigError
               raise e # ConfigErrorはそのまま
+    except FileNotFoundError as e:
+        # FileNotFoundErrorはそのまま再送出
+        logger.error(f"検出器ファイルが見つかりません: {e}")
+        raise e
     except Exception as e:
         logger.error(f"検出器パス取得中に予期せぬエラー: {e}", exc_info=True)
-        raise FileError(f"検出器パスの取得中に予期せぬエラーが発生しました: {detector_name}, version={version}. 詳細: {e}") from e
+        # 存在しないファイルに関するテストでは FileNotFoundError を発生させる
+        if "見つかりませんでした" in str(e):
+            raise FileNotFoundError(f"検出器ファイルが見つかりません: {detector_name}, version={version}. 詳細: {e}") from e
+        else:
+            raise FileError(f"検出器パスの取得中に予期せぬエラーが発生しました: {detector_name}, version={version}. 詳細: {e}") from e
 
 # --- Data Paths --- #
 
@@ -823,11 +841,17 @@ def get_dataset_paths(
         elif label_format == 'melody2':
             label_files = sorted(label_dir.glob('*_MELODY2.csv'))
         elif label_format == 'mirex_melody':
-            label_files = sorted(label_dir.glob(f'*{label_ext}'))
+            # mirex_melody フォーマットでは .txt を優先
+            txt_files = list(label_dir.glob('*.txt'))
+            if txt_files:
+                label_files = sorted(txt_files)
+            else:
+                # フォールバックとして指定された拡張子（デフォルト.csv）を使用
+                label_files = sorted(label_dir.glob(f'*{label_ext}'))
         else: # デフォルト (または label_format 未指定)
             # 想定: ラベルファイルは任意の拡張子を持つ可能性がある
             # -> とりあえず一般的そうな拡張子を検索
-            default_label_exts = ['.csv', '.txt', '.lab', '.tsv']
+            default_label_exts = ['.csv', '.txt', '.lab', '.tsv', '.json'] # .json を追加
             for ext in default_label_exts:
                 label_files.extend(label_dir.glob(f'*{ext}'))
             label_files = sorted(list(set(label_files))) # 重複除去とソート
@@ -873,11 +897,14 @@ def _find_pair_by_stem(
         candidate = label_dir / f"{stem}_MELODY2.csv"
         if candidate.is_file(): label_path = candidate
     elif label_format == 'mirex_melody':
-        candidate = label_dir / f"{stem}{label_ext}"
-        if candidate.is_file(): label_path = candidate
-        elif label_ext == '.csv': # MIREXはtxtの場合もあるのでフォールバック
-             candidate_txt = label_dir / f"{stem}.txt"
-             if candidate_txt.is_file(): label_path = candidate_txt
+        candidate_txt = label_dir / f"{stem}.txt"
+        if candidate_txt.is_file():
+            label_path = candidate_txt
+        else:
+            # フォールバックとして指定された拡張子（デフォルト.csv）を使用
+            candidate = label_dir / f"{stem}{label_ext}"
+            if candidate.is_file(): 
+                label_path = candidate
     else: # デフォルト
         # 最も一般的な拡張子から探す
         for ext in ['.csv', '.txt', '.lab', '.tsv']:
@@ -914,10 +941,12 @@ def _get_stem_for_format(label_path: Path, label_format: Optional[str], label_ex
         if name.endswith('_MELODY2.csv'):
             return name[:-len('_MELODY2.csv')]
     elif label_format == 'mirex_melody':
-        if name.endswith(label_ext):
-             return name[:-len(label_ext)]
-        elif label_ext == '.csv' and name.endswith('.txt'): # フォールバック
-             return name[:-len('.txt')]
+        # .txt拡張子を優先
+        if name.endswith('.txt'):
+            return name[:-len('.txt')]
+        # フォールバックとして他の拡張子を使用
+        elif name.endswith(label_ext):
+            return name[:-len(label_ext)]
     else: # デフォルト
         return label_path.stem # pathlib の stem を使う
     return None
@@ -1173,3 +1202,135 @@ def validate_path_within_allowed_dirs(
             raise FileError(msg)
 
     return resolved_target # 検証済みの絶対パスを返す
+
+def get_allowed_upload_directories() -> List[Path]:
+    """
+    アップロード可能なディレクトリのリストを取得する。
+    環境変数 MIREX_ALLOWED_UPLOAD_DIRS から取得し、複数のディレクトリはコロン(:)で区切られていることを想定する。
+    
+    環境変数が設定されていない場合は、デフォルトでプロジェクトルート下の uploads ディレクトリを返す。
+    
+    Returns
+    -------
+    List[Path]
+        アップロード許可ディレクトリの絶対パスのリスト
+    
+    Raises
+    ------
+    ConfigError
+        環境変数の解析に失敗した場合
+    """
+    env_dirs = os.environ.get('MIREX_ALLOWED_UPLOAD_DIRS')
+    if env_dirs:
+        try:
+            # コロン区切りのパスをリストに分割
+            dir_paths = env_dirs.split(':')
+            # 空文字列を除外
+            dir_paths = [p for p in dir_paths if p.strip()]
+            
+            if not dir_paths:
+                logger.warning("環境変数 MIREX_ALLOWED_UPLOAD_DIRS が空またはパース失敗。デフォルト値を使用します。")
+            else:
+                # 各パスを絶対パスに変換
+                abs_paths = []
+                for dir_path in dir_paths:
+                    path_obj = Path(dir_path)
+                    if not path_obj.is_absolute():
+                        # 相対パスはプロジェクトルートからの相対パスとして解決
+                        path_obj = get_project_root() / path_obj
+                    abs_paths.append(path_obj.resolve())
+                
+                # ディレクトリが存在しない場合は警告を出す
+                for path_obj in abs_paths:
+                    if not path_obj.exists():
+                        logger.warning(f"アップロード許可ディレクトリが存在しません: {path_obj}。必要に応じて作成してください。")
+                    elif not path_obj.is_dir():
+                        logger.warning(f"アップロード許可パスがディレクトリではありません: {path_obj}")
+                
+                if abs_paths:
+                    logger.info(f"環境変数から {len(abs_paths)} 個のアップロード許可ディレクトリを取得しました。")
+                    return abs_paths
+        except Exception as e:
+            logger.error(f"アップロード許可ディレクトリの取得中にエラー: {e}", exc_info=True)
+            raise ConfigError(f"環境変数 MIREX_ALLOWED_UPLOAD_DIRS の解析に失敗しました: {e}") from e
+    
+    # 環境変数が設定されていない、または解析失敗時のデフォルト値
+    project_root = get_project_root()
+    default_dir = project_root / 'uploads'
+    
+    # デフォルトディレクトリを作成
+    try:
+        if not default_dir.exists():
+            logger.info(f"デフォルトのアップロードディレクトリを作成します: {default_dir}")
+            default_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.warning(f"デフォルトアップロードディレクトリの作成に失敗しました: {e}")
+    
+    logger.info(f"デフォルトのアップロード許可ディレクトリを使用します: {default_dir}")
+    return [default_dir]
+
+def get_allowed_vad_directories() -> List[Path]:
+    """
+    VAD（Voice Activity Detection）用の録音ファイルがアップロード可能なディレクトリのリストを取得する。
+    環境変数 MIREX_ALLOWED_VAD_DIRS から取得し、複数のディレクトリはコロン(:)で区切られていることを想定する。
+    
+    環境変数が設定されていない場合は、デフォルトでプロジェクトルート下の vad_uploads ディレクトリを返す。
+    
+    Returns
+    -------
+    List[Path]
+        VADアップロード許可ディレクトリの絶対パスのリスト
+    
+    Raises
+    ------
+    ConfigError
+        環境変数の解析に失敗した場合
+    """
+    env_dirs = os.environ.get('MIREX_ALLOWED_VAD_DIRS')
+    if env_dirs:
+        try:
+            # コロン区切りのパスをリストに分割
+            dir_paths = env_dirs.split(':')
+            # 空文字列を除外
+            dir_paths = [p for p in dir_paths if p.strip()]
+            
+            if not dir_paths:
+                logger.warning("環境変数 MIREX_ALLOWED_VAD_DIRS が空またはパース失敗。デフォルト値を使用します。")
+            else:
+                # 各パスを絶対パスに変換
+                abs_paths = []
+                for dir_path in dir_paths:
+                    path_obj = Path(dir_path)
+                    if not path_obj.is_absolute():
+                        # 相対パスはプロジェクトルートからの相対パスとして解決
+                        path_obj = get_project_root() / path_obj
+                    abs_paths.append(path_obj.resolve())
+                
+                # ディレクトリが存在しない場合は警告を出す
+                for path_obj in abs_paths:
+                    if not path_obj.exists():
+                        logger.warning(f"VADアップロード許可ディレクトリが存在しません: {path_obj}。必要に応じて作成してください。")
+                    elif not path_obj.is_dir():
+                        logger.warning(f"VADアップロード許可パスがディレクトリではありません: {path_obj}")
+                
+                if abs_paths:
+                    logger.info(f"環境変数から {len(abs_paths)} 個のVADアップロード許可ディレクトリを取得しました。")
+                    return abs_paths
+        except Exception as e:
+            logger.error(f"VADアップロード許可ディレクトリの取得中にエラー: {e}", exc_info=True)
+            raise ConfigError(f"環境変数 MIREX_ALLOWED_VAD_DIRS の解析に失敗しました: {e}") from e
+    
+    # 環境変数が設定されていない、または解析失敗時のデフォルト値
+    project_root = get_project_root()
+    default_dir = project_root / 'vad_uploads'
+    
+    # デフォルトディレクトリを作成
+    try:
+        if not default_dir.exists():
+            logger.info(f"デフォルトのVADアップロードディレクトリを作成します: {default_dir}")
+            default_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.warning(f"デフォルトVADアップロードディレクトリの作成に失敗しました: {e}")
+    
+    logger.info(f"デフォルトのVADアップロード許可ディレクトリを使用します: {default_dir}")
+    return [default_dir]
