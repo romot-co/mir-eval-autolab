@@ -8,13 +8,18 @@ import numpy as np
 from typing import Union
 import numba
 
-def hz_to_midi(frequencies: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+def hz_to_midi(frequencies: Union[float, np.ndarray, list]) -> Union[float, np.ndarray]:
     """
     周波数（Hz）からMIDIノート番号に変換する
     
+    Note
+    ----
+    この実装は特にNumbaとの互換性とエラー処理の一貫性のために維持されています。
+    単純な変換のみが必要な場合はlibrosa.hz_to_midi()を使用してください。
+    
     Parameters
     ----------
-    frequencies : float or numpy.ndarray
+    frequencies : float or numpy.ndarray or list
         周波数の値または配列 (Hz)
     
     Returns
@@ -22,6 +27,10 @@ def hz_to_midi(frequencies: Union[float, np.ndarray]) -> Union[float, np.ndarray
     float or numpy.ndarray
         MIDIノート番号の値または配列
     """
+    # リストまたは他の配列型の入力をnumpy配列に変換
+    if not isinstance(frequencies, np.ndarray) and not np.isscalar(frequencies):
+        frequencies = np.asarray(frequencies, dtype=float)
+        
     with np.errstate(divide='ignore', invalid='ignore'):
         midi_notes = 12 * np.log2(frequencies / 440.0) + 69
     
@@ -34,13 +43,18 @@ def hz_to_midi(frequencies: Union[float, np.ndarray]) -> Union[float, np.ndarray
     
     return midi_notes
 
-def midi_to_hz(midi_notes: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+def midi_to_hz(midi_notes: Union[float, np.ndarray, list]) -> Union[float, np.ndarray]:
     """
     MIDIノート番号から周波数（Hz）に変換する
+
+    Note
+    ----
+    この実装は特にNumbaとの互換性とエラー処理の一貫性のために維持されています。
+    単純な変換のみが必要な場合はlibrosa.hz_to_midi()を使用してください。
     
     Parameters
     ----------
-    midi_notes : float or numpy.ndarray
+    midi_notes : float or numpy.ndarray or list
         MIDIノート番号の値または配列
     
     Returns
@@ -48,6 +62,11 @@ def midi_to_hz(midi_notes: Union[float, np.ndarray]) -> Union[float, np.ndarray]
     float or numpy.ndarray
         周波数の値または配列 (Hz)
     """
+    # リストまたは他の配列型の入力をnumpy配列に変換
+    scalar_input = np.isscalar(midi_notes)
+    if not isinstance(midi_notes, np.ndarray) and not scalar_input:
+        midi_notes = np.asarray(midi_notes, dtype=float)
+    
     # 無効な値（負または0）を0周波数にマッピング
     if isinstance(midi_notes, np.ndarray):
         # ゼロ以下の値を0にする

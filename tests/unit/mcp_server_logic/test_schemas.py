@@ -234,7 +234,7 @@ def test_session_info_response_missing_required():
         # Missing status, created_at, last_update etc.
         SessionInfoResponse(session_id="sess_abc")
 
-def test_session_info_response_invalid_status():
+def test_session_info_response_invalid_status(sample_session_info_data):
     """Test SessionInfoResponse validation error on invalid status."""
     invalid_data = sample_session_info_data.copy()
     invalid_data["status"] = "active" # Invalid status

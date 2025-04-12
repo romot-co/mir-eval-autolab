@@ -549,6 +549,7 @@ def register_code_tools(
     config: Dict[str, Any],
     start_async_job_func: Callable[..., Coroutine[Any, Any, Dict[str, str]]], # ★ JobStartResponse形式を返す
     # add_history_async_func: Callable[..., Awaitable[None]] # ★ 削除
+    db_path: Path,  # DB_path引数を追加
 ):
     """コード管理関連のMCPツールを登録します。"""
     logger.info("コード管理ツールを登録中...")

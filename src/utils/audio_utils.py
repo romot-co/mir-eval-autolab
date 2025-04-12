@@ -258,7 +258,11 @@ def make_output_path(output_dir: str, audio_file: str, detector_name: str, exten
     # ディレクトリ作成はこの関数の責務ではないため削除
     # os.makedirs(output_dir, exist_ok=True)
     base_name = os.path.splitext(os.path.basename(audio_file))[0]
+    
+    # "_results" サフィックスがある場合は削除（ファイル名の末尾のみ）
+    if base_name.endswith("_results"):
+        base_name = base_name[:-8]  # "_results"の長さは8
+        
     # 拡張子の先頭のドットを除去
     clean_extension = extension.lstrip('.')
-    # ファイル名から "_results" を削除
-    return os.path.join(output_dir, f"{base_name}_{detector_name}.{clean_extension}") 
+    return os.path.join(output_dir, f"{base_name}_{detector_name}.{clean_extension}")

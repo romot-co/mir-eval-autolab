@@ -20,11 +20,9 @@ logger = logging.getLogger('mcp_server_main')
 
 # --- Import the logic modules --- #
 try:
-    from src.mcp_server_logic import (
-        core, db_utils, session_manager, job_manager, llm_tools,
-        evaluation_tools, code_tools, improvement_loop, utils
-    )
-    # 必要なら json_utils 等も
+    from src.mcp_server_logic import core, schemas, db_utils, session_manager, job_manager, \
+        evaluation_tools, code_tools, utils # improvement_loop を削除
+    # from mcp_server_logic import llm_tools # LLMツールは仕様変更により直接使わない
 except ImportError as e:
     logger.critical(f"必須モジュールのインポートに失敗しました: {e}", exc_info=True)
     logger.critical("PYTHONPATHを確認し、依存関係が正しくインストールされているか確認してください。")
@@ -82,17 +80,23 @@ async def main() -> int:
     # --- Register Tools from Modules --- #
     logger.info("Registering MCP tools...")
     try:
-        session_manager.register_session_tools(mcp, config, db_path)
-        job_manager.register_job_tools(mcp, config, db_path)
-        llm_tools.register_llm_tools(mcp, config, start_async_job_func, add_history_async_func)
         evaluation_tools.register_evaluation_tools(mcp, config, start_async_job_func, add_history_async_func)
+    except AttributeError as e:
+        logger.warning(f"Could not register evaluation tools: {e}") # Changed from error to warning
+    try:
         code_tools.register_code_tools(mcp, config, start_async_job_func, add_history_async_func)
-        improvement_loop.register_loop_tools(mcp, config, start_async_job_func, add_history_async_func)
-        # visualization_tools registration removed
-
-        # Register extensions section removed
-
+    except AttributeError as e:
+        logger.warning(f"Could not register code tools: {e}") # Changed from error to warning
+    # try: # llm_tools の登録は削除
+    #     llm_tools.register_llm_tools(mcp, config, start_async_job_func, add_history_async_func)
+    # except AttributeError as e:
+    #     logger.warning(f"Could not register LLM tools: {e}")
+    # improvement_loop.register_loop_tools(mcp, config, start_async_job_func, add_history_async_func) # 削除
+    try:
+        session_manager.register_session_tools(mcp, config, db_path) # 引数修正
         logger.info("All required tools registered successfully.") # メッセージ修正
+    except AttributeError as e:
+        logger.warning(f"Could not register session tools: {e}") # Changed from error to warning
     except Exception as e:
         logger.critical(f"ツール登録中にエラー: {e}", exc_info=True)
         print(f"FATAL: Tool registration failed: {e}", file=sys.stderr)

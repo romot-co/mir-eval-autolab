@@ -104,8 +104,8 @@ DEFAULT_CONFIG = {
     },
     'llm': {
         'client_type': 'ClaudeClient',
-        'api_key': None, # APIキーは環境変数での設定を強く推奨
-        'api_key_openai': None,
+        # 'api_key': None, # APIキーは環境変数での設定を強く推奨 - ホスト側で管理するため削除
+        # 'api_key_openai': None, # ホスト側で管理するため削除
         'model': 'claude-3-opus-20240229',
         'api_base': 'https://api.anthropic.com',
         'api_version': '2023-06-01',

@@ -130,43 +130,80 @@ def normalize_detection_result(detection_result: Dict[str, Any], sr: int = None)
                     # Keep the default value
             # else: field not in detection_result, default value is already set
 
-        # intervalsとnote_pitchesの検証と修正
-        # Ensure intervals is always 2D, even if empty
-        if 'intervals' in normalized_result:
-             intervals = normalized_result['intervals']
-             if not isinstance(intervals, np.ndarray) or intervals.ndim != 2 or intervals.shape[1] != 2:
-                 logger.warning(f"不正なインターバル形状: {intervals.shape if hasattr(intervals, 'shape') else type(intervals)}。空にします。")
-                 normalized_result['intervals'] = np.empty((0, 2), dtype=np.float64)
-                 normalized_result['note_pitches'] = np.empty((0,), dtype=np.float64) # Pitches must match intervals
-             else:
-                 # Ensure pitches match intervals length
-                 pitches = normalized_result.get('note_pitches', np.array([]))
-                 if not isinstance(pitches, np.ndarray):
-                     pitches = np.asarray(pitches, dtype=np.float64) # Attempt conversion
+        # intervalsの形状チェックと修正
+        intervals = normalized_result.get('intervals', np.empty((0, 2)))
+        note_pitches = normalized_result.get('note_pitches', np.empty(0)) # note_pitchesもここで取得
 
-                 if len(pitches) != len(intervals):
-                     logger.warning(f"ピッチ数 ({len(pitches)}) とインターバル数 ({len(intervals)}) が一致しません。短い方に合わせます。")
-                     min_len = min(len(pitches), len(intervals))
-                     normalized_result['note_pitches'] = pitches[:min_len]
-                     normalized_result['intervals'] = intervals[:min_len]
-                 else:
-                      normalized_result['note_pitches'] = pitches # Already ensured array type and matching length
+        if isinstance(intervals, np.ndarray):
+            # --- 形状チェック ---
+            shape_valid = True
+            if intervals.size > 0:
+                if intervals.ndim == 1:  # (N,) の場合
+                    logger.warning(f"不正なインターバル形状 ({intervals.shape})。空にします。")
+                    intervals = np.empty((0, 2), dtype=np.float64)
+                    shape_valid = False
+                elif intervals.ndim == 2 and intervals.shape[1] != 2:  # (N, M!=2) の場合
+                    logger.warning(f"不正なインターバル形状 ({intervals.shape})。空にします。")
+                    intervals = np.empty((0, 2), dtype=np.float64)
+                    shape_valid = False
+                elif intervals.size == 0 and intervals.ndim != 2:  # 空配列で形状が(0,)などの場合
+                    intervals = intervals.reshape(0, 2)  # 強制的に(0, 2)にする
+            elif intervals.size == 0 and intervals.ndim != 2:  # 空配列で形状が(0,)などの場合
+                intervals = intervals.reshape(0, 2)  # 強制的に(0, 2)にする
 
-        # フレーム時間と周波数の情報を処理
-        if 'frame_times' in normalized_result and 'frame_frequencies' in normalized_result:
-            times = normalized_result['frame_times']
-            freqs = normalized_result['frame_frequencies']
-            if not isinstance(times, np.ndarray): times = np.asarray(times, dtype=np.float64)
-            if not isinstance(freqs, np.ndarray): freqs = np.asarray(freqs, dtype=np.float64)
+            normalized_result['intervals'] = intervals # 更新されたintervalsを格納
 
-            if len(times) != len(freqs):
-                logger.warning(f"フレーム時間 ({len(times)}) とフレーム周波数 ({len(freqs)}) の長さが一致しません。短い方に合わせます。")
-                min_len = min(len(times), len(freqs))
-                normalized_result['frame_times'] = times[:min_len]
-                normalized_result['frame_frequencies'] = freqs[:min_len]
-            else:
-                 normalized_result['frame_times'] = times
-                 normalized_result['frame_frequencies'] = freqs
+            # 形状不正でintervalsが空になった場合、note_pitchesも空にする
+            if not shape_valid and isinstance(note_pitches, np.ndarray) and len(note_pitches) > 0:
+                logger.warning(f"intervalsの形状不正のため、note_pitchesも空にします。")
+                normalized_result['note_pitches'] = np.empty(0, dtype=np.float64)
+                note_pitches = normalized_result['note_pitches'] # note_pitchesを更新
+
+        # 配列長の一致チェックと切り詰め
+        intervals = normalized_result.get('intervals', np.empty((0, 2)))
+        note_pitches = normalized_result.get('note_pitches', np.empty(0))
+
+        if isinstance(intervals, np.ndarray) and isinstance(note_pitches, np.ndarray):
+            len_intervals = len(intervals)
+            len_pitches = len(note_pitches)
+
+            if len_intervals != len_pitches: # 長さが違う場合のみ処理
+                if len_intervals > 0 and len_pitches > 0: # 両方に要素がある場合
+                    min_len = min(len_intervals, len_pitches)
+                    logger.warning(
+                        f"ピッチ数 ({len_pitches}) とインターバル数 ({len_intervals}) が一致しません。"
+                        f"短い方の長さ ({min_len}) に切り詰めます。"
+                    )
+                    normalized_result['intervals'] = intervals[:min_len]
+                    normalized_result['note_pitches'] = note_pitches[:min_len]
+                elif len_intervals == 0 and len_pitches > 0:
+                    logger.warning(f"intervalsが空ですがnote_pitchesが存在します。note_pitchesを空にします。")
+                    normalized_result['note_pitches'] = np.empty(0, dtype=np.float64)
+                elif len_pitches == 0 and len_intervals > 0:
+                    logger.warning(f"note_pitchesが空ですがintervalsが存在します。intervalsを空にします。")
+                    normalized_result['intervals'] = np.empty((0, 2), dtype=np.float64)
+
+        # フレーム時間と周波数の長さ一致チェックと切り詰め
+        frame_times = normalized_result.get('frame_times', np.empty(0))
+        frame_frequencies = normalized_result.get('frame_frequencies', np.empty(0))
+
+        if isinstance(frame_times, np.ndarray) and isinstance(frame_frequencies, np.ndarray):
+            len_times = len(frame_times)
+            len_freqs = len(frame_frequencies)
+            if len_times != len_freqs and len_times > 0 and len_freqs > 0:
+                min_len = min(len_times, len_freqs)
+                logger.warning(
+                    f"フレーム時間 ({len_times}) とフレーム周波数 ({len_freqs}) の長さが一致しません。"
+                    f"短い方の長さ ({min_len}) に切り詰めます。"
+                )
+                normalized_result['frame_times'] = frame_times[:min_len]
+                normalized_result['frame_frequencies'] = frame_frequencies[:min_len]
+            elif len_times == 0 and len_freqs > 0:
+                logger.warning(f"frame_timesが空ですがframe_frequenciesが存在します。frame_frequenciesを空にします。")
+                normalized_result['frame_frequencies'] = np.empty(0, dtype=np.float64)
+            elif len_freqs == 0 and len_times > 0:
+                logger.warning(f"frame_frequenciesが空ですがframe_timesが存在します。frame_timesを空にします。")
+                normalized_result['frame_times'] = np.empty(0, dtype=np.float64)
 
         # 追加データを設定 (入力辞書にのみ存在し、標準フィールドでないものを追加)
         input_additional = detection_result.get('additional_data', {})
@@ -179,20 +216,13 @@ def normalize_detection_result(detection_result: Dict[str, Any], sr: int = None)
 
         normalized_result['additional_data'] = additional_data
 
-        # 最終的な結果の整合性を再確認 (特に interval/pitch 長)
-        # This check might be redundant due to earlier checks, but good for safety
-        if len(normalized_result['intervals']) != len(normalized_result['note_pitches']):
-            logger.error("最終正規化チェック: インターバルとピッチの長さが一致しません。短い方に合わせます。")
-            min_len = min(len(normalized_result['intervals']), len(normalized_result['note_pitches']))
-            normalized_result['intervals'] = normalized_result['intervals'][:min_len]
-            normalized_result['note_pitches'] = normalized_result['note_pitches'][:min_len]
-
-        # DetectionResult オブジェクトを作成して返す
-        return DetectionResult.from_dict(normalized_result)
-
     except Exception as e:
         logger.error(f"検出結果の正規化中に予期せぬエラーが発生しました: {str(e)}\n{traceback.format_exc()}")
         return DetectionResult() # エラー時は空のDetectionResultを返す
+
+    # tryブロックの外でDetectionResultオブジェクトを作成
+    # これにより、__post_init__でのValueErrorがキャッチされずに伝播する
+    return DetectionResult.from_dict(normalized_result)
 
 
 def ensure_detector_output_format(detector_output: Any) -> DetectionResult:

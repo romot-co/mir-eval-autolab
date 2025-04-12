@@ -4,6 +4,7 @@ import asyncio
 import json
 from unittest.mock import patch, MagicMock, AsyncMock, ANY, call
 from concurrent.futures import Executor # For mocking the executor
+from pathlib import Path
 
 # テスト対象モジュールと依存モジュールをインポート (存在しない場合はダミーを仮定)
 try:
@@ -125,7 +126,6 @@ except ImportError:
 
 
 # --- Fixtures ---
-pytestmark = pytest.mark.asyncio
 
 @pytest.fixture
 def mock_executor():
@@ -174,9 +174,17 @@ def mock_run_grid_search():
     """Mocks grid_search_core.run_grid_search."""
     return MagicMock(return_value={"best_params": {"p": 1}, "best_results": {"f": 0.99}, "summary_path": "/gs.csv"})
 
+@pytest.fixture
+def mock_path_utils():
+    """Mocks the path_utils module functions."""
+    mock = MagicMock()
+    mock.get_output_dir = MagicMock(return_value=Path("/mock_output"))
+    mock.get_ground_truth_dir = MagicMock(return_value=Path("/mock_ground_truth"))
+    return mock
 
-# --- Tests for Evaluation Tool Wrappers ---
+# --- Tests for evaluation tool async wrappers ---
 
+@pytest.mark.asyncio
 async def test_run_evaluate_detector_async_success(dummy_session_info_for_eval, mock_executor, mock_session_manager_for_eval, mock_config_for_eval, mock_evaluate_detector):
      """Test the evaluate_detector async wrapper successfully."""
      tool_input = EvaluateDetectorInput(params={"detector_name": "test", "audio_path": "a.wav"})
@@ -214,6 +222,7 @@ async def test_run_evaluate_detector_async_success(dummy_session_info_for_eval, 
      assert hist_kwargs["details"]["output"] == sync_result
 
 
+@pytest.mark.asyncio
 async def test_run_run_evaluation_async_success(dummy_session_info_for_eval, mock_executor, mock_session_manager_for_eval, mock_config_for_eval, mock_run_evaluation):
     """Test the run_evaluation async wrapper successfully."""
     tool_input = RunEvaluationInput(params={"dataset_path": "/data", "output_dir": "/out"})
@@ -249,6 +258,7 @@ async def test_run_run_evaluation_async_success(dummy_session_info_for_eval, moc
     assert hist_kwargs["event_type"] == f"{TOOL_NAME_RUN_EVALUATION}_complete"
 
 
+@pytest.mark.asyncio
 async def test_run_grid_search_async_success(dummy_session_info_for_eval, mock_executor, mock_session_manager_for_eval, mock_config_for_eval, mock_run_grid_search):
     """Test the grid_search async wrapper successfully."""
     tool_input = GridSearchInput(params={"detector_name": "gs_test", "param_grid": {}})
@@ -284,6 +294,7 @@ async def test_run_grid_search_async_success(dummy_session_info_for_eval, mock_e
     assert hist_kwargs["event_type"] == f"{TOOL_NAME_GRID_SEARCH}_complete"
 
 
+@pytest.mark.asyncio
 async def test_run_evaluate_detector_async_failure(dummy_session_info_for_eval, mock_executor, mock_session_manager_for_eval, mock_config_for_eval, mock_evaluate_detector):
      """Test the evaluate_detector async wrapper when the core function fails."""
      tool_input = EvaluateDetectorInput(params={"detector_name": "fail_eval", "audio_path": "fail"})

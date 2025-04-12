@@ -67,19 +67,25 @@ except ImportError:
         session_id = misc_utils_mock.generate_id("session")
         timestamp = misc_utils_mock.get_timestamp()
         status = SessionStatus.INITIALIZING.value
+        # 実際のSQLクエリ文字列を使用
+        insert_query = "INSERT INTO sessions (session_id, status, created_at, last_update, best_metrics_json, stagnation_count) VALUES (?, ?, ?, ?, ?, ?)"
         await db_utils_mock.db_execute_commit_async(
             config.db_path,
-            ANY, # Insert query
+            insert_query, # 実際のSQLクエリ
             (session_id, status, timestamp, timestamp, None, 0) # Dummy params
         )
         return SessionInfoResponse(session_id=session_id, status=status, created_at=timestamp, last_update=timestamp)
 
     async def get_session_info(session_id: str, config: SessionManagerConfig, db_utils_mock) -> Optional[SessionInfoResponse]:
-        session_row = await db_utils_mock.db_fetch_one_async(config.db_path, ANY, (session_id,))
+        # 実際のSQLクエリ文字列を使用
+        session_query = "SELECT * FROM sessions WHERE session_id = ?"
+        session_row = await db_utils_mock.db_fetch_one_async(config.db_path, session_query, (session_id,))
         if not session_row:
             return None
 
-        history_rows = await db_utils_mock.db_fetch_all_async(config.db_path, ANY, (session_id,))
+        # 実際のSQLクエリ文字列を使用
+        history_query = "SELECT * FROM history WHERE session_id = ? ORDER BY timestamp ASC"
+        history_rows = await db_utils_mock.db_fetch_all_async(config.db_path, history_query, (session_id,))
         history = []
         if history_rows:
              history = [
@@ -115,16 +121,20 @@ except ImportError:
         timestamp = misc_utils_mock.get_timestamp()
         details_json = json.dumps(details)
 
+        # 実際のSQLクエリ文字列を使用
+        history_insert = "INSERT INTO history (event_id, session_id, timestamp, event_type, details_json) VALUES (?, ?, ?, ?, ?)"
         # Simulate history insert
         await db_utils_mock.db_execute_commit_async(
-            config.db_path, ANY, # Insert history query
+            config.db_path, history_insert, # 実際のSQLクエリ 
             (event_id, session_id, timestamp, event_type, details_json)
         )
 
+        # 実際のSQLクエリ文字列を使用
+        session_update = "UPDATE sessions SET last_update = ? WHERE session_id = ?"
         # Simulate session update (last_update, potentially status, metrics, stagnation)
         # Basic update: just last_update
         await db_utils_mock.db_execute_commit_async(
-            config.db_path, ANY, # Update session query
+            config.db_path, session_update, # 実際のSQLクエリ
             (timestamp, session_id) # Only update timestamp
         )
         # --- Placeholder for metric/stagnation logic ---
@@ -134,24 +144,27 @@ except ImportError:
 
 
     async def cleanup_old_sessions(config: SessionManagerConfig, db_utils_mock):
+        # 実際のSQLクエリ文字列を使用
+        delete_query = "DELETE FROM sessions WHERE last_update < ?"
         # Only check if the delete command is executed
         cutoff_timestamp = (datetime.now(timezone.utc) - timedelta(hours=config.session_timeout_hours)).isoformat()
         await db_utils_mock.db_execute_commit_async(
             config.db_path,
-            ANY, # Delete query
+            delete_query, # 実際のSQLクエリ
             (cutoff_timestamp,) # Timestamp cutoff parameter
         )
 
     async def update_session_status_internal(session_id: str, new_status: str, db_path: str, db_utils_mock):
+         # 実際のSQLクエリ文字列を使用
+         update_query = "UPDATE sessions SET status = ?, last_update = ? WHERE session_id = ?"
          # Dummy internal status update function
          timestamp = datetime.now(timezone.utc).isoformat()
          await db_utils_mock.db_execute_commit_async(
-             db_path, ANY, # Update status query
+             db_path, update_query, # 実際のSQLクエリ
              (new_status, timestamp, session_id) # Update status and timestamp
          )
 
 # --- Fixtures ---
-pytestmark = pytest.mark.asyncio
 
 @pytest.fixture
 def mock_config() -> SessionManagerConfig:
@@ -172,7 +185,7 @@ def mock_misc_utils():
     """Mocks the misc_utils module functions."""
     mock = MagicMock()
     # Use a list to provide different IDs for session and event
-    mock.generate_id = MagicMock(side_effect=["session_abc", "event_123", "event_456"])
+    mock.generate_id = MagicMock()
     mock.get_timestamp = MagicMock(return_value=datetime.now(timezone.utc).isoformat())
     return mock
 
@@ -183,8 +196,13 @@ def mock_validate():
 
 # --- Tests for start_session ---
 
+@pytest.mark.asyncio
 async def test_start_session_success(mock_config, mock_db_utils, mock_misc_utils):
     """Test starting a session successfully."""
+    # モックをリセット
+    mock_misc_utils.generate_id.reset_mock()
+    mock_misc_utils.generate_id.side_effect = ["session_abc"]
+    
     response = await start_session(mock_config, mock_db_utils, mock_misc_utils)
 
     assert isinstance(response, SessionInfoResponse)
@@ -204,6 +222,7 @@ async def test_start_session_success(mock_config, mock_db_utils, mock_misc_utils
     assert response.status in db_params
     assert response.created_at in db_params
 
+@pytest.mark.asyncio
 async def test_start_session_db_error(mock_config, mock_db_utils, mock_misc_utils):
     """Test that StateManagementError during DB insert is propagated."""
     mock_db_utils.db_execute_commit_async.side_effect = StateManagementError("DB unavailable")
@@ -213,6 +232,7 @@ async def test_start_session_db_error(mock_config, mock_db_utils, mock_misc_util
 
 # --- Tests for get_session_info ---
 
+@pytest.mark.asyncio
 async def test_get_session_info_found(mock_config, mock_db_utils):
     """Test getting information for an existing session with history."""
     session_id = "existing_session"
@@ -247,6 +267,7 @@ async def test_get_session_info_found(mock_config, mock_db_utils):
     mock_db_utils.db_fetch_one_async.assert_called_once_with(mock_config.db_path, ANY, (session_id,))
     mock_db_utils.db_fetch_all_async.assert_called_once_with(mock_config.db_path, ANY, (session_id,))
 
+@pytest.mark.asyncio
 async def test_get_session_info_not_found(mock_config, mock_db_utils):
     """Test getting information for a non-existent session."""
     session_id = "non_existent_session"
@@ -258,6 +279,7 @@ async def test_get_session_info_not_found(mock_config, mock_db_utils):
     mock_db_utils.db_fetch_one_async.assert_called_once_with(mock_config.db_path, ANY, (session_id,))
     mock_db_utils.db_fetch_all_async.assert_not_called() # Should not query history if session not found
 
+@pytest.mark.asyncio
 async def test_get_session_info_db_error(mock_config, mock_db_utils):
     """Test StateManagementError during DB fetch."""
     session_id = "error_session"
@@ -268,12 +290,17 @@ async def test_get_session_info_db_error(mock_config, mock_db_utils):
 
 # --- Tests for add_session_history ---
 
+@pytest.mark.asyncio
 async def test_add_session_history_success(mock_config, mock_db_utils, mock_misc_utils, mock_validate):
     """Test adding a history event successfully."""
     session_id = "history_test_session"
     event_type = "test_event"
     details = {"key": "value", "number": 123}
     timestamp_before = datetime.now(timezone.utc).isoformat()
+    
+    # モックをリセット
+    mock_misc_utils.generate_id.reset_mock()
+    mock_misc_utils.generate_id.side_effect = ["event_123"]
     mock_misc_utils.get_timestamp.return_value = timestamp_before # Control timestamp
 
     await add_session_history(session_id, event_type, details, mock_config, mock_db_utils, mock_misc_utils, mock_validate)
@@ -303,6 +330,7 @@ async def test_add_session_history_success(mock_config, mock_db_utils, mock_misc
     assert timestamp_before in session_update_params
     assert session_id in session_update_params
 
+@pytest.mark.asyncio
 async def test_add_session_history_validation_error(mock_config, mock_db_utils, mock_misc_utils, mock_validate):
     """Test that validation error prevents DB writes."""
     session_id = "validation_fail_session"
@@ -321,6 +349,7 @@ async def test_add_session_history_validation_error(mock_config, mock_db_utils, 
 
 # --- Test for cleanup_old_sessions ---
 
+@pytest.mark.asyncio
 async def test_cleanup_old_sessions(mock_config, mock_db_utils):
     """Test that the cleanup function executes a delete query."""
     await cleanup_old_sessions(mock_config, mock_db_utils)

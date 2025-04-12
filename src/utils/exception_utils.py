@@ -137,17 +137,17 @@ def log_exception(logger: logging.Logger, e: Exception,
     stack_trace = traceback.format_exc()
     
     if log_level == logging.DEBUG:
-        logger.debug(f"{error_msg}\n{stack_trace}")
+        logger.debug(f"{error_msg}\\n{stack_trace}", exc_info=True)
     elif log_level == logging.INFO:
-        logger.info(f"{error_msg}\n{stack_trace}")
+        logger.info(f"{error_msg}\\n{stack_trace}", exc_info=True)
     elif log_level == logging.WARNING:
-        logger.warning(f"{error_msg}\n{stack_trace}")
+        logger.warning(f"{error_msg}\\n{stack_trace}", exc_info=True)
     elif log_level == logging.ERROR:
-        logger.error(f"{error_msg}\n{stack_trace}")
+        logger.error(f"{error_msg}\\n{stack_trace}", exc_info=True)
     elif log_level == logging.CRITICAL:
-        logger.critical(f"{error_msg}\n{stack_trace}")
+        logger.critical(f"{error_msg}\\n{stack_trace}", exc_info=True)
     
-    return f"{error_msg}\n{stack_trace}"
+    return f"{error_msg}\\n{stack_trace}"
 
 
 def safe_execute(func: Callable[..., T], 

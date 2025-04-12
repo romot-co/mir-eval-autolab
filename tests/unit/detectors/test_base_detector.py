@@ -5,13 +5,26 @@ import abc
 # テスト対象のベースクラスをインポート
 try:
     from src.detectors.base_detector import BaseDetector
-except ImportError:
-    pytest.skip("Skipping base_detector tests due to missing src modules", allow_module_level=True)
-    # Dummy BaseDetector with ABCMeta if needed for static analysis
+    SKIP_TESTS = False
+except ImportError as e:
+    print(f"Skipping base_detector tests due to import error: {e}")
+    SKIP_TESTS = True
+    # Dummy BaseDetector with ABCMeta for testing
     class BaseDetector(metaclass=abc.ABCMeta):
+        """ベース検出器のモック用抽象クラス"""
+        name = "BaseDetector"
+        version = "0.0.1"
+        
+        def __init__(self):
+            pass
+            
         @abc.abstractmethod
         def detect(self, audio_data, sample_rate):
-            raise NotImplementedError
+            """音声データから検出を行う抽象メソッド"""
+            raise NotImplementedError("Subclasses must implement detect()")
+
+# テスト実行をスキップするかどうかの設定
+pytestmark = pytest.mark.skipif(SKIP_TESTS, reason="必要なモジュールがインポートできませんでした")
 
 # --- Test BaseDetector Abstractness ---
 

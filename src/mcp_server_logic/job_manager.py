@@ -17,11 +17,12 @@ from . import db_utils, utils
 # from .core import active_jobs # core から移動
 from src.utils.json_utils import NumpyEncoder # JSONエンコーダー (旧 JsonNumpyEncoder)
 # StateManagementError をインポート
-from src.utils.exception_utils import StateManagementError, log_exception
+from src.utils.exception_utils import StateManagementError, log_exception, FileError, ConfigError
 from .schemas import JobInfo, JobStatus, ErrorDetails # schemas をインポート
 from . import schemas # schemas モジュール自体を追加でインポート
 from src.utils.misc_utils import generate_id, get_timestamp # 変更後
 from . import session_manager # ★ 追加: セッションステータス更新用
+from src.utils.path_utils import validate_path_within_allowed_dirs, get_workspace_dir # パス検証用に追加
 
 logger = logging.getLogger('mcp_server.job_manager')
 
@@ -76,6 +77,23 @@ def _db_row_to_jobinfo(row: Dict[str, Any]) -> JobInfo:
 async def job_worker(worker_id: int, config: Dict[str, Any], db_path: Path):
     """ジョブキューからタスクを取得して実行するワーカ"""
     logger.info(f"Job worker {worker_id} started.")
+    
+    # ワーカー起動時にDBパスを検証
+    try:
+        workspace_dir = get_workspace_dir(config)
+        validated_db_path = validate_path_within_allowed_dirs(
+            db_path,
+            allowed_base_dirs=[workspace_dir],
+            check_existence=True,
+            check_is_file=True,
+            allow_absolute=True
+        )
+        db_path = validated_db_path
+        logger.debug(f"Worker {worker_id}: Validated DB path: {db_path}")
+    except (ConfigError, FileError, ValueError) as e:
+        logger.critical(f"Worker {worker_id}: Failed to validate DB path: {e}. Worker cannot start.")
+        return  # ワーカーを終了
+    
     while True:
         try:
             job_id, task_coro_func, args, kwargs = await job_queue.get()
@@ -266,6 +284,28 @@ async def start_async_job(
     """非同期ジョブを開始し、DBに登録してキューに入れる"""
     job_id = generate_id("job")
     current_time = get_timestamp()
+    
+    # DBパスの検証
+    try:
+        # ワークスペースディレクトリを取得
+        workspace_dir = get_workspace_dir(config)
+        # DBパスが許可されたディレクトリ内にあることを検証
+        validated_db_path = validate_path_within_allowed_dirs(
+            db_path,
+            allowed_base_dirs=[workspace_dir],
+            check_existence=True,  # DBファイルが存在することを確認
+            check_is_file=True,    # ファイルであることを確認
+            allow_absolute=True    # 絶対パスを許可
+        )
+        # 検証済みパスを使用
+        db_path = validated_db_path
+    except (ConfigError, FileError, ValueError) as e:
+        logger.error(f"Failed to validate DB path for job {job_id}: {e}")
+        return {
+            "job_id": job_id, 
+            "status": "error", 
+            "message": f"Failed to validate DB path: {e}"
+        }
 
     # 引数をJSON文字列として保存 (デバッグ用)
     task_args_json = None
@@ -317,6 +357,36 @@ async def get_job_status(db_path: Path, job_id: str) -> JobInfo:
         logger.debug(f"Getting status for active job {job_id} from memory.")
         # メモリ上の JobInfo を返す (コピーを返すのが安全)
         return active_jobs[job_id].model_copy()
+
+    # DBパスの検証
+    try:
+        # configを引数で受け取っていないため、関数内でworkspace_dirを直接取得することはできない
+        # しかし、db_path自体が通常validate済みのパスが渡されることを前提に、簡易的な検証を行う
+        
+        # DBファイルが存在するか確認
+        if not db_path.exists():
+            logger.error(f"DB file does not exist: {db_path}")
+            return JobInfo(
+                job_id=job_id,
+                status=JobStatus.UNKNOWN,
+                error_details=ErrorDetails(message=f"DB file does not exist: {db_path}")
+            )
+            
+        # DBファイルがファイルであるか確認
+        if not db_path.is_file():
+            logger.error(f"DB path is not a file: {db_path}")
+            return JobInfo(
+                job_id=job_id,
+                status=JobStatus.UNKNOWN,
+                error_details=ErrorDetails(message=f"DB path is not a file: {db_path}")
+            )
+    except Exception as e:
+        logger.error(f"Failed to validate DB path for job status query: {e}", exc_info=True)
+        return JobInfo(
+            job_id=job_id,
+            status=JobStatus.UNKNOWN,
+            error_details=ErrorDetails(message=f"Failed to validate DB path: {e}", type=type(e).__name__)
+        )
 
     # DBから取得
     logger.debug(f"Getting status for job {job_id} from DB.")

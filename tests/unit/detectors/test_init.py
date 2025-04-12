@@ -16,13 +16,54 @@ try:
         _detector_registry # Accessing internal for testing registration
     )
     from src.utils.exception_utils import DetectorError, ConfigError
-except ImportError:
-    pytest.skip("Skipping detectors/__init__ tests due to missing src modules", allow_module_level=True)
+    SKIP_TESTS = False
+except ImportError as e:
+    print(f"Skipping detectors/__init__ tests due to import error: {e}")
+    SKIP_TESTS = True
     # Dummy classes for static analysis
-    class BaseDetector: pass
-    class DetectorError(Exception): pass
-    class ConfigError(Exception): pass
+    class BaseDetector:
+        """ベース検出器クラスのダミー実装"""
+        def __init__(self, **kwargs):
+            self.name = kwargs.get('name', 'DummyDetector')
+            self.version = kwargs.get('version', '0.0.1')
+
+    class DetectorError(Exception):
+        """検出器関連のエラー用例外クラス"""
+        pass
+    
+    class ConfigError(Exception):
+        """設定関連のエラー用例外クラス"""
+        pass
+    
+    # ダミー関数定義
+    def register_detector(detector_class):
+        """検出器をレジストリに登録するダミー関数"""
+        if not issubclass(detector_class, BaseDetector):
+            raise TypeError("Detector class must inherit from BaseDetector")
+        return True
+    
+    def load_detector_from_file(detector_file):
+        """ファイルから検出器をロードするダミー関数"""
+        if not Path(detector_file).exists():
+            raise DetectorError("Detector file not found")
+        return []
+    
+    def get_detector_class(detector_name):
+        """検出器クラスを取得するダミー関数"""
+        raise DetectorError(f"Detector class '{detector_name}' not found")
+    
+    def create_detector(detector_name, params=None):
+        """検出器インスタンスを作成するダミー関数"""
+        try:
+            detector_class = get_detector_class(detector_name)
+            return detector_class(**(params or {}))
+        except Exception as e:
+            raise DetectorError(f"Failed to instantiate detector class {detector_name}: {e}") from e
+    
     _detector_registry = {}
+
+# テスト実行をスキップするかどうかの設定
+pytestmark = pytest.mark.skipif(SKIP_TESTS, reason="必要なモジュールがインポートできませんでした")
 
 # --- Fixtures ---
 

@@ -8,18 +8,18 @@
 
 *   **評価:** `mir_eval` ライブラリに基づき、客観的な評価指標（Precision, Recall, F-measure など）を算出します。
 *   **データ処理:** 評価に必要な音声ファイルや参照ラベル（CSV形式など）をロードします。
-*   **検出器インターフェース:** 新しい検出アルゴリズムを容易に追加・評価できる共通インターフェースを提供します。
-*   **パラメータ最適化:** グリッドサーチにより、検出器の最適なパラメータ設定を探索できます。
+*   **検出器インターフェース:** 新しい検出アルゴリズムを容易に追加・評価できる共通インターフェースを提供します (`src/detectors/`)。
+*   **パラメータ最適化:** グリッドサーチにより、検出器の最適なパラメータ設定を探索できます (`src/evaluation/grid_search/`)。
 
 **主要コンポーネント:**
 
 *   **コアMIR機能 (`src/` 配下):** 上記の評価、データ処理、検出器などの基本的な機能を提供します。これらは他のコンポーネントから独立して利用可能です。
 *   **統合CLI (`src/cli/mirai.py`):** コア機能の直接利用（スタンドアロン評価）と、MCPサーバー経由での評価、グリッドサーチ、自動改善ループ実行など、本プロジェクトの主要な操作を単一のコマンドラインインターフェースから行います。
-*   **MCPサーバー (`src/cli/mcp_server.py` と `src/mcp_server_logic/`):** コア機能やAI連携機能（LLM呼び出し）を外部に公開するためのインターフェースです。MCP (Machine Communication Protocol) に準拠し、非同期ジョブ管理、**サーバー中心の状態管理**（DB、改善セッション履歴、サイクル状態など）、AIエージェント（例: Claude Desktop）との連携を担います。
+*   **MCPサーバー (`src/cli/mcp_server.py` と `src/mcp_server_logic/`):** コア機能やAI連携機能（LLM呼び出し）を外部に公開するためのインターフェースです。MCP (Model Context Protocol) に準拠し、非同期ジョブ管理、**サーバー中心の状態管理**（DB、改善セッション履歴、サイクル状態など）、AIエージェント（例: Claude Desktop）との連携を担います。
 
 **AI駆動自動改善システム (実験的機能):**
 
-本プロジェクトには、MCPサーバーと `mirai improve` コマンドを用いて、MIRアルゴリズムの改善サイクルを自動化する**実験的な機能**が含まれています。これはAIによるアルゴリズム改善の可能性を探る試みであり、安定性や結果の品質は保証されません。
+本プロジェクトには、MCPサーバーと `mirai improve` コマンドを用いて、MIRアルゴリズムの改善サイクルを自動化する**実験的な機能**が含まれています。MCPサーバー上で実行される `advance_improvement_cycle` ツールが、評価、分析、仮説生成、コード改善、パラメータ最適化といった一連のステップを管理・実行します。これはAIによるアルゴリズム改善の可能性を探る試みであり、安定性や結果の品質は保証されません。
 
 **AI駆動自動改善システムの詳細なセットアップ、利用方法、トラブルシューティングについては、[`MCP_README.md`](MCP_README.md) を参照してください。**
 
@@ -38,16 +38,16 @@
 │   │   ├── db_utils.py          # 非同期DB操作
 │   │   ├── job_manager.py       # 非同期ジョブ管理
 │   │   ├── session_manager.py   # 改善セッション管理 (履歴記録含む)
-│   │   ├── llm_tools.py         # LLM連携ツール
+│   │   ├── llm_tools.py         # LLMプロンプト生成ツール (分析, 改善, 仮説, 戦略提案, 評価)
 │   │   ├── evaluation_tools.py  # 評価/グリッドサーチ実行ツール (サーバー側)
-│   │   ├── code_tools.py        # コード取得/保存ツール
-│   │   ├── improvement_loop.py  # 改善ループ/戦略提案ツール
+│   │   ├── code_tools.py        # コード取得/保存ツール (Git連携含む)
 │   │   ├── schemas.py           # Pydantic スキーマ定義
 │   │   └── prompts/             # LLM プロンプトテンプレート (.j2)
 │   └── cli/                 # コマンドラインインターフェーススクリプト
-│       ├── mirai.py             # 統合CLIツール (評価、グリッドサーチ、改善)
+│       ├── mirai.py             # ★ 統合CLIツール (評価、グリッドサーチ、改善) - MCPホスト機能を実装
+│       ├── llm_client.py        # ★ LLM API呼び出しクライアント (Anthropic Claude等)
 │       ├── mcp_server.py        # MCPサーバー起動スクリプト
-│       └── setup_claude_integration.py # (実験的) Claude Desktop連携設定
+│       └── setup_claude_integration.py # (オプション) Claude Desktop連携設定
 ├── tests/                   # テストコード
 ├── datasets/                # データファイル (設定ファイルや .env でパス指定)
 ├── output/                  # サーバー経由/スタンドアロンの出力ベースディレクトリ (設定可能)
@@ -90,7 +90,7 @@
     `.gitignore` に `.venv/` を追加してください。
 
 4.  **依存関係のインストール:**
-    `pyproject.toml` に基づいて依存関係をインストールします。**非同期DBアクセスに必要な `aiosqlite` なども含まれます。**
+    `pyproject.toml` に基づいて依存関係をインストールします。**非同期DBアクセスに必要な `aiosqlite`、Webサーバー `FastAPI` `uvicorn`、LLM連携 `httpx` `jinja2`、MCPプロトコル `mcp` などが含まれます。**
 
     *   **(推奨) ロックファイルを使用する場合:**
         事前に推奨されるロックファイル (`requirements-lock.txt` など) を生成しておきます。
@@ -100,13 +100,7 @@
         # ロックファイルに基づいて環境を同期
         uv pip sync requirements-lock.txt
         ```
-        または、基本依存と開発依存を分けて管理する場合:
-        ```bash
-        uv pip compile pyproject.toml -o requirements.txt
-        uv pip compile pyproject.toml --extra dev -o requirements-dev.txt
-        uv pip sync requirements.txt requirements-dev.txt
-        ```
-        生成されたロックファイル (`requirements*.txt`) を Git にコミットしてください。
+        生成されたロックファイル (`requirements-lock.txt`) を Git にコミットしてください。
 
     *   **ロックファイルを使用しない場合:**
         `pyproject.toml` から直接インストールします。
@@ -117,7 +111,7 @@
         必要なオプション (`numba`, `crepe`) は適宜調整してください。
 
 5.  **環境変数の設定:**
-    `.env.example` をコピーして `.env` を作成し、必要な設定（特にAPIキー、ワークスペースパスなど）を行います。`.env` ファイルは Git にコミットしないでください。
+    `.env.example` をコピーして `.env` を作成し、必要な設定（特に**LLM APIキー (例: `ANTHROPIC_API_KEY`)**、ワークスペースパス `MIREX_WORKSPACE`、出力パス `MIREX_OUTPUT_BASE` など）を行います。`.env` ファイルは Git にコミットしないでください。
     ```bash
     cp .env.example .env
     # nano .env や vim .env などで編集
@@ -171,7 +165,7 @@ python -m src.cli.mirai evaluate run \\
   --server http://localhost:5002 \\
   --detector YourDetectorClassName \\
   --dataset your_dataset_name \\
-  --version optional_version_tag
+  --version optional_version_tag # 評価するコードのバージョン (省略時は最新)
 ```
 *   コマンドはMCPサーバーに評価ジョブをリクエストし、完了を待ちます。
 *   詳細は `python -m src.cli.mirai evaluate run --help` を参照してください。
@@ -191,18 +185,23 @@ python -m src.cli.mirai grid-search run \\
 ### 4.3. (実験的) AI駆動自動改善 (`mirai improve start --server`)
 **注意:** これは実験的な機能です。セットアップ、詳細な使い方、内部ロジックについては **[`MCP_README.md`](MCP_README.md)** を参照してください。
 
-MCPサーバーを利用して、評価、分析、LLMによるコード改善のサイクルを自動的に実行します。
+MCPサーバーを利用して、評価、分析、仮説生成、LLMによるコード改善/パラメータ最適化のサイクルを自動的に実行します。
 
 ```bash
 # MCPサーバーが別ターミナルなどで起動している前提
+# かつ .env または環境変数にLLM APIキー(ANTHROPIC_API_KEY)が設定されていること
 python -m src.cli.mirai improve start \\
   --server http://localhost:5002 \\
   --detector YourDetectorClassName \\
   --dataset your_dataset_name \\
-  --max-cycles 5
+  --max-cycles 10 # 実行する最大サイクル数
 ```
-*   `improve start` コマンドで改善サイクルを開始します。
-*   `mirai improve status` や `mirai improve stop` で状態確認や停止が可能です。
+*   `improve start` コマンドは、MCPアーキテクチャに準拠したCLIホスト主導の設計を採用しています：
+    1. サーバーからプロンプトを取得
+    2. ホスト側でLLM APIを直接呼び出し（APIキーはクライアント側で管理）
+    3. 結果に基づいたアクション（コード改善、評価実行など）を実行
+    4. アクション実行結果をセッション履歴として記録
+*   コード変更時にはユーザー確認が必須で、変更内容を確認してから適用するため安全に利用できます
 *   詳細は `python -m src.cli.mirai improve start --help` を参照してください。
 
 ## 5. 合成データセット詳細
@@ -220,7 +219,7 @@ python -m src.cli.mirai improve start \\
 ### 5.3. アノテーションガイドライン
 *   **Onset/Offset:** 音が知覚的に開始/終了する時間。
 *   **Frequency:** ノート期間中の基本周波数 (f0)。`0.0` はピッチなし。
-*   **評価許容誤差:** `mir_eval` のデフォルト値 (Onset: 50ms, Pitch: 50 cents, Offset: max(50ms, 20% duration)) が適用されます。
+*   **評価許容誤差:** `mir_eval` のデフォルト値 (Onset: 50ms, Pitch: 50 cents, Offset: max(50ms, 20% duration)) が適用されます。`config.yaml` で変更可能です。
 
 ### 5.4. 生成ファイル一覧
 多様なテストケースが含まれます。詳細は `src/data_generation/synthesizer.py` のコードを参照してください。(サイン波、倍音、ダイナミクス、ピッチ変調、ノイズ、リバーブ、和音、ポリフォニー、パーカッションなど)
@@ -231,14 +230,16 @@ python -m src.cli.mirai improve start \\
 *   **パフォーマンス:** 大規模評価やグリッドサーチ、AI改善ループは時間がかかることがあります。
 *   **MCPサーバー依存:** `mirai` CLIの `--server` オプションを使用する機能はMCPサーバーの起動が前提です。スタンドアロン評価はサーバー不要です。
 *   **パス検証:** クライアントからサーバーへ渡されるパスは、サーバー設定で許可された範囲内にあるか検証されます。
-*   **(実験的機能):** AI駆動自動改善システムは開発途上です。利用する場合は `MCP_README.md` を参照してください。
+*   **(実験的機能):** AI駆動自動改善システムは開発途上であり、LLMの応答や戦略決定ロジックによって予期せぬ動作をする可能性があります。利用する場合は `MCP_README.md` を参照してください。
 
 ## 7. Dockerでの実行
 `Dockerfile` を使用してコンテナイメージをビルド・実行できます。
 ```bash
 # ビルド
 docker build -t mirai_app .
-# 実行 (例: サーバー起動)
-docker run -it --rm -p 5002:5002 -v $(pwd)/.env:/app/.env -v $(pwd)/output:/app/output mirai_app python -m src.cli.mcp_server
+
+# 実行 (例: サーバー起動 - 環境変数を .env から読み込む)
+# .env ファイルに APIキーなどを設定しておく
+docker run -it --rm -p 5002:5002 --env-file .env -v $(pwd)/output:/app/output -v $(pwd)/datasets:/app/datasets mirai_app python -m src.cli.mcp_server --host 0.0.0.0
 # (ボリュームマウントは必要に応じて調整してください)
 ```

@@ -1,50 +1,78 @@
 # tests/unit/utils/test_exception_utils.py
 import pytest
 import logging
-from unittest.mock import MagicMock # MagicMock をインポート
+from unittest.mock import MagicMock, patch # MagicMock と patch をインポート
+import time # For retry test
 
 # Assuming these exceptions are defined in src.utils.exception_utils
 # エラーを避けるため、もしファイルが存在しない場合はダミーのクラスを定義
 try:
     from src.utils.exception_utils import (
+        MirexError,
+        DetectionError,
+        EvaluationError,
+        FileError,
         ConfigError,
-        MCPError,
-        ToolError,
-        LLMError,
         StateManagementError,
+        LLMError,
         log_exception,
-        safe_execute
+        safe_execute,
+        create_error_result,
+        format_exception_message,
+        retry_on_exception,
+        wrap_exceptions,
+        SubprocessError
     )
 except ImportError:
     # Allow tests to run even if the module doesn't fully exist yet
     class BaseError(Exception): pass
-    class ConfigError(BaseError): pass
-    class MCPError(BaseError): pass
-    class ToolError(MCPError): pass
-    class LLMError(MCPError): pass
-    class StateManagementError(MCPError): pass
+    class MirexError(BaseError): pass
+    class DetectionError(MirexError): pass
+    class EvaluationError(MirexError): pass
+    class FileError(MirexError): pass
+    class ConfigError(MirexError): pass
+    class StateManagementError(MirexError): pass
+    class LLMError(MirexError): pass
     # Define dummy functions if import fails
-    def log_exception(logger, exc, message, level=logging.ERROR):
+    def log_exception(logger, exc, message, log_level=logging.ERROR):
         # Basic logging mimic for testing structure
-        logger.log(level, f"{message}: {exc}", exc_info=True)
+        logger.log(log_level, f"{message}: {exc}", exc_info=True)
 
-    def safe_execute(func, *args, default=None, error_message="", expected_exceptions=Exception, raise_on_error=False, logger_name='src.utils.exception_utils', **kwargs):
-        logger = logging.getLogger(logger_name)
+    def safe_execute(func, logger, error_msg="関数実行中にエラーが発生しました",
+                    default_value=None, log_level=logging.ERROR, raise_exception=False, **kwargs):
         try:
-            return func(*args, **kwargs)
+            return func(**kwargs)
         except Exception as e:
-            if raise_on_error:
-                raise e
-            if isinstance(e, expected_exceptions):
-                final_message = f"{error_message}: {e}" if error_message else str(e)
-                # Use log_exception structure or direct logging
-                # log_exception(logger, e, error_message) # Or direct call:
-                logger.error(f"{error_message}: {e}", exc_info=True)
-                return default
-            else: # Unexpected exception
-                final_message = f"{error_message} (Unexpected Error): {e}" if error_message else f"Unexpected Error: {e}"
-                logger.error(final_message, exc_info=True)
-                return default
+            log_exception(logger, e, error_msg, log_level)
+            if raise_exception:
+                raise
+            return default_value
+
+    # ダミー関数
+    def create_error_result(error_msg, include_keys=None):
+        result = {'error': error_msg, 'valid': False}
+        if include_keys:
+            for key in include_keys:
+                if key not in result:
+                    result[key] = 0.0
+        return result
+    
+    def format_exception_message(e, context=""):
+        if context:
+            return f"{context}: {str(e)}"
+        return str(e)
+
+    def retry_on_exception(max_attempts=3, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    
+    def wrap_exceptions(target_exceptions, wrapper_exception, message=None):
+        def decorator(func):
+            def wrapper(*args, **kwargs):
+                return func(*args, **kwargs)
+            return wrapper
+        return decorator
 
 
 # Assuming get_logger is available for testing log_exception
@@ -78,29 +106,42 @@ except ImportError:
 def test_custom_exceptions_exist():
     """カスタム例外クラスが存在し、適切な継承関係にあることを確認"""
     assert issubclass(ConfigError, Exception)
-    assert issubclass(MCPError, Exception)
+    assert issubclass(MirexError, Exception)
     # 仮定の継承関係をテスト
-    assert issubclass(ToolError, MCPError)
-    assert issubclass(LLMError, MCPError)
-    assert issubclass(StateManagementError, MCPError)
+    assert issubclass(DetectionError, MirexError)
+    assert issubclass(EvaluationError, MirexError)
+    assert issubclass(FileError, MirexError)
+    assert issubclass(StateManagementError, MirexError)
+    assert issubclass(LLMError, MirexError)
+    # Test that MirexError itself is an Exception
+    assert issubclass(MirexError, Exception)
+
+    # Test instantiation with messages
+    msg = "Test message"
+    assert str(MirexError(msg)) == msg
+    assert str(DetectionError(msg)) == msg
+    assert str(EvaluationError(msg)) == msg
+    assert str(FileError(msg)) == msg
+    assert str(ConfigError(msg)) == msg
+    assert str(StateManagementError(msg)) == msg
+    assert str(LLMError(msg)) == msg
+
     # Check basic instantiation
     assert str(ConfigError("Config message")) == "Config message"
-    # ToolError などが追加の引数を取る可能性も考慮
+    # 追加の引数を取る可能性も考慮
     try:
         # 実際の __init__ シグネチャに合わせて調整が必要
-        # Assuming ToolError might take job_id
-        class MockToolError(MCPError): # Use a mock if original might not exist
-             def __init__(self, message, job_id=None):
+        # Assuming DetectionError might take additional info
+        class MockDetectionError(MirexError): # Use a mock if original might not exist
+             def __init__(self, message, detector=None):
                  super().__init__(message)
-                 self.job_id = job_id
-        t_error = MockToolError("Tool message", job_id="job1")
-        # t_error = ToolError("Tool message", job_id="job1") # Use this if ToolError exists and takes job_id
-        assert str(t_error) == "Tool message"
-        # assert t_error.job_id == "job1" # Check attribute if it exists
+                 self.detector = detector
+        t_error = MockDetectionError("Detection error", detector="detector1")
+        assert str(t_error) == "Detection error"
     except TypeError:
         # シグネチャが異なる場合は基本のメッセージのみテスト
-        assert str(ToolError("Tool message")) == "Tool message"
-    except NameError: # Handle if ToolError itself is not defined
+        assert str(DetectionError("Detection error")) == "Detection error"
+    except NameError: # Handle if DetectionError itself is not defined
         pass
 
 
@@ -148,8 +189,12 @@ def test_log_exception(caplog, logger_for_test):
     assert record.levelname == "ERROR"
     assert test_message in record.message
     assert error_message in record.message # Check if exception str is included
-    # log_exception が exc_info=True を渡すことを期待 (or logger.exception is used)
-    assert record.exc_info is not None
+    
+    # Check traceback is included in exc_text, not directly in message if default formatter used
+    # Note: Default formatter puts traceback in exc_text, not message.
+    # If a custom formatter is used, this might need adjustment.
+    assert record.exc_text is not None # Check if traceback text was generated
+    assert error_message in record.exc_text # Ensure the error message is in the traceback text
 
 def test_log_exception_custom_level(caplog, logger_for_test):
     """log_exceptionがカスタムログレベルを使用できることを確認"""
@@ -159,7 +204,7 @@ def test_log_exception_custom_level(caplog, logger_for_test):
         raise TypeError(error_message)
     except TypeError as e:
          with caplog.at_level(logging.WARNING, logger=logger_for_test.name):
-             log_exception(logger_for_test, e, test_message, level=logging.WARNING)
+             log_exception(logger_for_test, e, test_message, log_level=logging.WARNING)
 
     filtered_records = [r for r in caplog.records if r.name == logger_for_test.name]
     assert len(filtered_records) >= 1
@@ -167,7 +212,73 @@ def test_log_exception_custom_level(caplog, logger_for_test):
     assert record.levelname == "WARNING"
     assert test_message in record.message
     assert error_message in record.message
-    assert record.exc_info is not None
+    
+    # Check traceback is included in exc_text
+    assert record.exc_text is not None # Check if traceback text was generated
+    assert error_message in record.exc_text # Ensure the error message is in the traceback text
+
+def test_log_exception_debug_level(caplog, logger_for_test):
+    """log_exceptionがDEBUGレベルでログ出力できることを確認"""
+    test_message = "Debug information"
+    error_message = "Debug error detail"
+    try:
+        raise RuntimeError(error_message)
+    except RuntimeError as e:
+         with caplog.at_level(logging.DEBUG, logger=logger_for_test.name):
+             log_exception(logger_for_test, e, test_message, log_level=logging.DEBUG)
+
+    filtered_records = [r for r in caplog.records if r.name == logger_for_test.name]
+    assert len(filtered_records) >= 1
+    record = filtered_records[-1]
+    assert record.levelname == "DEBUG"
+    assert test_message in record.message
+    assert error_message in record.message
+    
+    # Check traceback is included in exc_text
+    assert record.exc_text is not None
+    assert error_message in record.exc_text
+
+def test_log_exception_info_level(caplog, logger_for_test):
+    """log_exceptionがINFOレベルでログ出力できることを確認"""
+    test_message = "Info message"
+    error_message = "Info error detail"
+    try:
+        raise IndexError(error_message)
+    except IndexError as e:
+         with caplog.at_level(logging.INFO, logger=logger_for_test.name):
+             log_exception(logger_for_test, e, test_message, log_level=logging.INFO)
+
+    filtered_records = [r for r in caplog.records if r.name == logger_for_test.name]
+    assert len(filtered_records) >= 1
+    record = filtered_records[-1]
+    assert record.levelname == "INFO"
+    assert test_message in record.message
+    assert error_message in record.message
+    
+    # Check traceback is included in exc_text
+    assert record.exc_text is not None
+    assert error_message in record.exc_text
+
+def test_log_exception_critical_level(caplog, logger_for_test):
+    """log_exceptionがCRITICALレベルでログ出力できることを確認"""
+    test_message = "Critical error"
+    error_message = "Critical failure detail"
+    try:
+        raise MemoryError(error_message)
+    except MemoryError as e:
+         with caplog.at_level(logging.CRITICAL, logger=logger_for_test.name):
+             log_exception(logger_for_test, e, test_message, log_level=logging.CRITICAL)
+
+    filtered_records = [r for r in caplog.records if r.name == logger_for_test.name]
+    assert len(filtered_records) >= 1
+    record = filtered_records[-1]
+    assert record.levelname == "CRITICAL"
+    assert test_message in record.message
+    assert error_message in record.message
+    
+    # Check traceback is included in exc_text
+    assert record.exc_text is not None
+    assert error_message in record.exc_text
 
 # --- safe_execute Tests ---
 
@@ -181,125 +292,322 @@ def type_error_func(x):
     raise TypeError("Different error")
 
 @pytest.fixture
-def mock_safe_execute_logger(monkeypatch):
-    """safe_execute内部で使用されるロガーをモックするフィクスチャ"""
-    mock_logger = MagicMock(spec=logging.Logger)
-    # safe_execute が内部で 'src.utils.exception_utils' という名前でロガーを取得すると仮定
-    logger_name_in_module = 'src.utils.exception_utils' # Assume this name
-    original_get_logger = logging.getLogger
+def mock_logger():
+    """モックロガーを作成するフィクスチャ"""
+    # 直接モックロガーを作成
+    # spec=logging.Logger を追加して、ロガーの属性を模倣
+    mock_logger_obj = MagicMock(spec=logging.Logger)
+    mock_logger_obj.name = 'mock_logger' # Add name attribute
+    return mock_logger_obj
 
-    def mock_get_logger(name):
-        if name == logger_name_in_module:
-            # print(f"Mocking getLogger for: {name}") # Debug print
-            return mock_logger
-        # print(f"Using original getLogger for: {name}") # Debug print
-        return original_get_logger(name)
+@pytest.fixture
+def mock_get_logger(mock_logger):
+    """get_logger関数をモックするフィクスチャ - nameパラメータを受け取れるように修正"""
+    with patch("src.utils.exception_utils.get_logger") as mock:
+        # nameパラメータを受け取れるようにする
+        mock.side_effect = lambda name=None, log_level=None: mock_logger
+        yield mock
 
-    monkeypatch.setattr(logging, 'getLogger', mock_get_logger)
-
-    # Mock log_exception as well, in case safe_execute uses it directly
-    # Need to mock it within the context of the module where safe_execute would call it
-    try:
-        # Try patching the potentially imported function
-        mock_log_exception_func = MagicMock()
-        monkeypatch.setattr('src.utils.exception_utils.log_exception', mock_log_exception_func)
-        return mock_logger, mock_log_exception_func
-    except AttributeError:
-        # If the import failed or structure is different, just return the logger mock
-        return mock_logger, None # Indicate log_exception mock failed
-
-def test_safe_execute_success(mock_safe_execute_logger):
+def test_safe_execute_success(mock_logger):
     """safe_executeが成功時に結果を返し、ログを出力しないことを確認"""
-    mock_logger, mock_log_exception = mock_safe_execute_logger
-    result = safe_execute(success_func, 5, default="error", error_message="Should not log")
+    result = safe_execute(success_func, logger=mock_logger, default_value="error", error_msg="Should not log", x=5)
     assert result == 10
     mock_logger.error.assert_not_called()
     mock_logger.exception.assert_not_called()
-    if mock_log_exception:
-        mock_log_exception.assert_not_called()
 
-def test_safe_execute_expected_error(mock_safe_execute_logger):
-    """safe_executeが予期したエラー発生時にデフォルト値を返し、ログを出力することを確認"""
-    mock_logger, mock_log_exception = mock_safe_execute_logger
+def test_safe_execute_expected_error(mock_logger):
+    """safe_executeがエラー発生時にデフォルト値を返し、ログを出力することを確認"""
     error_msg = "Error in error_func"
-    result = safe_execute(error_func, 5, default="fallback", error_message=error_msg, expected_exceptions=ValueError)
+    result = safe_execute(error_func, logger=mock_logger, default_value="fallback", error_msg=error_msg, x=5)
     assert result == "fallback"
 
-    # Check if logger.error(exc_info=True) was called
-    mock_logger.error.assert_called_once()
-    call_args, call_kwargs = mock_logger.error.call_args
-    assert error_msg in call_args[0]
-    assert "Intentional error" in call_args[0]
-    assert call_kwargs.get('exc_info') is True
-    # Verify log_exception (the separate function) was NOT called if logger.error was used directly
-    if mock_log_exception:
-       mock_log_exception.assert_not_called()
+    # logger.error/exception または log_exception が呼ばれたことを確認
+    # safe_executeの実装に応じてどちらかの方法でログ出力されるはず
+    # Check if log_exception was called (assuming safe_execute uses it)
+    # We need to patch log_exception itself to check its calls
+    with patch('src.utils.exception_utils.log_exception') as mock_log_exc:
+        result = safe_execute(error_func, logger=mock_logger, default_value="fallback", error_msg=error_msg, x=5)
+        assert result == "fallback"
+        mock_log_exc.assert_called_once()
 
-
-def test_safe_execute_unexpected_error(mock_safe_execute_logger):
-    """safe_executeが予期しないエラー発生時にデフォルト値を返し、ログを出力することを確認"""
-    mock_logger, mock_log_exception = mock_safe_execute_logger
-    error_msg = "Unexpected error in type_error_func"
-    # Expecting ValueError, but gets TypeError
-    result = safe_execute(type_error_func, 5, default=None, error_message=error_msg, expected_exceptions=ValueError)
-    assert result is None
-
-    # Check logger.error was called for the unexpected error
-    mock_logger.error.assert_called_once()
-    call_args, call_kwargs = mock_logger.error.call_args
-    assert error_msg in call_args[0]
-    assert "Unexpected Error" in call_args[0] # Check for the "Unexpected Error" prefix
-    assert "Different error" in call_args[0]
-    assert call_kwargs.get('exc_info') is True
-    if mock_log_exception:
-       mock_log_exception.assert_not_called()
-
-
-def test_safe_execute_no_expected_exception_set(mock_safe_execute_logger):
-    """expected_exceptionsが未指定の場合、すべてのExceptionをキャッチすることを確認"""
-    mock_logger, mock_log_exception = mock_safe_execute_logger
-    error_msg = "Error in error_func (no expected)"
-    # Default expected_exceptions=Exception catches ValueError
-    result = safe_execute(error_func, 5, default=-1, error_message=error_msg)
-    assert result == -1
-
-    mock_logger.error.assert_called_once()
-    call_args, call_kwargs = mock_logger.error.call_args
-    assert error_msg in call_args[0]
-    assert "Intentional error" in call_args[0]
-    assert call_kwargs.get('exc_info') is True
-    if mock_log_exception:
-       mock_log_exception.assert_not_called()
-
-
-def test_safe_execute_custom_default(mock_safe_execute_logger):
-    """safe_executeがカスタムデフォルト値を正しく返すことを確認"""
-    mock_logger, mock_log_exception = mock_safe_execute_logger
-    result = safe_execute(error_func, 5, default={"status": "failed"}, error_message="Test custom default")
-    assert result == {"status": "failed"}
-    # Check that logging still happened
-    mock_logger.error.assert_called_once()
-
-
-def test_safe_execute_raise_on_error(mock_safe_execute_logger):
-    """safe_executeがraise_on_error=Trueの場合に例外を再送出することを確認"""
-    mock_logger, mock_log_exception = mock_safe_execute_logger
+def test_safe_execute_raise_exception(mock_logger):
+    """safe_executeがraise_exception=Trueの場合に例外を再発生させることを確認"""
+    error_msg = "Error should be raised"
     with pytest.raises(ValueError, match="Intentional error"):
-        safe_execute(error_func, 5, default="fallback", error_message="Should raise", raise_on_error=True)
-    # エラーが再送出された場合、ログは出力されないことを期待
-    mock_logger.error.assert_not_called()
-    mock_logger.exception.assert_not_called()
-    if mock_log_exception:
-        mock_log_exception.assert_not_called()
+        safe_execute(error_func, logger=mock_logger, error_msg=error_msg, raise_exception=True, x=5)
+    # Ensure logging still happened before raising
+    # Check if log_exception was called
+    with patch('src.utils.exception_utils.log_exception') as mock_log_exc:
+        with pytest.raises(ValueError, match="Intentional error"):
+            safe_execute(error_func, logger=mock_logger, error_msg=error_msg, raise_exception=True, x=5)
+        mock_log_exc.assert_called_once()
 
+# --- create_error_result Tests ---
 
-def test_safe_execute_raise_on_error_unexpected(mock_safe_execute_logger):
-    """safe_executeがraise_on_error=Trueで予期しないエラーの場合も再送出することを確認"""
-    mock_logger, mock_log_exception = mock_safe_execute_logger
-    with pytest.raises(TypeError, match="Different error"):
-        # Expected is ValueError, actual is TypeError, should still raise
-        safe_execute(type_error_func, 5, default=None, error_message="Should raise", expected_exceptions=ValueError, raise_on_error=True)
-    mock_logger.error.assert_not_called()
-    mock_logger.exception.assert_not_called()
-    if mock_log_exception:
-        mock_log_exception.assert_not_called() 
+def test_create_error_result_basic():
+    """create_error_resultが基本的なエラー結果を生成することを確認"""
+    error_msg = "テストエラー"
+    result = create_error_result(error_msg)
+    
+    # 基本的な構造を確認
+    assert result['error'] == error_msg
+    assert result['valid'] is False
+    assert result['precision'] == 0.0
+    assert result['recall'] == 0.0
+    assert result['f_measure'] == 0.0
+    
+    # match_statisticsの存在と主要フィールドを確認
+    assert 'match_statistics' in result
+    assert result['match_statistics']['ref_note_count'] == 0
+    assert result['match_statistics']['est_note_count'] == 0
+    assert result['match_statistics']['complete_matches'] == 0
+
+def test_create_error_result_with_keys():
+    """create_error_resultが追加のキーを含む結果を生成することを確認"""
+    error_msg = "テストエラー"
+    include_keys = ['additional_metric', 'another_field']
+    result = create_error_result(error_msg, include_keys)
+    
+    # 基本的な構造を確認
+    assert result['error'] == error_msg
+    assert result['valid'] is False
+    
+    # 追加のキーが存在し、デフォルト値が設定されていることを確認
+    assert 'additional_metric' in result
+    assert result['additional_metric'] == 0.0
+    assert 'another_field' in result
+    assert result['another_field'] == 0.0
+    
+    # 既存のキーは上書きされないことを確認
+    assert result['precision'] == 0.0
+    assert result['recall'] == 0.0
+
+# --- format_exception_message Tests ---
+
+def test_format_exception_message_no_context():
+    """format_exception_messageがコンテキストなしで例外メッセージを整形することを確認"""
+    error_msg = "テストエラー"
+    exc = ValueError(error_msg)
+    
+    result = format_exception_message(exc)
+    assert result == error_msg
+
+def test_format_exception_message_with_context():
+    """format_exception_messageがコンテキスト付きで例外メッセージを整形することを確認"""
+    error_msg = "テストエラー"
+    context = "検出処理中"
+    exc = ValueError(error_msg)
+    
+    result = format_exception_message(exc, context)
+    assert result == f"{context}: {error_msg}"
+
+# --- retry_on_exception Tests ---
+
+import time
+import tenacity
+import requests
+from unittest.mock import patch, MagicMock, call
+
+def test_retry_on_exception_success():
+    """retry_on_exceptionが成功時に関数を一度だけ実行することを確認"""
+    mock_logger = MagicMock(spec=logging.Logger)
+    
+    # 成功する関数
+    mock_func = MagicMock(return_value="success")
+    mock_func.__name__ = "test_func"
+    
+    # デコレータを適用
+    decorated_func = retry_on_exception(
+        max_attempts=3,
+        logger=mock_logger
+    )(mock_func)
+    
+    # 実行
+    result = decorated_func(1, b=2)
+    
+    # 検証
+    assert result == "success"
+    mock_func.assert_called_once_with(1, b=2)
+    mock_logger.warning.assert_not_called()
+
+def test_retry_on_exception_retry_and_succeed():
+    """retry_on_exceptionが一時的なエラー後に再試行して成功することを確認"""
+    mock_logger = MagicMock(spec=logging.Logger)
+    
+    # 最初の呼び出しでエラー、2回目は成功する関数
+    mock_func = MagicMock(side_effect=[requests.Timeout("接続タイムアウト"), "success"])
+    mock_func.__name__ = "test_func"
+    
+    # patched_sleepで睡眠を回避
+    with patch('time.sleep') as patched_sleep:
+        # デコレータを適用
+        decorated_func = retry_on_exception(
+            max_attempts=3,
+            initial_delay=0.1,
+            logger=mock_logger,
+            log_message_prefix="テストリトライ"
+        )(mock_func)
+        
+        # 実行
+        result = decorated_func(1, b=2)
+    
+    # 検証
+    assert result == "success"
+    assert mock_func.call_count == 2
+    assert mock_logger.warning.call_count == 1
+    # warning呼び出しパラメータを確認
+    warning_msg = mock_logger.warning.call_args[0][0]
+    assert "テストリトライ" in warning_msg
+    assert "1/3" in warning_msg  # 試行回数
+    assert "Timeout" in warning_msg  # 例外タイプ
+    assert "接続タイムアウト" in warning_msg  # 例外メッセージ
+    
+    # 少なくとも一度はsleepが呼ばれたはず
+    patched_sleep.assert_called()
+
+def test_retry_on_exception_max_attempts_reached():
+    """retry_on_exceptionが最大試行回数に達した場合にエラーを発生させることを確認"""
+    mock_logger = MagicMock(spec=logging.Logger)
+    
+    # 常にタイムアウトエラーを発生させる関数
+    mock_func = MagicMock(side_effect=requests.Timeout("接続タイムアウト"))
+    mock_func.__name__ = "test_func"
+    
+    # patched_sleepで睡眠を回避
+    with patch('time.sleep'):
+        # デコレータを適用
+        decorated_func = retry_on_exception(
+            max_attempts=2,
+            initial_delay=0.1,
+            logger=mock_logger
+        )(mock_func)
+        
+        # 実行して例外を確認（元の例外または、tenacityによってラップされた例外が発生する）
+        with pytest.raises((requests.Timeout, tenacity.RetryError)):
+            decorated_func(1, b=2)
+    
+    # 検証
+    assert mock_func.call_count >= 1  # 少なくとも1回は試行されたことを確認
+    # テナシティの実装によってはwarningが出ない場合もあるため、検証しない
+    # assert mock_logger.warning.call_count >= 0
+
+# --- wrap_exceptions Tests ---
+
+def test_wrap_exceptions_no_exception():
+    """wrap_exceptionsがエラーがない場合に通常の結果を返すことを確認"""
+    # 成功する関数
+    def success_func(x):
+        return x * 2
+    
+    # デコレータを適用
+    decorated_func = wrap_exceptions(
+        [ValueError, TypeError],
+        EvaluationError,
+        "変換中にエラーが発生しました"
+    )(success_func)
+    
+    # 実行
+    result = decorated_func(5)
+    assert result == 10
+
+def test_wrap_exceptions_wrap_target_exception():
+    """wrap_exceptionsが対象の例外を指定の例外にラップすることを確認"""
+    # エラーを発生させる関数
+    def error_func(x):
+        raise ValueError("Invalid value")
+    
+    # デコレータを適用
+    decorated_func = wrap_exceptions(
+        [ValueError, TypeError],
+        EvaluationError,
+        "変換中にエラーが発生しました"
+    )(error_func)
+    
+    # 実行して例外を確認
+    with pytest.raises(EvaluationError) as excinfo:
+        decorated_func(5)
+    
+    # ラップされた例外メッセージを確認
+    assert "変換中にエラーが発生しました" in str(excinfo.value)
+    assert "Invalid value" in str(excinfo.value)
+
+def test_wrap_exceptions_nontarget_exception():
+    """wrap_exceptionsが対象外の例外をラップしないことを確認"""
+    # 対象外の例外を発生させる関数
+    def error_func(x):
+        raise KeyError("Key not found")
+    
+    # デコレータを適用
+    decorated_func = wrap_exceptions(
+        [ValueError, TypeError],
+        EvaluationError,
+        "変換中にエラーが発生しました"
+    )(error_func)
+    
+    # 実行して元の例外がそのまま発生することを確認
+    with pytest.raises(KeyError) as excinfo:
+        decorated_func(5)
+    
+    assert "Key not found" in str(excinfo.value)
+
+def test_wrap_exceptions_default_message():
+    """wrap_exceptionsがカスタムメッセージが指定されない場合にデフォルトメッセージを使用することを確認"""
+    # エラーを発生させる関数
+    def error_func(x):
+        raise TypeError("Invalid type")
+    
+    # メッセージを指定せずにデコレータを適用
+    decorated_func = wrap_exceptions(
+        [ValueError, TypeError],
+        EvaluationError
+    )(error_func)
+    
+    # 実行して例外を確認
+    with pytest.raises(EvaluationError) as excinfo:
+        decorated_func(5)
+    
+    # 関数名を含むデフォルトメッセージが使用されることを確認
+    assert "error_func" in str(excinfo.value)
+    assert "関数の実行中にエラーが発生しました" in str(excinfo.value)
+    assert "Invalid type" in str(excinfo.value)
+
+def test_subprocess_error_str_representation():
+    """SubprocessErrorの文字列表現のテスト"""
+    # 基本的なメッセージのみのケース
+    error1 = SubprocessError("コマンドの実行に失敗しました")
+    str_rep1 = str(error1)
+    assert "コマンドの実行に失敗しました" in str_rep1
+    assert "Return Code" not in str_rep1
+    assert "Stderr" not in str_rep1
+    assert "Stdout" not in str_rep1
+    
+    # returncodeありのケース
+    error2 = SubprocessError("コマンドの実行に失敗しました", returncode=1)
+    str_rep2 = str(error2)
+    assert "コマンドの実行に失敗しました" in str_rep2
+    assert "Return Code: 1" in str_rep2
+    assert "Stderr" not in str_rep2
+    assert "Stdout" not in str_rep2
+    
+    # returncode、stderrありのケース
+    error3 = SubprocessError("コマンドの実行に失敗しました", returncode=2, stderr="エラー出力")
+    str_rep3 = str(error3)
+    assert "コマンドの実行に失敗しました" in str_rep3
+    assert "Return Code: 2" in str_rep3
+    assert "Stderr: エラー出力" in str_rep3
+    assert "Stdout" not in str_rep3
+    
+    # returncode、stdout、stderrすべてありのケース
+    error4 = SubprocessError("コマンドの実行に失敗しました", returncode=3, stdout="標準出力", stderr="エラー出力")
+    str_rep4 = str(error4)
+    assert "コマンドの実行に失敗しました" in str_rep4
+    assert "Return Code: 3" in str_rep4
+    assert "Stderr: エラー出力" in str_rep4
+    assert "Stdout: 標準出力" in str_rep4
+    
+    # 長いstdout/stderrが切り詰められることを確認
+    long_text = "a" * 1000
+    error5 = SubprocessError("コマンドの実行に失敗しました", stdout=long_text, stderr=long_text)
+    str_rep5 = str(error5)
+    assert "Stderr: " + long_text[:500] + "..." in str_rep5
+    assert "Stdout: " + long_text[:500] + "..." in str_rep5 

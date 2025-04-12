@@ -17,11 +17,41 @@ try:
         # Add other generate_* functions if they exist
     )
     from src.structures.note import Note # If Note is used in labels
-except ImportError:
-    pytest.skip("Skipping data_generation/synthesizer tests due to missing src modules", allow_module_level=True)
-    # Dummy classes/functions
-    class Note: pass
-    def midi_to_hz(midi_note): return 440.0 * (2 ** ((midi_note - 69) / 12.0))
+    SKIP_TESTS = False
+except ImportError as e:
+    print(f"Skipping data_generation/synthesizer tests due to import error: {e}")
+    SKIP_TESTS = True
+    # Dummy classes/functions for testing without actual implementation
+    class Note:
+        def __init__(self, start_time=0.0, end_time=1.0, pitch=60, velocity=80):
+            self.start_time = start_time
+            self.end_time = end_time
+            self.pitch = pitch
+            self.velocity = velocity
+    
+    # ダミー関数
+    def midi_to_hz(midi_note): 
+        return 440.0 * (2 ** ((midi_note - 69) / 12.0))
+    
+    def generate_adsr_envelope(total_samples, attack_time, decay_time, sustain_level, release_time, sample_rate):
+        return np.zeros(total_samples)
+    
+    def generate_sine_wave(frequency, duration, sample_rate, amplitude=0.5, phase=0.0):
+        return np.zeros(int(duration * sample_rate))
+    
+    def generate_silence(output_dir, file_index, instrument_name, duration, sample_rate):
+        pass
+    
+    def generate_fm_synth(output_dir, file_index, instrument_name, carrier_freq, 
+                         duration, sample_rate, amplitude=0.5, mod_freq=5.0, 
+                         mod_index=3.0, attack=0.1, decay=0.2):
+        pass
+    
+    def save_audio_and_label(output_dir, file_index, instrument_name, audio_data, labels, sample_rate):
+        pass
+
+# テスト実行をスキップするかどうかの設定
+pytestmark = pytest.mark.skipif(SKIP_TESTS, reason="必要なモジュールがインポートできませんでした")
 
 # --- Fixtures ---
 
@@ -61,7 +91,7 @@ def mock_open():
 ])
 def test_midi_to_hz(midi_note, expected_hz):
     """Tests the midi_to_hz conversion."""
-    assert np.isclose(synthesizer.midi_to_hz(midi_note), expected_hz)
+    assert np.isclose(midi_to_hz(midi_note), expected_hz)
 
 def test_generate_adsr_envelope():
     """Tests the ADSR envelope generation (basic checks)."""

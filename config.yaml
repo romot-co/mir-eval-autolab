@@ -46,6 +46,24 @@ resource_limits:
   # grid_search_timeout: 1800
   # job_timeout: 600 # server.job_timeout_seconds を使用
 
+# === 戦略と改善ループの設定 ===
+strategy:
+  # サイクル決定の閾値設定
+  param_opt_stagnation_threshold: 3 # パラメータ最適化を試みるまでの停滞サイクル数
+  llm_strategy_stagnation_threshold: 5 # LLM戦略提案を試みるまでの停滞サイクル数
+  use_llm_strategy: true # LLM戦略提案を使用するかどうか
+  
+  # 仮説生成設定
+  num_hypotheses: 3 # 生成する仮説の数
+  poor_performance_threshold: 0.5 # 性能が悪いと判断する閾値（これを下回ると仮説生成を優先）
+  
+  # LLMコンテキスト設定
+  history_events_for_summary: 20 # プロンプトに含める履歴イベント数
+
+# === 制限設定 ===
+limits:
+  max_history_events_per_session: 1000 # セッション履歴の最大イベント数
+
 # === クリーンアップ設定 ===
 cleanup:
   # 古いセッション・ジョブ、ワークスペースファイルの自動削除設定
@@ -70,6 +88,7 @@ cleanup:
 evaluation:
   default_dataset: synthesized_v1 # デフォルトで使用するデータセット名
   default_metrics: ["note.*", "onset.*"] # デフォルトで計算するメトリック
+  primary_metric: "note.f_measure" # 改善度判定に使用するプライマリメトリック
   save_plots: true
   save_results_json: true
   # 評価スクリプト固有の設定 (例: mir_eval の許容誤差など)
@@ -91,8 +110,9 @@ grid_search:
 llm:
   # クライアント設定 (環境変数での上書きを推奨)
   client_type: "ClaudeClient" # 使用するクライアントクラス (ClaudeClient, OpenAIClient)
-  # api_key: ${ANTHROPIC_API_KEY} # APIキー (環境変数 ANTHROPIC_API_KEY)
-  # api_key_openai: ${OPENAI_API_KEY} # OpenAI用 (環境変数 OPENAI_API_KEY)
+  # API キーはホスト側（CLI/GUI）で管理され、LLM との直接対話に使用されます
+  # api_key と api_key_openai は MCP サーバー側では不要になりました
+  # ホスト側では環境変数（ANTHROPIC_API_KEY/OPENAI_API_KEY）または設定ファイルで管理してください
   model: "claude-3-opus-20240229" # 使用するモデル名
   # --- Claude Specific --- #
   api_base: "https://api.anthropic.com"

@@ -4,14 +4,18 @@
 
 import typer
 from typing_extensions import Annotated
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union, List, Tuple
 import json
 import sys
 import logging
+import asyncio
+import re
+import difflib
 from pathlib import Path
 import yaml
 import traceback
 import time
+import os
 
 # --- MCP Client Imports ---
 from mcp import client as MCPClient
@@ -25,6 +29,7 @@ try:
     from src.utils.path_utils import get_project_root
     from src.utils.exception_utils import log_exception
     from src.utils.misc_utils import load_config_yaml
+    from src.cli.llm_client import initialize_llm_client, LLMClientError  # 新しいLLMクライアント
 except ImportError as e:
     print(f"Error importing core modules: {e}. Ensure PYTHONPATH is set correctly.", file=sys.stderr)
     sys.exit(1)
@@ -492,198 +497,896 @@ def improve(
     goal: Annotated[Optional[str], typer.Option("--goal", help="High-level goal for the improvement (e.g., 'Improve F1-score for onset detection').")] = None,
     session_id: Annotated[Optional[str], typer.Option("--session-id", help="Resume an existing improvement session.")] = None,
     # Client-side loop limit (safety net)
-    max_client_loops: Annotated[int, typer.Option("--max-loops", help="Maximum number of client-side polling loops (safety net).")] = 100,
+    max_cycles: Annotated[Optional[int], typer.Option("--max-cycles", help="Maximum number of improvement cycles.")] = 10,
+    # LLM関連オプション
+    llm_model: Annotated[Optional[str], typer.Option("--llm-model", help="LLM model to use (defaults to claude-3-opus-20240229)")] = "claude-3-opus-20240229",
+    api_key: Annotated[Optional[str], typer.Option("--api-key", help="LLM API key (if not specified, reads from environment variable)")] = None,
     # Server-side session parameters (passed during start_session)
-    max_cycles: Annotated[Optional[int], typer.Option("--max-cycles", help="Maximum number of improvement cycles (server-side limit).")] = None,
     improvement_threshold: Annotated[Optional[float], typer.Option("--threshold", help="Minimum F1-score improvement required to reset stagnation counter (server-side).")] = None,
     max_stagnation: Annotated[Optional[int], typer.Option("--max-stagnation", help="Stop if F1-score doesn't improve by the threshold for this many cycles (server-side).")] = None,
     session_timeout: Annotated[Optional[int], typer.Option("--session-timeout", help="Maximum duration for the entire improvement session in seconds (server-side).")] = None,
     # Polling options
     poll_interval: Annotated[int, typer.Option("--poll-interval", help="Interval (seconds) for polling session/job status.")] = DEFAULT_POLL_INTERVAL,
     job_timeout: Annotated[int, typer.Option("--job-timeout", help="Timeout (seconds) for waiting for individual improvement jobs.")] = DEFAULT_JOB_TIMEOUT,
+    # ユーザー確認オプション
+    always_confirm: Annotated[bool, typer.Option("--always-confirm", help="Always confirm before applying code changes.")] = True,
 ):
-    """Starts or resumes the automatic improvement loop via the MCP server."""
+    """CLIホストとして自動改善ループを制御します。LLMクライアントを使用してコード改善などを行います。"""
     logger = logging.getLogger(__name__)
-    client = get_mcp_client(server_url)
-
-    active_session_id = None
-
+    
+    # LLMクライアントのインポート (先ほど作成したモジュール)
     try:
-        # 1. Start or Resume Session
+        from src.cli.llm_client import initialize_llm_client, LLMClientError
+    except ImportError as e:
+        logger.error(f"Failed to import LLM client: {e}")
+        typer.echo(f"Error: LLM client module not found. Please ensure src/cli/llm_client.py exists.", err=True)
+        raise typer.Exit(code=1)
+    
+    # 非同期処理を実行するためのイベントループ取得
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        # イベントループがないので新しく作成
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    # MCP クライアント初期化
+    client = get_mcp_client(server_url)
+    
+    # セッション識別子
+    active_session_id = None
+    
+    try:
+        # 1. LLM クライアント初期化 (API キーは環境変数から自動取得)
+        logger.info(f"Initializing LLM client with model {llm_model}")
+        llm_client = loop.run_until_complete(
+            initialize_llm_client_async(api_key=api_key, model=llm_model)
+        )
+        
+        # 2. セッション開始または再開
         logger.info(f"{'Resuming' if session_id else 'Starting'} improvement session...")
-        start_session_input = {
-            "detector_name": detector_name,
-            "dataset_name": dataset_name,
-            "goal": goal,
-            "session_id": session_id, # None if starting new
-            # Pass server-side limits if provided
-            "session_config": {
-                key: val for key, val in {
-                    "max_cycles": max_cycles,
-                    "improvement_threshold": improvement_threshold,
-                    "max_stagnation": max_stagnation,
-                    "session_timeout": session_timeout
-                }.items() if val is not None
-            }
+        session_config = {
+            key: val for key, val in {
+                "max_cycles": max_cycles,
+                "improvement_threshold": improvement_threshold,
+                "max_stagnation": max_stagnation,
+                "session_timeout": session_timeout
+            }.items() if val is not None
         }
-        try:
-            session_info = client.start_session(**start_session_input)
-            active_session_id = session_info.get("session_id")
-            if not active_session_id:
-                logger.error("Failed to start/resume session: No session_id received.")
-                logger.error(f"Server response: {session_info}")
-                raise typer.Exit(code=1)
-            logger.info(f"Session {'resumed' if session_id else 'started'} successfully. Session ID: {active_session_id}")
-            print_session_summary(session_info) # Display initial/resumed state
-
-        except (ToolError, MCPError, Exception) as e:
-            log_exception(logger, e, "Failed to start or resume session")
-            typer.echo(f"Error communicating with server during session start: {e}", err=True)
-            raise typer.Exit(code=1)
-
-        # 2. Server-Driven Improvement Loop (Client-side polling)
-        loop_count = 0
-        while loop_count < max_client_loops:
-            loop_count += 1
-            logger.info(f"Client Loop #{loop_count}/{max_client_loops} - Checking session status ({active_session_id})...")
-
+        
+        start_session_input = {
+            "base_algorithm": detector_name,
+            "dataset_name": dataset_name,
+            "improvement_goal": goal,
+        }
+        
+        if session_id:
+            # 既存セッションの再開
             try:
-                # Get current session status from server
-                current_session_info = client.get_session_info(session_id=active_session_id)
-                session_status = current_session_info.get("status")
-                logger.info(f"Session Status: {session_status}")
-                print_session_summary(current_session_info) # Display current state
-
-                # Check for terminal states
+                session_info = client.get_session_info(session_id=session_id)
+                active_session_id = session_id
+                logger.info(f"Session {session_id} resumed successfully.")
+            except Exception as e:
+                logger.error(f"Failed to resume session {session_id}: {e}")
+                typer.echo(f"Error: Could not resume session {session_id}. {e}", err=True)
+                raise typer.Exit(code=1)
+        else:
+            # 新規セッション開始
+            try:
+                session_info = client.start_session(**start_session_input)
+                active_session_id = session_info.get("session_id")
+                if not active_session_id:
+                    logger.error("Failed to start session: No session_id received.")
+                    logger.error(f"Server response: {session_info}")
+                    raise typer.Exit(code=1)
+                logger.info(f"New session started. Session ID: {active_session_id}")
+            except Exception as e:
+                logger.error(f"Failed to start new session: {e}")
+                typer.echo(f"Error: Could not start new session. {e}", err=True)
+                raise typer.Exit(code=1)
+        
+        # 初期セッション情報の表示
+        print_session_summary(session_info)
+        
+        # 3. 改善ループ (CLI主導)
+        cycle_count = 0
+        while cycle_count < max_cycles:
+            cycle_count += 1
+            logger.info(f"Starting improvement cycle {cycle_count}/{max_cycles}")
+            
+            # セッション情報の取得
+            try:
+                session_info = client.get_session_info(session_id=active_session_id)
+                session_status = session_info.get("status")
+                
+                # 終了条件のチェック
                 if session_status in ["completed", "failed", "stopped", "timed_out"]:
-                    logger.info(f"Improvement loop finished with status: {session_status}")
-                    break # Exit the client polling loop
-
-                # If session is active/running, trigger the next server-side step
-                if session_status in ["active", "running", "needs_action", "needs_initial_evaluation"]: # Add other relevant states
-                    logger.info(f"Triggering next improvement step on server for session {active_session_id}...")
-                    try:
-                        # Call the server-side tool to advance the cycle
-                        # TOOL NAME NEEDS TO BE CONFIRMED/IMPLEMENTED ON SERVER
-                        advance_tool_name = "advance_improvement_cycle" 
-                        job_start_result = client.run_tool(advance_tool_name, {"session_id": active_session_id})
-                        job_id = job_start_result.get("job_id")
-
-                        if not job_id:
-                            logger.error(f"Failed to start improvement job: No job_id received from server for tool '{advance_tool_name}'.")
-                            logger.error(f"Server response: {job_start_result}")
-                            # Consider this a session failure or retry?
-                            typer.echo(f"Error: Server did not start the improvement job. Check server logs.", err=True)
-                            # Attempt to mark session as failed on server?
-                            # client.stop_session(session_id=active_session_id, status="failed", reason="ClientError: Failed to start advance job")
-                            break # Exit loop on critical error
-
-                        logger.info(f"Improvement job started (Tool: {advance_tool_name}). Job ID: {job_id}. Waiting for completion...")
-
-                        # Wait for the job to complete
-                        final_job_info = poll_job_status(client, job_id, poll_interval=poll_interval, timeout=job_timeout)
-
-                        if final_job_info.get("status") == "failed":
-                            error_details = final_job_info.get("error_details", {})
-                            error_msg = error_details.get("message", "Improvement job failed")
-                            logger.error(f"Improvement job {job_id} failed: {error_msg}")
-                            typer.echo(f"Error: Improvement step failed on server. Check server logs (Session: {active_session_id}, Job: {job_id}).", err=True)
-                            # The session status should ideally be updated to 'failed' by the server upon job failure.
-                            # We break the client loop here.
-                            break
-                        elif final_job_info.get("status") == "completed":
-                             logger.info(f"Improvement job {job_id} completed. Fetching updated session status...")
-                             # The loop will continue and fetch the new status via get_session_info
-                        else:
-                             # Timeout or other unexpected status from poll_job_status
-                             logger.error(f"Polling for job {job_id} ended with unexpected status: {final_job_info.get('status')}")
-                             break # Exit loop
-
-                    except (ToolError, MCPError, TimeoutError, Exception) as job_err:
-                        log_exception(logger, job_err, f"Error during improvement step execution (Session: {active_session_id})")
-                        typer.echo(f"Error during server communication or job execution: {job_err}", err=True)
-                        # Attempt to stop session gracefully?
-                        # client.stop_session(session_id=active_session_id, status="failed", reason=f"ClientError: {job_err}")
-                        break # Exit loop on error
-                else:
-                    # Unknown or unexpected session status
-                    logger.warning(f"Unexpected session status '{session_status}' for session {active_session_id}. Stopping client loop.")
+                    logger.info(f"Session ended with status: {session_status}")
                     break
-
-            except (ToolError, MCPError, TimeoutError, Exception) as poll_err:
-                log_exception(logger, poll_err, f"Error polling session status (Session: {active_session_id})")
-                typer.echo(f"Error checking session status: {poll_err}", err=True)
-                break # Exit loop on error
-
-            # Wait before next poll
-            logger.debug(f"Waiting {poll_interval}s before next status check...")
-            time.sleep(poll_interval)
-
-        # Loop finished (completed, failed, stopped, or max_client_loops reached)
-        if loop_count >= max_client_loops:
-            logger.warning(f"Reached maximum client polling loops ({max_client_loops}). Stopping client. Session {active_session_id} might still be running on the server.")
-
-        logger.info("Fetching final session state...")
-        final_session_info = client.get_session_info(session_id=active_session_id)
-        print_session_summary(final_session_info)
-
+                
+                # サイクル状態の取得
+                cycle_state = session_info.get("cycle_state", {})
+                current_metrics = session_info.get("current_metrics", {})
+                best_metrics = session_info.get("best_metrics", {})
+                
+                logger.info(f"Current cycle state: {cycle_state}")
+                
+                # 次のアクションを決定
+                next_action = loop.run_until_complete(determine_next_action(
+                    loop, client, llm_client, 
+                    session_id=active_session_id, 
+                    session_info=session_info
+                ))
+                
+                logger.info(f"Next action determined: {next_action}")
+                
+                # アクションの実行
+                if next_action["action"] == "analyze_evaluation":
+                    loop.run_until_complete(execute_analyze_evaluation(
+                        loop, client, llm_client, 
+                        session_id=active_session_id,
+                        evaluation_results=current_metrics
+                    ))
+                
+                elif next_action["action"] == "generate_hypotheses":
+                    loop.run_until_complete(execute_generate_hypotheses(
+                        loop, client, llm_client,
+                        session_id=active_session_id,
+                        current_metrics=current_metrics,
+                        num_hypotheses=next_action.get("num_hypotheses", 3)
+                    ))
+                
+                elif next_action["action"] == "improve_code":
+                    # 現在のコードを取得
+                    code_info = client.get_code(
+                        detector_name=detector_name,
+                        version=cycle_state.get("last_code_version")
+                    )
+                    current_code = code_info.get("code", "")
+                    
+                    # コード改善プロンプトを生成
+                    suggestion = next_action.get("suggestion", "Improve the code based on the evaluation results.")
+                    loop.run_until_complete(execute_improve_code(
+                        loop, client, llm_client,
+                        session_id=active_session_id,
+                        detector_name=detector_name,
+                        code=current_code,
+                        suggestion=suggestion,
+                        always_confirm=always_confirm
+                    ))
+                
+                elif next_action["action"] == "run_evaluation":
+                    loop.run_until_complete(execute_run_evaluation(
+                        loop, client,
+                        session_id=active_session_id,
+                        detector_name=detector_name,
+                        dataset_name=dataset_name,
+                        code_version=next_action.get("code_version")
+                    ))
+                
+                elif next_action["action"] == "optimize_parameters":
+                    loop.run_until_complete(execute_optimize_parameters(
+                        loop, client, llm_client,
+                        session_id=active_session_id,
+                        detector_name=detector_name,
+                        current_metrics=current_metrics
+                    ))
+                
+                elif next_action["action"] == "stop":
+                    logger.info("Stopping improvement loop as suggested by strategy.")
+                    break
+                
+                else:
+                    logger.warning(f"Unknown action: {next_action['action']}. Skipping.")
+                
+                # ユーザーキャンセルの確認 (オプション)
+                if typer.confirm("Continue to next step?", default=True):
+                    logger.info("Continuing to next step.")
+                else:
+                    logger.info("User requested to stop the improvement loop.")
+                    break
+            
+            except Exception as e:
+                logger.error(f"Error in improvement cycle {cycle_count}: {e}", exc_info=True)
+                typer.echo(f"Error in improvement cycle {cycle_count}: {e}", err=True)
+                # エラーの場合、続行するか確認
+                if typer.confirm("An error occurred. Continue with next cycle?", default=False):
+                    logger.info("Continuing to next cycle despite error.")
+                    continue
+                else:
+                    logger.info("User requested to stop after error.")
+                    break
+        
+        # ループ終了後の最終状態取得
+        try:
+            final_session_info = client.get_session_info(session_id=active_session_id)
+            logger.info("Final session state:")
+            print_session_summary(final_session_info)
+        except Exception as e:
+            logger.error(f"Failed to get final session state: {e}")
+    
     except typer.Exit:
-        # Handle exits gracefully (e.g., from get_mcp_client or start_session error)
+        # Handle exits gracefully
         raise
     except Exception as e:
-        # Catch-all for unexpected errors in the main logic
-        log_exception(logger, e, f"Unexpected error in improve command (Session: {active_session_id or 'N/A'})")
+        # Catch-all for unexpected errors
+        logger.error(f"Unexpected error: {e}", exc_info=True)
         typer.echo(f"An unexpected error occurred: {e}", err=True)
         raise typer.Exit(code=1)
     finally:
-        # Optional: Clean up resources if needed
         logger.info("Exiting mirai improve command.")
 
-@improve_app.command("status", help="Get the status of an ongoing improvement session.")
-def improve_status(
-    server_url: Annotated[str, typer.Option("--server", "-s", help="URL of the MCP server.")],
-    session_id: Annotated[str, typer.Argument(help="The ID of the session to check.")],
-):
-    """Gets the status of a specific improvement session."""
-    logger = logging.getLogger(__name__)
-    client = get_mcp_client(server_url)
-    try:
-        session_info = client.get_session_info(session_id=session_id)
-        logger.info(f"Status for session {session_id}:")
-        print_session_summary(session_info)
-    except (ToolError, MCPError) as e:
-        log_exception(logger, e, f"Failed to get status for session {session_id}")
-        typer.echo(f"Error retrieving session status: {e}", err=True)
-        raise typer.Exit(code=1)
-    except Exception as e:
-        log_exception(logger, e, f"Unexpected error getting session status {session_id}")
-        typer.echo(f"An unexpected error occurred: {e}", err=True)
-        raise typer.Exit(code=1)
+# 以下、新しく追加する関数
 
-@improve_app.command("stop", help="Manually stop an ongoing improvement session.")
-def improve_stop(
-    server_url: Annotated[str, typer.Option("--server", "-s", help="URL of the MCP server.")],
-    session_id: Annotated[str, typer.Argument(help="The ID of the session to stop.")],
-):
-    """Manually stops a specific improvement session on the server."""
+async def initialize_llm_client_async(api_key: Optional[str] = None, model: str = "claude-3-opus-20240229"):
+    """LLMクライアントを非同期に初期化"""
+    from src.cli.llm_client import initialize_llm_client
+    return initialize_llm_client(api_key=api_key, model=model)
+
+async def determine_next_action(loop, client, llm_client, session_id: str, session_info: Dict[str, Any]) -> Dict[str, Any]:
+    """次のアクションを決定する
+    
+    ホスト側で戦略決定を行う重要な関数。セッション状態に基づいて次のアクションを決定します。
+    """
     logger = logging.getLogger(__name__)
-    client = get_mcp_client(server_url)
+    
+    # セッション状態の取得
+    cycle_state = session_info.get("cycle_state", {})
+    current_metrics = session_info.get("current_metrics", {})
+    cycle_count = cycle_state.get("cycle_count", 0)
+    
+    # 特定の状態での判断
+    if cycle_count == 0 or not current_metrics:
+        # 初期サイクルまたはメトリクスがない場合は評価実行
+        logger.info("Initial cycle or no metrics available. Suggesting evaluation.")
+        return {"action": "run_evaluation"}
+    
     try:
-        logger.info(f"Attempting to stop session {session_id}...")
-        # Assuming a 'stop_session' tool exists on the server
-        stop_result = client.stop_session(session_id=session_id, status="stopped", reason="Manual stop requested by client")
-        logger.info(f"Stop request sent for session {session_id}.")
-        logger.debug(f"Server response: {stop_result}")
-        typer.echo(f"Stop request sent for session {session_id}. Use 'improve status' to check final state.")
-        # Optionally, poll get_session_info until status is 'stopped'?
-    except (ToolError, MCPError) as e:
-        log_exception(logger, e, f"Failed to send stop request for session {session_id}")
-        typer.echo(f"Error sending stop request: {e}", err=True)
-        raise typer.Exit(code=1)
+        # 戦略提案をサーバーに依頼
+        job_result = client.run_tool("get_suggest_exploration_strategy_prompt", {"session_id": session_id})
+        job_id = job_result.get("job_id")
+        
+        if not job_id:
+            logger.error("No job_id received from get_suggest_exploration_strategy_prompt.")
+            # フォールバック戦略
+            return {"action": "improve_code", "suggestion": "Improve the overall performance."}
+        
+        # ジョブ完了を待つ
+        job_info = await loop.run_in_executor(
+            None, lambda: poll_job_status(client, job_id)
+        )
+        
+        if job_info.get("status") != "completed":
+            logger.error("Strategy suggestion prompt generation failed.")
+            # フォールバック戦略
+            return {"action": "analyze_evaluation", "evaluation_results": current_metrics}
+        
+        # プロンプトの取得
+        prompt = job_info.get("result", {}).get("prompt", "")
+        if not prompt:
+            logger.error("No prompt received from strategy suggestion.")
+            return {"action": "analyze_evaluation"}
+        
+        # LLMによる戦略提案
+        strategy_json = await llm_client.generate(prompt, request_json=True)
+        logger.debug(f"LLM strategy response: {strategy_json}")
+        
+        # JSONのパース
+        strategy = json.loads(strategy_json)
+        
+        # 戦略からアクション取得
+        action = strategy.get("action", "improve_code")
+        reasoning = strategy.get("reasoning", "No reasoning provided.")
+        parameters = strategy.get("parameters", {})
+        
+        logger.info(f"Strategy suggests action: {action}")
+        logger.info(f"Reasoning: {reasoning}")
+        
+        # アクションと付加情報を返す
+        result = {"action": action}
+        result.update(parameters)
+        return result
+        
     except Exception as e:
-        log_exception(logger, e, f"Unexpected error stopping session {session_id}")
-        typer.echo(f"An unexpected error occurred: {e}", err=True)
-        raise typer.Exit(code=1)
+        logger.error(f"Error determining next action: {e}", exc_info=True)
+        # エラー時のフォールバック戦略
+        if cycle_count % 2 == 0:
+            return {"action": "improve_code", "suggestion": "Fix any issues and improve performance."}
+        else:
+            return {"action": "run_evaluation"}
+
+async def execute_analyze_evaluation(loop, client, llm_client, session_id: str, evaluation_results: Dict[str, Any]):
+    """評価結果の分析を実行"""
+    logger = logging.getLogger(__name__)
+    
+    try:
+        # 評価分析プロンプトを生成
+        job_result = client.run_tool("get_analyze_evaluation_prompt", {
+            "session_id": session_id,
+            "evaluation_results": evaluation_results
+        })
+        
+        job_id = job_result.get("job_id")
+        if not job_id:
+            logger.error("No job_id received from get_analyze_evaluation_prompt.")
+            return False
+        
+        # ジョブ完了を待つ
+        job_info = await loop.run_in_executor(
+            None, lambda: poll_job_status(client, job_id)
+        )
+        
+        if job_info.get("status") != "completed":
+            logger.error("Analyze evaluation prompt generation failed.")
+            return False
+        
+        # プロンプトの取得
+        prompt = job_info.get("result", {}).get("prompt", "")
+        if not prompt:
+            logger.error("No prompt received for analysis.")
+            return False
+        
+        # LLMによる分析
+        analysis_json = await llm_client.generate(prompt, request_json=True)
+        logger.debug(f"LLM analysis response: {analysis_json}")
+        
+        # 分析結果を表示
+        try:
+            analysis = json.loads(analysis_json)
+            typer.echo("\n=== Evaluation Analysis ===")
+            typer.echo(f"Overall Summary: {analysis.get('overall_summary', 'No summary available.')}")
+            
+            strengths = analysis.get('strengths', [])
+            if strengths:
+                typer.echo("\nStrengths:")
+                for strength in strengths:
+                    typer.echo(f"- {strength}")
+            
+            weaknesses = analysis.get('weaknesses', [])
+            if weaknesses:
+                typer.echo("\nWeaknesses:")
+                for weakness in weaknesses:
+                    typer.echo(f"- {weakness}")
+            
+            next_steps = analysis.get('potential_next_steps', [])
+            if next_steps:
+                typer.echo("\nPotential Next Steps:")
+                for step in next_steps:
+                    typer.echo(f"- {step}")
+            
+            typer.echo("===========================\n")
+        except json.JSONDecodeError:
+            typer.echo("\n=== Evaluation Analysis ===")
+            typer.echo(analysis_json)
+            typer.echo("===========================\n")
+        
+        # 分析結果を履歴として記録
+        client.add_session_history(
+            session_id=session_id,
+            event_type="analysis_complete",
+            data={"analysis": json.loads(analysis_json) if isinstance(analysis_json, str) else analysis_json},
+            cycle_state_update={"last_analysis": json.loads(analysis_json) if isinstance(analysis_json, str) else analysis_json}
+        )
+        
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error executing analysis: {e}", exc_info=True)
+        return False
+
+async def execute_generate_hypotheses(loop, client, llm_client, session_id: str, current_metrics: Dict[str, Any], num_hypotheses: int = 3):
+    """改善仮説の生成を実行"""
+    logger = logging.getLogger(__name__)
+    
+    try:
+        # 仮説生成プロンプトを取得
+        job_result = client.run_tool("get_generate_hypotheses_prompt", {
+            "session_id": session_id,
+            "num_hypotheses": num_hypotheses,
+            "current_metrics": current_metrics
+        })
+        
+        job_id = job_result.get("job_id")
+        if not job_id:
+            logger.error("No job_id received from get_generate_hypotheses_prompt.")
+            return False
+        
+        # ジョブ完了を待つ
+        job_info = await loop.run_in_executor(
+            None, lambda: poll_job_status(client, job_id)
+        )
+        
+        if job_info.get("status") != "completed":
+            logger.error("Generate hypotheses prompt generation failed.")
+            return False
+        
+        # プロンプトの取得
+        prompt = job_info.get("result", {}).get("prompt", "")
+        if not prompt:
+            logger.error("No prompt received for hypotheses generation.")
+            return False
+        
+        # LLMによる仮説生成
+        hypotheses_json = await llm_client.generate(prompt, request_json=True)
+        logger.debug(f"LLM hypotheses response: {hypotheses_json}")
+        
+        # 仮説を表示
+        try:
+            hypotheses_data = json.loads(hypotheses_json)
+            typer.echo("\n=== Improvement Hypotheses ===")
+            
+            hypotheses = hypotheses_data.get('hypotheses', [])
+            if isinstance(hypotheses, list):
+                for i, hypothesis in enumerate(hypotheses, 1):
+                    if isinstance(hypothesis, str):
+                        typer.echo(f"{i}. {hypothesis}")
+                    elif isinstance(hypothesis, dict) and 'description' in hypothesis:
+                        typer.echo(f"{i}. {hypothesis['description']}")
+            
+            typer.echo("==============================\n")
+        except json.JSONDecodeError:
+            typer.echo("\n=== Improvement Hypotheses ===")
+            typer.echo(hypotheses_json)
+            typer.echo("==============================\n")
+        
+        # 仮説を履歴として記録
+        client.add_session_history(
+            session_id=session_id,
+            event_type="hypotheses_generated",
+            data={"hypotheses": json.loads(hypotheses_json) if isinstance(hypotheses_json, str) else hypotheses_json},
+            cycle_state_update={"last_hypotheses": json.loads(hypotheses_json) if isinstance(hypotheses_json, str) else hypotheses_json}
+        )
+        
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error generating hypotheses: {e}", exc_info=True)
+        return False
+
+async def execute_improve_code(loop, client, llm_client, session_id: str, detector_name: str, code: str, suggestion: str, always_confirm: bool = True):
+    """コード改善を実行"""
+    logger = logging.getLogger(__name__)
+    
+    try:
+        # コード改善プロンプトを生成
+        job_result = client.run_tool("get_improve_code_prompt", {
+            "session_id": session_id,
+            "code": code,
+            "suggestion": suggestion
+        })
+        
+        job_id = job_result.get("job_id")
+        if not job_id:
+            logger.error("No job_id received from get_improve_code_prompt.")
+            return False
+        
+        # ジョブ完了を待つ
+        job_info = await loop.run_in_executor(
+            None, lambda: poll_job_status(client, job_id)
+        )
+        
+        if job_info.get("status") != "completed":
+            logger.error("Improve code prompt generation failed.")
+            return False
+        
+        # プロンプトの取得
+        prompt = job_info.get("result", {}).get("prompt", "")
+        if not prompt:
+            logger.error("No prompt received for code improvement.")
+            return False
+        
+        # LLMによるコード改善
+        llm_response = await llm_client.generate(prompt)
+        logger.debug(f"LLM code response length: {len(llm_response)}")
+        
+        # コードの抽出
+        improved_code = await llm_client.extract_code_from_text(llm_response)
+        if not improved_code:
+            logger.error("Failed to extract code from LLM response.")
+            return False
+        
+        # コードの差分表示 (difflib)
+        diff = difflib.unified_diff(
+            code.splitlines(),
+            improved_code.splitlines(),
+            fromfile=f'original_{detector_name}.py',
+            tofile=f'improved_{detector_name}.py',
+            lineterm=''
+        )
+        
+        # 差分の表示
+        typer.echo("\n=== Code Improvement ===")
+        typer.echo(f"Suggestion: {suggestion}")
+        typer.echo("\nChanges:")
+        for line in diff:
+            if line.startswith('+'):
+                typer.echo(typer.style(line, fg=typer.colors.GREEN))
+            elif line.startswith('-'):
+                typer.echo(typer.style(line, fg=typer.colors.RED))
+            else:
+                typer.echo(line)
+        typer.echo("========================\n")
+        
+        # ユーザー確認 (オプション)
+        if always_confirm:
+            if not typer.confirm("Apply these code changes?"):
+                logger.info("User rejected code changes.")
+                # 改善拒否を履歴に記録
+                client.add_session_history(
+                    session_id=session_id,
+                    event_type="code_improvement_rejected",
+                    data={"suggestion": suggestion},
+                    cycle_state_update={}
+                )
+                return False
+        
+        # コードの保存
+        save_result = client.run_tool("save_code", {
+            "detector_name": detector_name,
+            "code": improved_code,
+            "session_id": session_id,
+            "changes_summary": suggestion
+        })
+        
+        save_job_id = save_result.get("job_id")
+        if not save_job_id:
+            logger.error("No job_id received from save_code.")
+            return False
+        
+        # 保存ジョブ完了を待つ
+        save_job_info = await loop.run_in_executor(
+            None, lambda: poll_job_status(client, save_job_id)
+        )
+        
+        if save_job_info.get("status") != "completed":
+            logger.error("Save code failed.")
+            return False
+        
+        # 成功メッセージ
+        saved_version = save_job_info.get("result", {}).get("version", "unknown")
+        typer.echo(f"Code successfully saved as version: {saved_version}")
+        
+        # コード改善を履歴として記録 (すでにsave_codeで記録されている場合もあり)
+        try:
+            client.add_session_history(
+                session_id=session_id,
+                event_type="code_improvement_applied",
+                data={"suggestion": suggestion, "version": saved_version},
+                cycle_state_update={"last_code_version": saved_version, "needs_evaluation": True}
+            )
+        except Exception as hist_err:
+            logger.warning(f"Failed to add history for code improvement: {hist_err}")
+        
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error improving code: {e}", exc_info=True)
+        return False
+
+async def execute_run_evaluation(loop, client, session_id: str, detector_name: str, dataset_name: str, code_version: Optional[str] = None):
+    """評価を実行"""
+    logger = logging.getLogger(__name__)
+    
+    try:
+        # 評価ジョブを開始
+        eval_result = client.run_tool("run_evaluation", {
+            "detector_name": detector_name,
+            "dataset_name": dataset_name,
+            "code_version": code_version,
+            "session_id": session_id,
+            "save_plots": True
+        })
+        
+        eval_job_id = eval_result.get("job_id")
+        if not eval_job_id:
+            logger.error("No job_id received from run_evaluation.")
+            return False
+        
+        # 評価ジョブ完了を待つ
+        typer.echo("Running evaluation... This may take a while.")
+        with typer.progressbar(length=100, label="Evaluating") as progress:
+            # 進捗の表示 (本当の進捗ではなく時間ベース)
+            progress.update(10)
+            
+            eval_job_info = await loop.run_in_executor(
+                None, lambda: poll_job_status(client, eval_job_id)
+            )
+            
+            progress.update(100)
+        
+        if eval_job_info.get("status") != "completed":
+            logger.error("Evaluation failed.")
+            typer.echo("Evaluation failed.")
+            return False
+        
+        # 評価結果の取得
+        eval_results = eval_job_info.get("result", {})
+        
+        # 結果を表示
+        typer.echo("\n=== Evaluation Results ===")
+        metrics = eval_results.get("metrics", {})
+        
+        # F1スコアなどの主要メトリクスを表示
+        note_metrics = metrics.get("note", {})
+        if note_metrics:
+            typer.echo(f"Note F-measure: {note_metrics.get('f_measure', 'N/A'):.4f}")
+            typer.echo(f"Note Precision: {note_metrics.get('precision', 'N/A'):.4f}")
+            typer.echo(f"Note Recall: {note_metrics.get('recall', 'N/A'):.4f}")
+        
+        onset_metrics = metrics.get("onset", {})
+        if onset_metrics:
+            typer.echo(f"Onset F-measure: {onset_metrics.get('f_measure', 'N/A'):.4f}")
+        
+        typer.echo("=========================\n")
+        
+        # 評価結果を履歴として記録 (すでにrun_evaluationで記録されている場合もあり)
+        try:
+            client.add_session_history(
+                session_id=session_id,
+                event_type="evaluation_viewed",
+                data={"metrics": metrics},
+                cycle_state_update={"last_evaluation": metrics, "needs_evaluation": False, "needs_assessment": True}
+            )
+        except Exception as hist_err:
+            logger.warning(f"Failed to add history for evaluation view: {hist_err}")
+        
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error running evaluation: {e}", exc_info=True)
+        return False
+
+async def execute_optimize_parameters(loop, client, llm_client, session_id: str, detector_name: str, current_metrics: Dict[str, Any]):
+    """パラメータ最適化を実行"""
+    logger = logging.getLogger(__name__)
+    
+    try:
+        # 現在のコードを取得
+        code_info = client.get_code(detector_name=detector_name)
+        current_code = code_info.get("code", "")
+        
+        # パラメータ提案プロンプトを生成
+        job_result = client.run_tool("get_suggest_parameters_prompt", {
+            "session_id": session_id,
+            "detector_code": current_code,
+            "current_metrics": current_metrics
+        })
+        
+        job_id = job_result.get("job_id")
+        if not job_id:
+            logger.error("No job_id received from get_suggest_parameters_prompt.")
+            return False
+        
+        # ジョブ完了を待つ
+        job_info = await loop.run_in_executor(
+            None, lambda: poll_job_status(client, job_id)
+        )
+        
+        if job_info.get("status") != "completed":
+            logger.error("Parameter suggestion prompt generation failed.")
+            return False
+        
+        # プロンプトの取得
+        prompt = job_info.get("result", {}).get("prompt", "")
+        if not prompt:
+            logger.error("No prompt received for parameter suggestion.")
+            return False
+        
+        # LLMによるパラメータ提案
+        params_json = await llm_client.generate(prompt, request_json=True)
+        logger.debug(f"LLM parameters response: {params_json}")
+        
+        # パラメータ提案を表示
+        try:
+            params_data = json.loads(params_json)
+            typer.echo("\n=== Parameter Suggestions ===")
+            
+            parameters = params_data.get('parameters', [])
+            overall_rationale = params_data.get('overall_rationale', '')
+            
+            if overall_rationale:
+                typer.echo(f"Rationale: {overall_rationale}")
+            
+            typer.echo("\nSuggested Parameters:")
+            for param in parameters:
+                name = param.get('name', 'unknown')
+                current = param.get('current_value', 'N/A')
+                suggested_range = param.get('suggested_range', [])
+                suggested_values = param.get('suggested_values', [])
+                rationale = param.get('rationale', '')
+                
+                typer.echo(f"- {name}:")
+                typer.echo(f"  Current: {current}")
+                if suggested_range:
+                    typer.echo(f"  Suggested Range: {suggested_range}")
+                if suggested_values:
+                    typer.echo(f"  Suggested Values: {suggested_values}")
+                if rationale:
+                    typer.echo(f"  Rationale: {rationale}")
+            
+            typer.echo("=============================\n")
+        except json.JSONDecodeError:
+            typer.echo("\n=== Parameter Suggestions ===")
+            typer.echo(params_json)
+            typer.echo("=============================\n")
+        
+        # グリッドサーチを実行するか確認
+        if typer.confirm("Run grid search with these parameter suggestions?"):
+            # パラメータ提案からグリッドサーチ設定を生成
+            grid_config = create_grid_config_from_suggestions(detector_name, json.loads(params_json))
+            
+            # グリッドサーチを実行
+            grid_result = client.run_tool("run_grid_search", {
+                "grid_config": grid_config,
+                "session_id": session_id
+            })
+            
+            grid_job_id = grid_result.get("job_id")
+            if not grid_job_id:
+                logger.error("No job_id received from run_grid_search.")
+                return False
+            
+            # グリッドサーチジョブ完了を待つ
+            typer.echo("Running grid search... This may take a while.")
+            with typer.progressbar(length=100, label="Grid Search") as progress:
+                progress.update(10)
+                
+                grid_job_info = await loop.run_in_executor(
+                    None, lambda: poll_job_status(client, grid_job_id)
+                )
+                
+                progress.update(100)
+            
+            if grid_job_info.get("status") != "completed":
+                logger.error("Grid search failed.")
+                typer.echo("Grid search failed.")
+                return False
+            
+            # グリッドサーチ結果の取得
+            grid_results = grid_job_info.get("result", {})
+            
+            # 結果を表示
+            typer.echo("\n=== Grid Search Results ===")
+            typer.echo(f"Best Score: {grid_results.get('best_score', 'N/A')}")
+            typer.echo(f"Best Parameters: {grid_results.get('best_params', {})}")
+            typer.echo(f"Results CSV: {grid_results.get('results_csv_path', 'N/A')}")
+            typer.echo("==========================\n")
+            
+            # 最適パラメータでコードを更新するか確認
+            if typer.confirm("Apply best parameters to the detector code?"):
+                # パラメータを適用したコードを生成
+                updated_code = apply_parameters_to_code(current_code, grid_results.get('best_params', {}))
+                
+                # コードを保存
+                save_result = client.run_tool("save_code", {
+                    "detector_name": detector_name,
+                    "code": updated_code,
+                    "session_id": session_id,
+                    "changes_summary": f"Applied optimal parameters: {grid_results.get('best_params', {})}"
+                })
+                
+                save_job_id = save_result.get("job_id")
+                if not save_job_id:
+                    logger.error("No job_id received from save_code.")
+                    return False
+                
+                # 保存ジョブ完了を待つ
+                save_job_info = await loop.run_in_executor(
+                    None, lambda: poll_job_status(client, save_job_id)
+                )
+                
+                if save_job_info.get("status") != "completed":
+                    logger.error("Save code with optimized parameters failed.")
+                    return False
+                
+                # 成功メッセージ
+                saved_version = save_job_info.get("result", {}).get("version", "unknown")
+                typer.echo(f"Code with optimized parameters saved as version: {saved_version}")
+                
+                # パラメータ最適化を履歴として記録
+                client.add_session_history(
+                    session_id=session_id,
+                    event_type="parameters_optimized",
+                    data={"best_params": grid_results.get('best_params', {}), "version": saved_version},
+                    cycle_state_update={"last_code_version": saved_version, "needs_evaluation": True, "last_optimized_params": grid_results.get('best_params', {})}
+                )
+        
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error optimizing parameters: {e}", exc_info=True)
+        return False
+
+def create_grid_config_from_suggestions(detector_name: str, suggestion: Dict[str, Any]) -> Dict[str, Any]:
+    """パラメータ提案からグリッドサーチ設定を生成する"""
+    grid_config = {
+        "detector_name": detector_name,
+        "parameters": {}
+    }
+    
+    parameters = suggestion.get('parameters', [])
+    for param in parameters:
+        name = param.get('name')
+        if not name:
+            continue
+        
+        suggested_range = param.get('suggested_range', [])
+        suggested_values = param.get('suggested_values', [])
+        
+        if suggested_range and len(suggested_range) >= 2:
+            # 数値範囲の場合
+            min_val, max_val = suggested_range[0], suggested_range[-1]
+            param_type = param.get('type', '').lower()
+            
+            if param_type == 'int':
+                # 整数パラメータ
+                grid_config['parameters'][name] = {
+                    "min": int(min_val),
+                    "max": int(max_val),
+                    "num": min(10, int(max_val - min_val + 1)),  # 最大10点
+                    "log": False
+                }
+            elif param_type == 'float':
+                # 浮動小数点パラメータ
+                grid_config['parameters'][name] = {
+                    "min": float(min_val),
+                    "max": float(max_val),
+                    "num": 10,  # 10点
+                    "log": False
+                }
+        elif suggested_values:
+            # 離散値の場合
+            grid_config['parameters'][name] = {
+                "values": suggested_values
+            }
+    
+    return grid_config
+
+def apply_parameters_to_code(code: str, parameters: Dict[str, Any]) -> str:
+    """最適パラメータをコードに適用する"""
+    import re
+    
+    # コードの行リスト
+    lines = code.splitlines()
+    updated_lines = []
+    
+    # パラメータ変数の定義を探す
+    param_applied = set()
+    for line in lines:
+        applied = False
+        for param_name, param_value in parameters.items():
+            # 変数定義のパターン (例: threshold = 0.5)
+            pattern = r'^\s*(' + re.escape(param_name) + r')\s*=\s*([^#]*)'
+            match = re.match(pattern, line)
+            
+            if match and param_name not in param_applied:
+                # 変数定義を新しい値で置き換え
+                var_name = match.group(1)
+                before_comment = line.split('#', 1)[0]
+                after_comment = line.split('#', 1)[1] if '#' in line else ""
+                
+                # コメントがある場合は保持
+                if after_comment:
+                    updated_line = f"{var_name} = {param_value} # {after_comment}"
+                else:
+                    updated_line = f"{var_name} = {param_value}"
+                
+                updated_lines.append(updated_line)
+                param_applied.add(param_name)
+                applied = True
+                break
+        
+        if not applied:
+            updated_lines.append(line)
+    
+    # 適用されなかったパラメータを最後に追加
+    if param_applied != set(parameters.keys()):
+        updated_lines.append("\n# Optimized parameters")
+        for param_name, param_value in parameters.items():
+            if param_name not in param_applied:
+                updated_lines.append(f"{param_name} = {param_value}  # Added by parameter optimization")
+    
+    return "\n".join(updated_lines)
 
 def print_session_summary(session_data: Dict[str, Any]):
     """Helper function to print session summary information."""

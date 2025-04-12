@@ -5,6 +5,7 @@
 # ======= Generated Outputs & Data =======
 # ========================================
 /output/
+/uploads/
 # /mcp_workspace/ # Or /.mcp_server_data/ if renamed later
 /.mcp_server_data/
 

@@ -11,8 +11,9 @@ import aiosqlite # aiosqlite をインポート
 from mcp.server.fastmcp import FastMCP
 from . import db_utils, utils
 from src.utils.misc_utils import generate_id, get_timestamp
-from src.utils.exception_utils import StateManagementError, log_exception
+from src.utils.exception_utils import StateManagementError, log_exception, FileError, ConfigError
 from src.utils.json_utils import NumpyEncoder # NumpyEncoder をインポート
+from src.utils.path_utils import validate_path_within_allowed_dirs, get_workspace_dir # パス検証用に追加
 from pydantic import BaseModel
 from pydantic.error_wrappers import ValidationError
 from . import schemas # スキーマをインポート
@@ -26,6 +27,24 @@ DEFAULT_IMPROVEMENT_THRESHOLD = 0.05 # 改善とみなす閾値 (F値など)
 
 async def start_session(config: Dict[str, Any], db_path: Path, base_algorithm: str = "Unknown") -> schemas.SessionInfoResponse:
     """改善セッションを開始します。"""
+    # DBパスの検証
+    try:
+        # ワークスペースディレクトリを取得
+        workspace_dir = get_workspace_dir(config)
+        # DBパスが許可されたディレクトリ内にあることを検証
+        validated_db_path = validate_path_within_allowed_dirs(
+            db_path,
+            allowed_base_dirs=[workspace_dir],
+            check_existence=False,  # DBファイルが存在しない場合もある（初回実行時など）
+            check_is_file=None,     # 存在チェックを行わないため不要
+            allow_absolute=True     # 絶対パスを許可
+        )
+        # 検証済みパスを使用
+        db_path = validated_db_path
+    except (ConfigError, FileError, ValueError) as e:
+        logger.error(f"Failed to validate DB path for starting session: {e}")
+        raise StateManagementError(f"Failed to validate DB path: {e}") from e
+    
     session_id = generate_id()
     current_time = get_timestamp()
     initial_cycle_state_model = schemas.SessionCycleState()
@@ -64,6 +83,24 @@ async def start_session(config: Dict[str, Any], db_path: Path, base_algorithm: s
 
 async def get_session_info(config: Dict[str, Any], db_path: Path, session_id: str) -> schemas.SessionInfoResponse:
     """セッション情報を取得し、SessionInfoResponse スキーマで返します。"""
+    # DBパスの検証
+    try:
+        # ワークスペースディレクトリを取得
+        workspace_dir = get_workspace_dir(config)
+        # DBパスが許可されたディレクトリ内にあることを検証
+        validated_db_path = validate_path_within_allowed_dirs(
+            db_path,
+            allowed_base_dirs=[workspace_dir],
+            check_existence=True,  # DBファイルが存在することを確認
+            check_is_file=True,    # ファイルであることを確認
+            allow_absolute=True    # 絶対パスを許可
+        )
+        # 検証済みパスを使用
+        db_path = validated_db_path
+    except (ConfigError, FileError, ValueError) as e:
+        logger.error(f"Failed to validate DB path for session info retrieval: {e}")
+        raise StateManagementError(f"Failed to validate DB path: {e}") from e
+    
     row = None
     try:
         sql = """SELECT session_id, base_algorithm, start_time, last_update, status,
@@ -169,6 +206,24 @@ async def add_session_history(
         ValueError: If the session is not found or if event_data/cycle_state_update validation fails.
         StateManagementError: If a database error occurs.
     """
+    # DBパスの検証
+    try:
+        # ワークスペースディレクトリを取得
+        workspace_dir = get_workspace_dir(config)
+        # DBパスが許可されたディレクトリ内にあることを検証
+        validated_db_path = validate_path_within_allowed_dirs(
+            db_path,
+            allowed_base_dirs=[workspace_dir],
+            check_existence=True,  # DBファイルが存在することを確認
+            check_is_file=True,    # ファイルであることを確認
+            allow_absolute=True    # 絶対パスを許可
+        )
+        # 検証済みパスを使用
+        db_path = validated_db_path
+    except (ConfigError, FileError, ValueError) as e:
+        logger.error(f"Failed to validate DB path for session history: {e}")
+        raise StateManagementError(f"Failed to validate DB path: {e}") from e
+    
     current_timestamp = get_timestamp()
     validated_event_data_dict: Dict[str, Any]
     validated_update_dict: Optional[Dict[str, Any]] = None
@@ -279,19 +334,32 @@ async def add_session_history(
                 # Pydantic モデルのフィールドを直接更新
                 current_cycle_state_dict = current_cycle_state.model_dump() # 更新用に辞書に戻す
 
+                # Determine the primary metric for comparison
+                primary_metric_path = config.get('evaluation', {}).get('primary_metric', 'overall.f_measure')
+                primary_metric_keys = primary_metric_path.split('.') # e.g., ['overall', 'f_measure']
+
+                def get_metric_value(metrics_dict, keys):
+                    val = metrics_dict
+                    try:
+                        for key in keys:
+                            val = val[key]
+                        return float(val) if isinstance(val, (int, float)) else None
+                    except (KeyError, TypeError, ValueError):
+                        return None
+
                 if event_type == "evaluation_complete":
                     # validated_event_data_dict は EvaluationCompleteData.model_dump() のはず
-                    new_metrics = validated_event_data_dict.get("metrics", {}).get("overall")
-                    new_f_measure = new_metrics.get("f_measure") if new_metrics else None
+                    new_metrics = validated_event_data_dict.get("metrics", {})
+                    new_primary_metric_value = get_metric_value(new_metrics, primary_metric_keys)
                     new_code_version = validated_event_data_dict.get("code_version")
                     new_code_path = validated_event_data_dict.get("code_path")
 
-                    if new_f_measure is not None:
-                        current_best_f = current_best_metrics_dict.get("overall", {}).get("f_measure") if current_best_metrics_dict else None
-                        logger.info(f"Session {session_id}: New F1={new_f_measure:.4f}, Best F1={current_best_f or 'N/A'}")
+                    if new_primary_metric_value is not None:
+                        current_best_f = get_metric_value(current_best_metrics_dict or {}, primary_metric_keys)
+                        logger.info(f"Session {session_id}: New {primary_metric_path}={new_primary_metric_value:.4f}, Best={current_best_f or 'N/A'}")
 
-                        if current_best_f is None or new_f_measure > (current_best_f + improvement_threshold):
-                            logger.info(f"Session {session_id}: F1 Score improved! Updating best metrics and resetting stagnation.")
+                        if current_best_f is None or new_primary_metric_value > (current_best_f + improvement_threshold):
+                            logger.info(f"Session {session_id}: Primary metric improved! Updating best metrics and resetting stagnation.")
                             updated_best_metrics_dict = validated_event_data_dict.get("metrics", {})
                             updated_best_metrics_json = json.dumps(updated_best_metrics_dict, cls=NumpyEncoder)
                             updated_best_code_version = new_code_version
@@ -299,15 +367,17 @@ async def add_session_history(
                             best_result_updated = True
                             current_cycle_state.stagnation_count = 0
                             state_updated = True
-                            log_msg_suffix += ", ベストスコア更新"
+                            log_msg_suffix += f", ベストスコア更新 ({primary_metric_path})"
                         else:
-                            logger.info(f"Session {session_id}: F1 Score did not improve significantly. Incrementing stagnation.")
+                            logger.info(f"Session {session_id}: Primary metric did not improve significantly. Incrementing stagnation.")
                             current_cycle_state.stagnation_count += 1
                             state_updated = True
                     else:
-                         logger.warning(f"Session {session_id}: Evaluation complete event missing F-measure in 'metrics.overall'. Cannot update stagnation.")
+                         logger.warning(f"Session {session_id}: Evaluation complete event missing primary metric '{primary_metric_path}' in results. Cannot update stagnation.")
 
-                elif event_type in ["evaluation_failed", "cycle_failed", "improve_code_failed", "analyze_evaluation_failed", "parameter_suggestion_failed"]:
+                # ★ 失敗イベントでの停滞カウント更新を有効化 ★
+                elif event_type in ["evaluation_failed", "cycle_failed", "improve_code_failed", "analyze_evaluation_failed", 
+                                   "parameter_suggestion_failed"] or event_type.endswith("_failed") or event_type == "cycle_error":
                     logger.warning(f"Session {session_id}: Event '{event_type}' occurred. Incrementing stagnation count.")
                     current_cycle_state.stagnation_count += 1
                     state_updated = True
@@ -319,6 +389,12 @@ async def add_session_history(
                         # ★ update_forward_refs は Pydantic v2 では不要 or 別の方法?
                         #    update 辞書を使ってモデルを更新する (フィールドが存在するかは検証済み)
                         updated_state = current_cycle_state.model_copy(update=validated_update_dict)
+                        # Check if stagnation count was manually set to 0 (e.g., after successful param opt)
+                        # Avoid overriding reset based on evaluation comparison if external update also resets
+                        if 'stagnation_count' in validated_update_dict and best_result_updated:
+                            logger.debug("Stagnation reset by both evaluation improvement and external update. Using external update.")
+                            # The model_copy already applied the external value.
+                            
                         current_cycle_state = updated_state # 更新されたモデルを代入
                         state_updated = True
                         if "cycle_state 更新" not in log_msg_suffix: log_msg_suffix += ", cycle_state 更新"
@@ -415,13 +491,13 @@ _EVENT_TYPE_TO_SCHEMA = {
     "strategy_suggested": schemas.StrategySuggestedData,
     "hypotheses_generated": schemas.HypothesesGeneratedData,
     # Session Management Events
-    "session_started": schemas.HistoryEventBaseData, # Might need specific data
-    "session_resumed": schemas.HistoryEventBaseData,
-    "session_paused": schemas.HistoryEventBaseData,
-    "session_stopped": schemas.HistoryEventBaseData,
-    "session_completed": schemas.HistoryEventBaseData, # Might need specific data (e.g., final metrics)
-    "session_timeout": schemas.HistoryEventBaseData,
-    "session_error": schemas.HistoryEventBaseData, # TODO: Define SessionErrorData
+    "session_started": schemas.SessionStartedData,
+    "session_resumed": schemas.SessionResumedData,
+    "session_paused": schemas.SessionPausedData,
+    "session_stopped": schemas.SessionStoppedData,
+    "session_completed": schemas.SessionCompletedData,
+    "session_timeout": schemas.SessionTimeoutData,
+    "session_error": schemas.SessionErrorData,
     # Cycle Specific Events (from old improve loop logic, potentially reused by server)
     "cycle_completed": schemas.CycleCompletedData,
     "cycle_failed": schemas.CycleFailedData,
@@ -431,6 +507,30 @@ _EVENT_TYPE_TO_SCHEMA = {
     "analysis_failed": schemas.AnalysisFailedData,
     "suggestion_failed": schemas.SuggestionFailedData,
     "code_improvement_failed": schemas.CodeImprovementFailedData,
+    # プロンプト生成関連のイベントタイプを追加
+    "improve_code_prompt_generation_started": schemas.ImproveCodePromptGenerationStartedData,
+    "improve_code_prompt_generation_complete": schemas.ImproveCodePromptGenerationCompleteData,
+    "improve_code_prompt_generation_failed": schemas.ImproveCodePromptGenerationFailedData,
+    
+    "parameter_suggestion_prompt_generation_started": schemas.ParameterSuggestionPromptGenerationStartedData,
+    "parameter_suggestion_prompt_generation_complete": schemas.ParameterSuggestionPromptGenerationCompleteData,
+    "parameter_suggestion_prompt_generation_failed": schemas.ParameterSuggestionPromptGenerationFailedData,
+    
+    "analyze_evaluation_prompt_generation_started": schemas.AnalyzeEvaluationPromptGenerationStartedData,
+    "analyze_evaluation_prompt_generation_complete": schemas.AnalyzeEvaluationPromptGenerationCompleteData,
+    "analyze_evaluation_prompt_generation_failed": schemas.AnalyzeEvaluationPromptGenerationFailedData,
+    
+    "strategy_suggestion_prompt_generation_started": schemas.StrategySuggestionPromptGenerationStartedData,
+    "strategy_suggestion_prompt_generation_complete": schemas.StrategySuggestionPromptGenerationCompleteData,
+    "strategy_suggestion_prompt_generation_failed": schemas.StrategySuggestionPromptGenerationFailedData,
+    
+    "hypotheses_generation_prompt_generation_started": schemas.HypothesesGenerationPromptGenerationStartedData,
+    "hypotheses_generation_prompt_generation_complete": schemas.HypothesesGenerationPromptGenerationCompleteData,
+    "hypotheses_generation_prompt_generation_failed": schemas.HypothesesGenerationPromptGenerationFailedData,
+    
+    "assess_improvement_prompt_generation_started": schemas.AssessImprovementPromptGenerationStartedData,
+    "assess_improvement_prompt_generation_complete": schemas.AssessImprovementPromptGenerationCompleteData,
+    "assess_improvement_prompt_generation_failed": schemas.AssessImprovementPromptGenerationFailedData,
     # Add other mappings as needed
 }
 
@@ -547,6 +647,43 @@ async def get_session_summary_for_prompt(
         logger.error(f"Error summarizing history for session {session_id}: {e}", exc_info=True)
         # Return empty string on error to avoid breaking the LLM prompt
         return ""
+
+async def update_session_status_internal(
+    config: Dict[str, Any],
+    db_path: Path,
+    session_id: str,
+    new_status: str, # TODO: Use SessionStatus enum?
+    error_details: Optional[Dict[str, Any]] = None
+) -> None:
+    """内部的にセッションステータスを更新するための関数"""
+    current_timestamp = get_timestamp()
+    sql_parts = ["UPDATE sessions SET status = ?, last_update = ?"]
+    params: List[Any] = [new_status, current_timestamp]
+
+    # Optionally update last_error if provided
+    # TODO: Add a last_error column (TEXT) to sessions table in init_database
+    # if error_details:
+    #     try:
+    #         error_json = json.dumps(error_details, cls=NumpyEncoder)
+    #         sql_parts.append("last_error = ?")
+    #         params.append(error_json)
+    #     except TypeError as e:
+    #         logger.warning(f"Failed to serialize error_details for session {session_id}: {e}")
+
+    sql = ", ".join(sql_parts) + " WHERE session_id = ?"
+    params.append(session_id)
+
+    try:
+        # Use the atomic DB update function
+        await db_utils.db_execute_commit_async(db_path, sql, tuple(params))
+        logger.info(f"セッション {session_id}: ステータスを '{new_status}' に更新しました")
+    except StateManagementError as e:
+        logger.error(f"Failed to update session status for {session_id} in DB: {e}")
+        # Re-raise or handle appropriately
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error updating session status for {session_id}: {e}", exc_info=True)
+        raise StateManagementError(f"Unexpected error updating session status: {e}") from e
 
 # --- Tool Registration --- #
 
