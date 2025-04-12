@@ -37,7 +37,7 @@ import multiprocessing as mp
 from collections import defaultdict
 
 # ★ 修正: exception_utils のインポートを元に戻す
-from src.utils.exception_utils import log_exception, create_error_result, ConfigError, FileError
+from src.utils.exception_utils import log_exception, ConfigError, FileError, EvaluationError
 
 from src.utils.audio_utils import load_audio_file, load_reference_data, make_output_path
 from src.utils.json_utils import NumpyEncoder
@@ -80,10 +80,17 @@ def load_global_config():
 
 load_global_config()
 
-def evaluate_detection_result(detected_intervals, detected_pitches,
-                             reference_intervals, reference_pitches,
-                             evaluator_config: Optional[Dict[str, Any]] = None,
-                             detector_result: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, float]]:
+from src.evaluation.evaluation_frame import notes_to_frames, evaluate_frame_pitches
+
+def evaluate_detection_result(
+    detected_intervals: np.ndarray,
+    detected_pitches: np.ndarray,
+    reference_intervals: np.ndarray,
+    reference_pitches: np.ndarray,
+    evaluator_config: Optional[Dict[str, Any]] = None,
+    detector_result: Optional[Dict[str, Any]] = None, # 検出器の生の結果を含む辞書 (フレーム情報など)
+    logger: logging.Logger = logging.getLogger(__name__)
+) -> Dict[str, Dict[str, float]]:
     """
     検出結果を評価し、各種評価指標を計算します。
 
@@ -394,7 +401,7 @@ def _evaluate_file_for_detector(
     plot_format: str,
     plot_config: Optional[Dict[str, Any]],
     save_results_json: bool,
-    # detector_cache: Optional[Dict[str, Any]] = None # キャッシュはプロセス内で有効か？
+    logger: Optional[logging.Logger] = None, # logger引数を追加
 ) -> Dict[str, Any]:
     """
     1つの音声ファイルに対して、1つの検出器で評価を実行します。
@@ -413,10 +420,18 @@ def _evaluate_file_for_detector(
         plot_format (str): プロットのフォーマット。
         plot_config (Optional[Dict[str, Any]]): プロット設定。
         save_results_json (bool): 結果をJSONで保存するかどうか。
+        logger: 使用するロガーインスタンス。
 
     Returns:
         Dict[str, Any]: 評価結果の辞書。
     """
+    if logger is None:
+        logger = logging.getLogger(f"_evaluate_file.{eval_id}") # プロセス固有のロガー名
+        if not logger.handlers:
+            # ハンドラがなければ基本的な設定を追加（メインプロセスで設定済みの想定）
+            # ここで setup_logger を呼ぶと重複設定になる可能性があるので注意
+            pass # 必要に応じてファイルハンドラなどを追加
+
     audio_file, ref_file = audio_ref_tuple
     start_time = time.time()
     logger.info(f"[{eval_id}] Evaluating detector '{detector_name}' on {os.path.basename(audio_file)}")
@@ -434,7 +449,8 @@ def _evaluate_file_for_detector(
             save_plots=save_plots,
             plot_format=plot_format,
             plot_config=plot_config,
-            save_results_json=save_results_json
+            save_results_json=save_results_json,
+            logger=logger # ★ 修正: logger を evaluate_detector に渡す
         )
         end_time = time.time()
         result['processing_time'] = end_time - start_time
@@ -734,7 +750,7 @@ def run_evaluation(
         logger.error(f"Error calculating or saving evaluation summary: {e}", exc_info=True)
         return {"summary": {"error": f"Summary calculation failed: {e}"}, "all_results": results}
 
-def _calculate_evaluation_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _calculate_evaluation_summary(results: List[Dict[str, Any]], logger: logging.Logger = logging.getLogger(__name__)) -> Dict[str, Any]:
     """
     複数の評価結果からサマリー統計を計算します。
 
@@ -927,181 +943,188 @@ def evaluate_detector(
     detector_params: Optional[Dict[str, Any]],
     audio_file: str,
     ref_file: str,
-    output_dir: Path, # Expect Path object
-    eval_id: str,     # Moved required argument before optional ones
-    evaluator_config: Optional[Dict[str, Any]] = None,
+    output_dir: Path,
+    eval_id: str,
+    evaluator_config: Dict[str, Any],
+    save_results_json: bool = True,
     save_plots: bool = False,
     plot_format: str = 'png',
     plot_config: Optional[Dict[str, Any]] = None,
-    save_results_json: bool = True
+    logger: Optional[logging.Logger] = None, # logger引数を追加
 ) -> Dict[str, Any]:
-    """
-    単一の検出器と単一の音声ファイルで評価を実行します。
+    """特定の検出器と設定で単一のオーディオファイルを評価します。
 
     Args:
-        detector_name (str): 検出器名。
-        detector_params (Optional[Dict[str, Any]]): 検出器パラメータ。
-        audio_file (str): 音声ファイルパス。
-        ref_file (str): 参照ファイルパス。
-        output_dir (Path): この評価結果を保存するディレクトリ (例: /path/to/output/evaluation_xxx)。
-                           ファイル名はこの関数内で生成されます。
-        eval_id (str): 評価ID (通常はファイル名など)。ファイル名生成に使用。
-        evaluator_config (Optional[Dict[str, Any]]): 評価設定。
-        save_plots (bool): プロットを保存するかどうか。
-        plot_format (str): プロット形式。
-        plot_config (Optional[Dict[str, Any]]): プロット設定。
-        save_results_json (bool): JSON結果を保存するかどうか。
+        detector_name: 使用する検出器の名前。
+        detector_params: 検出器に渡すパラメータ。
+        audio_file: 評価対象のオーディオファイルのパス。
+        ref_file: 参照データのパス。
+        output_dir: 結果を保存するディレクトリ。
+        eval_id: 評価の識別子 (通常はファイル名など)。
+        evaluator_config: 評価関数の設定。
+        save_results_json: 結果をJSONファイルに保存するかどうか。
+        save_plots: 検出結果のプロットを保存するかどうか。
+        plot_format: プロットの保存形式 ('png', 'svg'など)。
+        plot_config: プロット関数に渡す追加設定。
+        logger: 使用するロガーインスタンス。
 
     Returns:
-        Dict[str, Any]: 評価結果の辞書。
+        評価結果とメタデータを含む辞書。
     """
+    if logger is None:
+        logger = logging.getLogger(__name__) # デフォルトロガー
+
+    logger.info(f"[{eval_id}] Evaluating detector '{detector_name}' on {os.path.basename(audio_file)}")
     start_time = time.time()
-    logger.info(f"Evaluating {detector_name} on {eval_id}...")
+
+    result_base = {
+        'eval_id': eval_id,
+        'audio_file': os.path.basename(audio_file),
+        'ref_file': os.path.basename(ref_file),
+        'detector_name': detector_name,
+        'detector_params': detector_params,
+        'metrics': {},
+        'detection_time': 0.0,
+        'valid': False,
+        'error_message': None,
+        'processing_time': 0.0,
+        'json_file': None,
+        'plot_file': None,
+    }
 
     try:
-        # 1. 検出器クラスの取得とインスタンス化
-        DetectorClass = get_detector_class(detector_name)
-        if detector_params:
-            detector = DetectorClass(**detector_params)
-        else:
-            detector = DetectorClass()
+        # 1. 検出器クラスを取得してインスタンス化
+        try:
+            DetectorClass = get_detector_class(detector_name)
+            detector = DetectorClass(**(detector_params or {}))
+        except (ImportError, ConfigError, TypeError) as e:
+            error_msg = f"Failed to get or instantiate detector class ({detector_name}): {e}"
+            logger.error(f"Error during evaluation for {eval_id}: {error_msg}", exc_info=True)
+            result_base.update({'error_message': error_msg, 'processing_time': time.time() - start_time})
+            return result_base
 
-        # 2. 音声ファイルの読み込み
-        audio_data, sr = load_audio_file(audio_file)
+        # 2. 音声ファイルと参照データをロード
+        try:
+            logger.debug(f"Loading audio file: {audio_file}")
+            audio_data, sr = load_audio_file(audio_file)
+            if audio_data is None:
+                raise FileError(f"Failed to load audio data (is None): {audio_file}")
+        except (FileError, Exception) as e:
+            error_msg = f"Failed to load audio file: {e}"
+            logger.error(f"Error during evaluation for {eval_id}: {error_msg}", exc_info=True)
+            result_base.update({'error_message': error_msg, 'processing_time': time.time() - start_time})
+            return result_base
+
+        try:
+            logger.debug(f"Loading reference data: {ref_file}")
+            reference_data = load_reference_data(ref_file)
+            if reference_data is None or not reference_data.get('intervals', np.array([])).size > 0:
+                raise FileNotFoundError(f"Reference data not found or empty: {ref_file}")
+        except (FileNotFoundError, Exception) as e:
+            error_msg = f"Failed to load reference data: {e}"
+            logger.error(f"Error during evaluation for {eval_id}: {error_msg}", exc_info=True)
+            result_base.update({'error_message': error_msg, 'processing_time': time.time() - start_time})
+            return result_base
 
         # 3. 検出の実行
         detection_start_time = time.time()
-        detection_result_raw = detector.detect(audio_data, sr)
+        try:
+            detection_result_raw = detector.detect(audio_data, sr)
+            if detection_result_raw is None: # detectがNoneを返す場合
+                raise EvaluationError("Detector returned None.")
+        except Exception as e:
+            detection_duration = time.time() - detection_start_time
+            error_msg = f"Error during detector execution ({detector_name}): {e}"
+            logger.error(f"Error during evaluation for {eval_id}: {error_msg}", exc_info=True)
+            result_base.update({'error_message': error_msg, 'detection_time': detection_duration, 'processing_time': time.time() - start_time})
+            return result_base
         detection_duration = time.time() - detection_start_time
+        result_base['detection_time'] = detection_duration
 
         # 4. 検出結果の正規化
-        #    (戻り値は DetectionResult オブジェクト)
-        normalized_detection_result: DetectionResult = normalize_detection_result(
-            detection_result_raw,
-            sr=sr # sr が必要なら渡す
-        )
-        # 検証を追加: 正規化が成功したか
-        if not isinstance(normalized_detection_result, DetectionResult):
-             raise TypeError(f"正規化の結果がDetectionResultではありません: {type(normalized_detection_result)}")
-
-        # 5. 参照データの読み込み
-        reference_data = load_reference_data(ref_file)
-        if reference_data is None:
-            raise FileNotFoundError(f"Failed to load reference data from {ref_file}")
-
-        # 6. 評価の実行 (DetectionResultオブジェクトの属性を使用)
-        evaluation_metrics = evaluate_detection_result(
-            detected_intervals=normalized_detection_result.intervals,       # 修正後
-            detected_pitches=normalized_detection_result.note_pitches,   # 修正後
-            reference_intervals=reference_data['intervals'],
-            reference_pitches=reference_data['pitches'],
-            evaluator_config=evaluator_config,
-            # detector_result は正規化前の生の辞書を渡すか、
-            # 正規化後の DetectionResult を渡すか、evaluate_detection_result の実装による
-            # ここでは DetectionResult を辞書に変換して渡す（フレーム評価用）
-            detector_result=normalized_detection_result.to_dict() if normalized_detection_result else {} # 修正後
-        )
-
-        # 7. 結果辞書の作成
-        result = {
-            'eval_id': eval_id,
-            'audio_file': os.path.basename(audio_file),
-            'ref_file': os.path.basename(ref_file),
-            'detector_name': detector_name,
-            'detector_params': detector_params,
-            'metrics': evaluation_metrics,  # 'evaluation_metrics' -> 'metrics' に変更（一貫性のため）
-            'detection_time': detection_duration,
-            'valid': True, # Mark as valid if no exception occurred so far
-            'error_message': None
-        }
-
-        # 8. 結果の保存 (JSON)
-        if save_results_json:
-            json_filename = f"{eval_id}_evaluation.json"
-            json_output_path = output_dir / json_filename
-            save_evaluation_result(result, str(json_output_path))
-            result['json_file'] = json_filename # Store relative path
-            logger.debug(f"Saved evaluation results to {json_output_path}")
-
-        # 9. プロットの保存
-        if save_plots:
-            plot_filename = f"{eval_id}_detection_plot.{plot_format}"
-            plot_output_path = output_dir / plot_filename
-            # プロット関数が DetectionResult を受け取るように想定（必要なら io 側で調整）
-
-            # reference_data も DetectionResult に変換
-            reference_result_obj = DetectionResult.from_dict(reference_data) if reference_data else None
-
-            save_detection_plot_io( # 修正後 (ioモジュールの関数を呼び出す, エイリアス使用)
-                audio_data=audio_data,
+        try:
+            normalized_detection_result: DetectionResult = normalize_detection_result(
+                detection_result_raw,
                 sr=sr,
-                detection_result=normalized_detection_result,
-                # reference=reference_data, # 修正前
-                reference=reference_result_obj, # 修正後: DetectionResult オブジェクトを渡す
-                output_path=str(plot_output_path),
-                plot_format=plot_format,
-                plot_config=plot_config
+                detector_name=detector_name
             )
-            result['plot_file'] = plot_filename # Store relative path
+            if not isinstance(normalized_detection_result, DetectionResult):
+                 raise TypeError(f"Normalization result is not a DetectionResult: {type(normalized_detection_result)}")
+        except (TypeError, ValueError, Exception) as e:
+            error_msg = f"Error during detection result normalization: {e}"
+            logger.error(f"Error during evaluation for {eval_id}: {error_msg}", exc_info=True)
+            result_base.update({'error_message': error_msg, 'processing_time': time.time() - start_time})
+            return result_base
 
-        logger.info(f"Successfully evaluated {eval_id}")
-        return result
+        # 5. 評価の実行
+        try:
+            evaluation_metrics = evaluate_detection_result(
+                detected_intervals=normalized_detection_result.intervals,
+                detected_pitches=normalized_detection_result.note_pitches,
+                reference_intervals=reference_data['intervals'],
+                reference_pitches=reference_data['pitches'],
+                evaluator_config=evaluator_config,
+                detector_result=normalized_detection_result.to_dict(), # 参照データを含まない検出結果辞書を渡す
+                logger=logger
+            )
+        except Exception as e:
+            error_msg = f"Error during metric calculation: {e}"
+            logger.error(f"Error during evaluation for {eval_id}: {error_msg}", exc_info=True)
+            result_base.update({'error_message': error_msg, 'processing_time': time.time() - start_time})
+            return result_base
+
+        result_base['metrics'] = evaluation_metrics
+        result_base['valid'] = True
+
+        # 6. 結果の保存 (JSON)
+        if save_results_json:
+            json_filename = f"{eval_id}_{detector_name}_result.json"
+            json_path = output_dir / json_filename
+            try:
+                save_evaluation_result(result_base, json_path)
+                result_base['json_file'] = str(json_path.relative_to(output_dir.parent)) # 相対パスで保存
+            except Exception as e:
+                logger.warning(f"Failed to save evaluation result JSON to {json_path}: {e}")
+
+        # 7. プロットの保存
+        # ★ 修正: プロット保存処理を追加
+        if save_plots and plot_module_imported:
+            plot_filename = f"{eval_id}_{detector_name}_detection_plot.{plot_format}"
+            plot_path = output_dir / plot_filename
+            try:
+                # reference_data を DetectionResult に変換（plot関数が期待する場合）
+                # もしくは、plot関数が辞書を受け付けるならそのままでOK
+                # ここでは reference_data (辞書) をそのまま渡す
+                ref_for_plot = {
+                    'intervals': reference_data['intervals'],
+                    'note_pitches': reference_data['pitches']
+                    # 必要に応じて他のキーも追加
+                }
+
+                save_detection_plot_io(
+                    detection_result=normalized_detection_result,
+                    reference=ref_for_plot,
+                    output_path=str(plot_path),
+                    plot_format=plot_format,
+                    plot_config=plot_config, # plot_config を渡す
+                    audio_path=audio_file # 音声ファイルパスも渡す
+                )
+                result_base['plot_file'] = str(plot_path.relative_to(output_dir.parent)) # 相対パスで保存
+                logger.debug(f"Detection plot saved to {plot_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save detection plot to {plot_path}: {e}", exc_info=True)
+        elif save_plots and not plot_module_imported:
+            logger.warning("Plotting libraries not installed. Skipping plot generation.")
+
 
     except Exception as e:
-        # ... (error handling remains the same, ensuring 'valid' is False)
-        result = {
-            'eval_id': eval_id,
-            'audio_file': Path(audio_file).name if audio_file else 'N/A',
-            'ref_file': Path(ref_file).name if ref_file else 'N/A',
-            'detector_name': detector_name,
-            'valid': False,
-            'error_message': str(e)
-        }
-        # Log the full error details
-        log_exception(logger, e, f"Error during evaluation for {eval_id}")
-        return result
+        # 予期せぬエラー
+        error_msg = f"Unexpected error during evaluation: {e}"
+        logger.error(f"Error during evaluation for {eval_id}: {error_msg}", exc_info=True)
+        result_base['valid'] = False
+        result_base['error_message'] = error_msg
 
-def frame_evaluate_wrapper(detection_result, reference_data):
-    """フレームベース評価を実行するラッパー"""
-    if not detection_result or not reference_data: return {}
-    ref_time = reference_data.get('frame_times')
-    ref_freq = reference_data.get('frame_frequencies')
-    est_time = detection_result.get('frame_times')
-    est_freq = detection_result.get('frame_frequencies')
+    result_base['processing_time'] = time.time() - start_time
+    logger.info(f"[{eval_id}] Finished evaluating '{detector_name}' in {result_base['processing_time']:.2f}s")
 
-    if ref_time is None or ref_freq is None or est_time is None or est_freq is None:
-        logger.debug("Frame data missing, skipping frame-based evaluation.")
-        return {}
-
-    # Ensure non-negative frequencies
-    ref_freq = np.maximum(ref_freq, 0)
-    est_freq = np.maximum(est_freq, 0)
-
-    try:
-        # mir_evalのframe評価を実行
-        frame_metrics = mir_eval.melody.evaluate(ref_time=ref_time, ref_freq=ref_freq, 
-                                                est_time=est_time, est_freq=est_freq)
-        
-        # mir_evalのキー名を一貫したスネークケースに変換
-        # 例: 'Voicing Recall' -> 'voicing_recall'
-        key_mapping = {
-            'Voicing Recall': 'voicing_recall',
-            'Voicing False Alarm': 'voicing_false_alarm',
-            'Raw Pitch Accuracy': 'raw_pitch_accuracy',
-            'Raw Chroma Accuracy': 'raw_chroma_accuracy',
-            'Overall Accuracy': 'overall_accuracy'
-        }
-        
-        # 変換と値の正規化を同時に行う
-        serializable_metrics = {}
-        for orig_key, value in frame_metrics.items():
-            # キー変換 (マッピングにあれば変換、なければそのまま使用)
-            norm_key = key_mapping.get(orig_key, orig_key.lower().replace(' ', '_'))
-            # 値の正規化 (numpy型をfloatに変換)
-            norm_value = float(value) if isinstance(value, (np.float32, np.float64)) else value
-            serializable_metrics[norm_key] = norm_value
-            
-        return serializable_metrics
-    except Exception as e:
-        logger.error(f"Error during frame-based evaluation: {e}", exc_info=True)
-        return create_error_result(f"FrameEvalError: {e}") 
+    return result_base 

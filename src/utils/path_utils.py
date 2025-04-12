@@ -1271,66 +1271,71 @@ def get_allowed_upload_directories() -> List[Path]:
 
 def get_allowed_vad_directories() -> List[Path]:
     """
-    VAD（Voice Activity Detection）用の録音ファイルがアップロード可能なディレクトリのリストを取得する。
-    環境変数 MIREX_ALLOWED_VAD_DIRS から取得し、複数のディレクトリはコロン(:)で区切られていることを想定する。
+    VAD（Voice Activity Detection）処理が許可されているディレクトリの一覧を取得します。
+    このディレクトリ群は、VAD処理のセキュリティ境界として機能します。
+
+    戻り値
+    ------
+    List[Path]
+        VAD処理が許可されているディレクトリのパスのリスト
+    """
+    # プロジェクトルートを取得
+    project_root = get_project_root(use_cache=True)
     
-    環境変数が設定されていない場合は、デフォルトでプロジェクトルート下の vad_uploads ディレクトリを返す。
+    # 許可されたディレクトリのリスト
+    allowed_dirs = [
+        project_root / "data",
+        project_root / "recordings",
+        project_root / "input",
+        project_root / "output",
+        project_root / "datasets",
+        project_root / "temp",
+        project_root / "examples",
+    ]
     
+    # temp ディレクトリが存在しない場合は作成する
+    temp_dir = project_root / "temp"
+    if not temp_dir.exists():
+        temp_dir.mkdir(exist_ok=True)
+    
+    # 存在するディレクトリのみをフィルタリング
+    existing_dirs = [d for d in allowed_dirs if d.is_dir()]
+    
+    return existing_dirs
+
+def find_files(directory: Union[str, Path], pattern: str = "*") -> List[Path]:
+    """
+    指定されたディレクトリ内でパターンに一致するファイルを検索します。
+
+    Parameters
+    ----------
+    directory : Union[str, Path]
+        検索するディレクトリ
+    pattern : str, optional
+        検索するグロブパターン, by default "*"
+
     Returns
     -------
     List[Path]
-        VADアップロード許可ディレクトリの絶対パスのリスト
+        パターンに一致するファイルのパスのリスト
+
+    Examples
+    --------
+    >>> find_files("data", "*.wav")
+    [Path('data/file1.wav'), Path('data/file2.wav')]
     
-    Raises
-    ------
-    ConfigError
-        環境変数の解析に失敗した場合
+    >>> find_files("data", "**/*.txt")  # 再帰的に検索
+    [Path('data/file.txt'), Path('data/subdir/file.txt')]
     """
-    env_dirs = os.environ.get('MIREX_ALLOWED_VAD_DIRS')
-    if env_dirs:
-        try:
-            # コロン区切りのパスをリストに分割
-            dir_paths = env_dirs.split(':')
-            # 空文字列を除外
-            dir_paths = [p for p in dir_paths if p.strip()]
-            
-            if not dir_paths:
-                logger.warning("環境変数 MIREX_ALLOWED_VAD_DIRS が空またはパース失敗。デフォルト値を使用します。")
-            else:
-                # 各パスを絶対パスに変換
-                abs_paths = []
-                for dir_path in dir_paths:
-                    path_obj = Path(dir_path)
-                    if not path_obj.is_absolute():
-                        # 相対パスはプロジェクトルートからの相対パスとして解決
-                        path_obj = get_project_root() / path_obj
-                    abs_paths.append(path_obj.resolve())
-                
-                # ディレクトリが存在しない場合は警告を出す
-                for path_obj in abs_paths:
-                    if not path_obj.exists():
-                        logger.warning(f"VADアップロード許可ディレクトリが存在しません: {path_obj}。必要に応じて作成してください。")
-                    elif not path_obj.is_dir():
-                        logger.warning(f"VADアップロード許可パスがディレクトリではありません: {path_obj}")
-                
-                if abs_paths:
-                    logger.info(f"環境変数から {len(abs_paths)} 個のVADアップロード許可ディレクトリを取得しました。")
-                    return abs_paths
-        except Exception as e:
-            logger.error(f"VADアップロード許可ディレクトリの取得中にエラー: {e}", exc_info=True)
-            raise ConfigError(f"環境変数 MIREX_ALLOWED_VAD_DIRS の解析に失敗しました: {e}") from e
+    directory_path = Path(directory)
+    if not directory_path.exists() or not directory_path.is_dir():
+        logger.warning(f"ディレクトリが存在しないか、ディレクトリではありません: {directory_path}")
+        return []
     
-    # 環境変数が設定されていない、または解析失敗時のデフォルト値
-    project_root = get_project_root()
-    default_dir = project_root / 'vad_uploads'
+    # グロブパターンで検索
+    files = list(directory_path.glob(pattern))
     
-    # デフォルトディレクトリを作成
-    try:
-        if not default_dir.exists():
-            logger.info(f"デフォルトのVADアップロードディレクトリを作成します: {default_dir}")
-            default_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        logger.warning(f"デフォルトVADアップロードディレクトリの作成に失敗しました: {e}")
+    # ファイルのみをフィルタリング
+    files = [f for f in files if f.is_file()]
     
-    logger.info(f"デフォルトのVADアップロード許可ディレクトリを使用します: {default_dir}")
-    return [default_dir]
+    return files

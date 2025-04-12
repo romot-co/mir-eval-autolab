@@ -44,12 +44,23 @@ def notes_to_frames(note_intervals: np.ndarray,
     """
     # 入力検証
     if len(note_intervals) == 0 or len(note_pitches) == 0:
-        # 空の場合は空の配列を返す
-        return np.array([]), np.array([])
+        # 空の入力の場合の処理
+        if end_time is None or end_time <= 0 or hop_time > end_time:
+            # end_timeが無効な場合は空の配列を返す
+            return np.array([]), np.array([])
+        else:
+            # end_timeが有効な場合はその長さに合わせたゼロ配列を返す
+            n_frames = int(np.ceil(end_time / hop_time))
+            times = np.arange(n_frames) * hop_time
+            freqs = np.zeros(n_frames)
+            return times, freqs
     
     # 終了時間が指定されていない場合は最後のノートのオフセットを使用
-    if end_time is None and len(note_intervals) > 0:
+    if end_time is None:
         end_time = np.max(note_intervals[:, 1])
+    elif end_time <= 0 or hop_time > end_time:
+        # end_timeが無効な場合は空の配列を返す
+        return np.array([]), np.array([])
     
     # 全体のフレーム数を計算
     n_frames = int(np.ceil(end_time / hop_time))
@@ -65,11 +76,19 @@ def notes_to_frames(note_intervals: np.ndarray,
         onset, offset = interval
         
         # ノート区間に含まれるフレームインデックスを計算
-        start_idx = int(onset / hop_time)
-        end_idx = min(int(offset / hop_time), n_frames - 1)
+        # 開始フレーム: onset以上のフレームに割り当て（境界上は含む = inclusive）
+        start_idx = int(np.floor(onset / hop_time))
         
-        # 対応するフレームにピッチを設定
-        freqs[start_idx:end_idx+1] = pitch
+        # 終了フレーム: offset未満のフレームまで含む（境界上は含まない = exclusive）
+        end_idx = int(np.ceil(offset / hop_time)) - 1
+        
+        # インデックス範囲をチェック
+        start_idx = max(0, start_idx)
+        end_idx = min(end_idx, n_frames - 1)
+        
+        # 有効なフレーム範囲がある場合のみ設定
+        if start_idx <= end_idx:
+            freqs[start_idx:end_idx+1] = pitch
     
     return times, freqs
 

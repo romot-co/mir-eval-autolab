@@ -116,7 +116,7 @@ def load_multiple_evaluation_results(input_dir: str, pattern: str = "*_evaluatio
     logger.info(f"{len(results)} 件の評価結果を正常にロードしました。")
     return results
 
-def print_summary_statistics(results_summary: pd.DataFrame, logger: logging.Logger = None, 
+def print_summary_statistics(results_summary: pd.DataFrame, logger_arg: logging.Logger = None,
                              metrics_list: List[str] = None) -> None:
     """
     評価結果のサマリーを標準出力に表示します。
@@ -125,15 +125,21 @@ def print_summary_statistics(results_summary: pd.DataFrame, logger: logging.Logg
     ----------
     results_summary : pd.DataFrame
         評価結果のサマリー
-    logger : logging.Logger, optional
-        使用するロガー（指定しない場合はデフォルトロガーを使用）
+    logger_arg : logging.Logger, optional
+        使用するロガー（指定しない場合はモジュールレベルのロガーを使用）
     metrics_list : List[str], optional
         表示する指標のリスト
     """
-    # ロガーが指定されていない場合はデフォルトのロガーを使用
-    if logger is None:
-        logger = logging.getLogger(__name__)
+    # ロガーが指定されていない場合はモジュールレベルのロガーを使用
+    if logger_arg is None:
+        effective_logger = logger # モジュールレベルの logger を使う
+    else:
+        effective_logger = logger_arg
     
+    if results_summary.empty:
+        effective_logger.warning("表示する指標がありません (DataFrame is empty)") # 空の場合のログ追加
+        return
+
     if metrics_list is None:
         metrics_list = [
             "onset_precision", "onset_recall", "onset_f_measure",
@@ -152,22 +158,25 @@ def print_summary_statistics(results_summary: pd.DataFrame, logger: logging.Logg
     display_metrics = [m for m in metrics_list if m in available_metrics]
     
     if not display_metrics:
-        logger.warning("表示する指標がありません")
+        effective_logger.warning("表示する指標がありません (No displayable metrics found in DataFrame)") # ここも修正
         return
     
-    # 評価結果の表示
-    logger.info("\n評価結果のサマリー:")
-    logger.info(f"検出器: {results_summary['detector_name'].iloc[0]}")
-    logger.info(f"評価ファイル数: {results_summary['files_count'].iloc[0]}")
-    logger.info(f"平均検出時間: {results_summary['detection_time_mean'].iloc[0]:.4f}秒")
-    
-    # 指標の表示
-    for metric in display_metrics:
-        if metric in available_metrics:
-            value = results_summary[metric].iloc[0]
-            logger.info(f"{metric}: {value:.4f}")
-    
-    logger.info("")
+    # 評価結果の表示 (iloc[0] の前に空チェックを追加した方が安全)
+    if not results_summary.empty:
+        effective_logger.info("\n評価結果のサマリー:")
+        effective_logger.info(f"検出器: {results_summary['detector_name'].iloc[0]}")
+        effective_logger.info(f"評価ファイル数: {results_summary['files_count'].iloc[0]}")
+        effective_logger.info(f"平均検出時間: {results_summary['detection_time_mean'].iloc[0]:.4f}秒")
+        
+        # 指標の表示
+        for metric in display_metrics:
+            if metric in available_metrics:
+                value = results_summary[metric].iloc[0]
+                effective_logger.info(f"{metric}: {value:.4f}")
+        
+        effective_logger.info("")
+    else:
+         effective_logger.warning("Cannot print summary for empty DataFrame.")
 
 def create_summary_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
     """
@@ -197,7 +206,9 @@ def create_summary_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
         row = {
             'audio_path': result.get('audio_path', ''),
             'detector_name': result.get('detector_name', ''),
-            'detection_time': result.get('detection_time', 0.0)
+            'detection_time': result.get('detection_time', 0.0),
+            'ref_note_count': result.get('ref_note_count'),
+            'est_note_count': result.get('est_note_count')
         }
         
         # 評価結果がある場合は展開

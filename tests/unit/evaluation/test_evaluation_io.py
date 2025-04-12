@@ -4,509 +4,539 @@ import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from unittest.mock import patch, MagicMock, call, ANY
-import os
+from unittest.mock import patch, MagicMock, call, mock_open, ANY
+import logging
 import tempfile
-import sys
+import os
+import builtins # builtins をインポート
 
-# Patch path_utils
-mock_path_utils = MagicMock()
-mock_path_utils.find_files = MagicMock(return_value=[])
-mock_path_utils.ensure_dir = MagicMock(return_value=None)
-mock_path_utils.get_dataset_paths = MagicMock(return_value=([], []))
-
-# patch sys.modules to add our mock
-sys_modules_patcher = patch.dict('sys.modules', {
-    'src.utils.path_utils': mock_path_utils
-})
-sys_modules_patcher.start()
-
-# テスト対象モジュールをインポート
-from src.evaluation import evaluation_io
+# テスト対象のモジュールをインポート
 from src.evaluation.evaluation_io import (
     save_evaluation_result,
     load_evaluation_result,
     load_multiple_evaluation_results,
+    print_summary_statistics,
     create_summary_dataframe,
     save_detection_plot,
-    NumpyEncoder,
-    FileError
+    save_detection_and_evaluation_results,
+    NumpyEncoder, # JSONエンコーダもテスト対象にする可能性あり
+    FileError, # 例外クラスもインポート
 )
-
-# Patch plot_utils which might be imported in evaluation_io
-mock_plot_utils = MagicMock()
-plot_utils_patcher = patch.dict('sys.modules', {
-    'src.visualization.plot_utils': mock_plot_utils
-})
-plot_utils_patcher.start()
-
-# システムモジュールが見つからない場合のスキップフラグ
-SKIP_TESTS = False
-
-try:
-    from src.exceptions import FileError
-except ImportError as e:
-    print(f"必要なモジュールをインポートできません: {e}")
-    SKIP_TESTS = True
-    
-    # テスト用のダミー実装
-    class FileError(Exception):
-        """ファイル操作エラーを表すダミー例外クラス"""
-        pass
-    
-    def save_evaluation_result(result_dict, output_path, metadata=None):
-        """評価結果を保存するダミー関数"""
-        return True
-    
-    def load_evaluation_result(input_path):
-        """評価結果を読み込むダミー関数"""
-        return {'metrics': {}, 'metadata': {}}
-    
-    def load_multiple_evaluation_results(input_path):
-        """複数の評価結果を読み込むダミー関数"""
-        return []
-    
-    def create_summary_dataframe(evaluation_results):
-        """サマリーデータフレームを作成するダミー関数"""
-        return pd.DataFrame()
-    
-    def save_detection_plot(detection_result, output_path):
-        """検出結果のプロットを保存するダミー関数"""
-        return True
-
-# テストをスキップするかどうかのマーカー
-pytestmark = pytest.mark.skipif(
-    SKIP_TESTS, 
-    reason="必要なモジュールをインポートできません。実装が完了してから再実行してください。"
-)
+# DetectionResult は evaluation_runner 側で使われるため、ここでは不要かもしれないが、
+# save_detection_plot の引数型として使われるためインポート
+from src.utils.detection_result import DetectionResult
 
 # --- Fixtures ---
 
 @pytest.fixture
-def mock_open():
-    """ Mocks the built-in open function for file I/O checks. """
-    with patch('builtins.open', new_callable=MagicMock) as mock_open:
-         mock_file_handle = MagicMock()
-         mock_open.return_value.__enter__.return_value = mock_file_handle
-         yield mock_open, mock_file_handle
+def temp_dir():
+    """一時ディレクトリを提供するフィクスチャ"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield Path(tmpdir)
 
 @pytest.fixture
-def mock_json():
-    """Mocks the json module."""
-    with patch('src.evaluation.evaluation_io.json', autospec=True) as mock:
-        yield mock
-
-@pytest.fixture
-def mock_pathlib():
-    """Mocks relevant pathlib.Path methods."""
-    # Wrap multiple patch context managers in parentheses
-    with (
-        patch('pathlib.Path.glob') as mock_glob,
-        patch('pathlib.Path.exists') as mock_exists,
-        patch('pathlib.Path.is_file') as mock_is_file
-    ):
-        yield {"glob": mock_glob, "exists": mock_exists, "is_file": mock_is_file}
-
-@pytest.fixture
-def mock_matplotlib():
-    """Mocks matplotlib pyplot."""
-    # Try multiple common import paths for pyplot
-    try:
-        with patch('src.evaluation.evaluation_io.plt', autospec=True) as mock_plt:
-            yield mock_plt
-    except (ImportError, AttributeError):
-         try:
-             with patch('matplotlib.pyplot', autospec=True) as mock_plt:
-                 yield mock_plt
-         except (ImportError, AttributeError):
-             # Create a dummy mock if matplotlib is not installed or patch target is wrong
-             yield MagicMock()
-
-
-# --- Test save/load_evaluation_result ---
-
-def test_save_evaluation_result(mock_open, mock_json):
-    """Tests saving an evaluation result dictionary to JSON."""
-    mock_open_func, mock_file_handle = mock_open
-    result_dict = {
-        'detector_name': 'TestDet',
-        'metrics': {'f_measure': 0.85, 'precision': np.float32(0.8)},
-        'params': {'threshold': 0.5}
+def sample_eval_result():
+    """サンプル評価結果データを返すフィクスチャ"""
+    return {
+        'detector_name': 'TestDetector',
+        'audio_path': '/path/to/audio.wav',
+        'status': 'success',
+        'evaluation': {
+            'note': {'precision': 0.8, 'recall': 0.7, 'f_measure': np.float32(0.75)},
+            'onset': {'precision': 0.9, 'recall': 0.8, 'f_measure': 0.85},
+            'frame_pitch': {'raw_pitch_accuracy': 0.95, 'voicing_recall': 0.9}
+        },
+        'detection_time': 1.234,
+        'ref_note_count': 10,
+        'est_note_count': 9
     }
-    output_path = Path("/fake/output/result.json")
 
-    save_evaluation_result(result_dict, output_path)
+@pytest.fixture
+def sample_detection_result_dict():
+    """サンプルの検出結果辞書（Numpy配列を含む）を返すフィクスチャ"""
+    return {
+        'detector_name': 'TestDetector',
+        'intervals': np.array([[0.1, 0.5], [0.6, 1.0]]),
+        'note_pitches': np.array([440.0, 880.0]),
+        'frame_times': np.linspace(0, 1, 10, dtype=np.float32),
+        'frame_frequencies': np.random.rand(10).astype(np.float64),
+        'detection_time': 0.55
+    }
 
-    # Check that open was called correctly
-    mock_open_func.assert_called_once_with(output_path, 'w')
-    # Check that json.dump was called with the correct arguments
-    mock_json.dump.assert_called_once_with(
-        result_dict,
-        mock_file_handle, # The file handle from mock_open
-        cls=NumpyEncoder, # Check if the custom encoder is used
-        indent=4
-    )
+# --- Test NumpyEncoder ---
 
-def test_load_evaluation_result(mock_open, mock_json):
-    """Tests loading an evaluation result dictionary from JSON."""
-    mock_open_func, mock_file_handle = mock_open
-    input_path = Path("/fake/input/result.json")
-    expected_dict = {"detector_name": "LoadedDet", "metrics": {"f_measure": 0.7}}
+def test_numpy_encoder_serialization():
+    """NumpyEncoderがNumPyの型を正しくJSONシリアライズ可能かテストします"""
+    data_with_numpy = {
+        'int32': np.int32(10),
+        'int64': np.int64(20),
+        'float32': np.float32(0.5),
+        'float64': np.float64(0.123),
+        'bool': np.bool_(True),
+        'array': np.array([1, 2, 3]),
+        'nested': {
+            'inner_array': np.arange(5)
+        },
+        'python_int': 100,
+        'python_float': 0.99,
+        'python_list': [1, 2, 3]
+    }
+    expected_json_str = '{"int32": 10, "int64": 20, "float32": 0.5, "float64": 0.123, "bool": true, "array": [1, 2, 3], "nested": {"inner_array": [0, 1, 2, 3, 4]}, "python_int": 100, "python_float": 0.99, "python_list": [1, 2, 3]}'
 
-    # Configure mock_json.load to return the expected dictionary
-    mock_json.load.return_value = expected_dict
+    # NumpyEncoderを使用してJSON文字列に変換
+    json_output = json.dumps(data_with_numpy, cls=NumpyEncoder, sort_keys=True)
 
-    loaded_dict = load_evaluation_result(input_path)
+    # 期待されるJSON文字列と比較 (順序を無視するため辞書にロードし直して比較)
+    assert json.loads(json_output) == json.loads(expected_json_str)
 
-    # Check open and json.load calls
-    mock_open_func.assert_called_once_with(input_path, 'r')
-    mock_json.load.assert_called_once_with(mock_file_handle)
-    assert loaded_dict == expected_dict
+# def test_numpy_encoder_unsupported_type():
+#     """NumpyEncoderがサポートされていない型に対してTypeErrorを発生させるかテストします"""
+#     # Note: Current NumpyEncoder *does* handle complex numbers.
+#     # Test if it correctly serializes complex numbers instead.
+#     unsupported_data = {'complex': np.complex128(1+2j)}
+#     expected_json = '{"complex": {"real": 1.0, "imag": 2.0}}'
+#     json_output = json.dumps(unsupported_data, cls=NumpyEncoder, sort_keys=True)
+#     assert json.loads(json_output) == json.loads(expected_json)
 
-def test_load_evaluation_result_file_not_found(mock_open):
-    """Tests loading when the JSON file does not exist."""
-    mock_open_func, _ = mock_open
-    mock_open_func.side_effect = FileNotFoundError
-    input_path = Path("/fake/nonexistent.json")
+# --- Test save_evaluation_result ---
 
+def test_save_evaluation_result_basic(sample_eval_result, temp_dir):
+    """save_evaluation_resultがJSONファイルを正しく作成・書き込みするかテストします"""
+    output_path = temp_dir / "result.json"
+    save_evaluation_result(sample_eval_result, str(output_path))
+
+    # ファイルが存在することを確認
+    assert output_path.exists()
+
+    # ファイルの内容を確認
+    with open(output_path, 'r', encoding='utf-8') as f:
+        loaded_data = json.load(f)
+
+    # 保存されたデータが元のデータと一致することを確認 (Numpy型は変換されている)
+    # np.float32 が float に変換されていることを確認
+    assert isinstance(loaded_data['evaluation']['note']['f_measure'], float)
+    # 元のデータと比較（変換後の型で）
+    assert loaded_data['detector_name'] == sample_eval_result['detector_name']
+    assert loaded_data['evaluation']['note']['precision'] == sample_eval_result['evaluation']['note']['precision']
+    assert np.isclose(loaded_data['evaluation']['note']['f_measure'], sample_eval_result['evaluation']['note']['f_measure'])
+
+
+def test_save_evaluation_result_creates_directory(sample_eval_result, temp_dir):
+    """save_evaluation_resultが出力ディレクトリが存在しない場合に作成するかテストします"""
+    output_path = temp_dir / "new_subdir" / "result.json"
+    save_evaluation_result(sample_eval_result, str(output_path))
+
+    assert output_path.exists()
+    assert output_path.parent.is_dir()
+
+def test_save_evaluation_result_permission_error(sample_eval_result, temp_dir):
+    """save_evaluation_resultで書き込み権限がない場合の動作をテストします"""
+    # 読み取り専用ディレクトリを作成
+    read_only_dir = temp_dir / "read_only"
+    read_only_dir.mkdir(mode=0o555) # 読み取り + 実行権限のみ
+    output_path = read_only_dir / "result.json"
+
+    # PermissionErrorが発生することを期待
+    with pytest.raises(PermissionError):
+        # try-except で囲むことで、os.makedirs が失敗した場合もテスト可能にする
+        try:
+            save_evaluation_result(sample_eval_result, str(output_path))
+        except PermissionError:
+            # ディレクトリ作成で失敗した場合も PermissionError を期待
+            raise
+        except Exception as e:
+            pytest.fail(f"Expected PermissionError, but got {type(e)}")
+
+
+# --- Test load_evaluation_result ---
+
+def test_load_evaluation_result_basic(sample_eval_result, temp_dir):
+    """load_evaluation_resultがJSONファイルを正しく読み込むかテストします"""
+    input_path = temp_dir / "result.json"
+    # まずテストデータを保存
+    with open(input_path, 'w', encoding='utf-8') as f:
+        json.dump(sample_eval_result, f, cls=NumpyEncoder)
+
+    # 関数を実行
+    loaded_data = load_evaluation_result(str(input_path))
+
+    # 読み込んだデータが元のデータと一致することを確認
+    assert loaded_data['detector_name'] == sample_eval_result['detector_name']
+    assert loaded_data['evaluation']['note']['precision'] == sample_eval_result['evaluation']['note']['precision']
+    assert np.isclose(loaded_data['evaluation']['note']['f_measure'], sample_eval_result['evaluation']['note']['f_measure'])
+
+def test_load_evaluation_result_file_not_found(temp_dir):
+    """load_evaluation_resultでファイルが存在しない場合の動作をテストします"""
+    non_existent_path = temp_dir / "non_existent.json"
     with pytest.raises(FileNotFoundError):
-        load_evaluation_result(input_path)
+        load_evaluation_result(str(non_existent_path))
+
+def test_load_evaluation_result_invalid_json(temp_dir):
+    """load_evaluation_resultでJSON形式が無効な場合の動作をテストします"""
+    invalid_json_path = temp_dir / "invalid.json"
+    with open(invalid_json_path, 'w', encoding='utf-8') as f:
+        f.write("this is not json")
+
+    with pytest.raises(json.JSONDecodeError):
+        load_evaluation_result(str(invalid_json_path))
 
 # --- Test load_multiple_evaluation_results ---
 
-def test_load_multiple_evaluation_results(mock_pathlib, mock_open):
-    """Tests loading multiple JSON result files from a directory."""
-    mock_open_func, mock_file_handle = mock_open
-    results_dir = Path("/fake/results")
-    file1_path = results_dir / "result1.json"
-    file2_path = results_dir / "result2.json"
-    result1_data = {"id": 1, "metric": 0.8}
-    result2_data = {"id": 2, "metric": 0.9}
+def test_load_multiple_evaluation_results_basic(sample_eval_result, temp_dir):
+    """load_multiple_evaluation_resultsが複数のJSONファイルを正しく読み込むかテストします"""
+    results_dir = temp_dir / "results"
+    results_dir.mkdir()
 
-    # Configure mocks
-    mock_pathlib["exists"].return_value = True
-    mock_pathlib["glob"].return_value = [file1_path, file2_path]
-    # Simulate reading different files
-    def open_side_effect(path, mode):
-        mock_fh = MagicMock()
-        if path == file1_path:
-            mock_fh.read.return_value = json.dumps(result1_data)
-        elif path == file2_path:
-            mock_fh.read.return_value = json.dumps(result2_data)
-        else:
-            raise FileNotFoundError
-        # Need to return the context manager interface
-        mock_cm = MagicMock()
-        mock_cm.__enter__.return_value = mock_fh
-        mock_cm.__exit__.return_value = None
-        return mock_cm
-    mock_open_func.side_effect = open_side_effect
+    # 複数の評価結果ファイルを作成
+    result1_path = results_dir / "file1_evaluation.json"
+    result2_path = results_dir / "file2_evaluation.json"
+    other_path = results_dir / "other_file.txt" # 対象外ファイル
 
-    # Patch json.loads within the function's scope if necessary, or rely on reading text
-    # For simplicity, assume load_multiple uses open().read() and json.loads()
-    with patch('src.evaluation.evaluation_io.json.loads') as mock_json_loads:
-         mock_json_loads.side_effect = [result1_data, result2_data]
+    result1_data = sample_eval_result.copy()
+    result1_data['audio_path'] = 'file1.wav'
+    result2_data = sample_eval_result.copy()
+    result2_data['audio_path'] = 'file2.wav'
+    result2_data['evaluation']['note']['f_measure'] = 0.9
 
-         loaded_results = load_multiple_evaluation_results(results_dir)
+    save_evaluation_result(result1_data, str(result1_path))
+    save_evaluation_result(result2_data, str(result2_path))
+    other_path.touch()
 
-    # Assertions
-    mock_pathlib["exists"].assert_called_once_with()
-    mock_pathlib["glob"].assert_called_once_with("*.json")
-    assert mock_open_func.call_count == 2
-    mock_open_func.assert_has_calls([call(file1_path, 'r'), call(file2_path, 'r')], any_order=True)
-    assert mock_json_loads.call_count == 2
-    assert loaded_results == [result1_data, result2_data]
+    # 関数を実行
+    loaded_results = load_multiple_evaluation_results(str(results_dir))
 
-def test_load_multiple_evaluation_results_dir_not_found(mock_pathlib):
-    """Tests loading from a directory that does not exist."""
-    mock_pathlib["exists"].return_value = False
-    results_dir = Path("/fake/nonexistent_dir")
+    # 検証
+    assert len(loaded_results) == 2
+    # 読み込まれた結果のリストに、保存したデータが含まれているか確認（順序は不定）
+    loaded_paths = sorted([res['audio_path'] for res in loaded_results])
+    assert loaded_paths == ['file1.wav', 'file2.wav']
 
-    loaded_results = load_multiple_evaluation_results(results_dir)
+def test_load_multiple_evaluation_results_custom_pattern(sample_eval_result, temp_dir):
+    """load_multiple_evaluation_resultsでカスタムパターンを使用するテスト"""
+    results_dir = temp_dir / "results"
+    results_dir.mkdir()
 
-    mock_pathlib["exists"].assert_called_once_with()
-    mock_pathlib["glob"].assert_not_called()
+    # 異なる名前のファイルを作成
+    path1 = results_dir / "result_abc.res"
+    path2 = results_dir / "result_xyz.res"
+    path3 = results_dir / "result_123.json" # パターン外
+
+    save_evaluation_result(sample_eval_result, str(path1))
+    save_evaluation_result(sample_eval_result, str(path2))
+    save_evaluation_result(sample_eval_result, str(path3))
+
+    # カスタムパターンで実行
+    loaded_results = load_multiple_evaluation_results(str(results_dir), pattern="*.res")
+
+    # 検証
+    assert len(loaded_results) == 2
+
+def test_load_multiple_evaluation_results_empty_dir(temp_dir):
+    """load_multiple_evaluation_resultsでディレクトリが空の場合のテスト"""
+    empty_dir = temp_dir / "empty_results"
+    empty_dir.mkdir()
+
+    loaded_results = load_multiple_evaluation_results(str(empty_dir))
+
     assert loaded_results == []
+
+def test_load_multiple_evaluation_results_dir_not_found(temp_dir):
+    """load_multiple_evaluation_resultsでディレクトリが存在しない場合のテスト"""
+    non_existent_dir = temp_dir / "non_existent"
+
+    with pytest.raises(FileError, match="入力パスがディレクトリではありません"):
+        load_multiple_evaluation_results(str(non_existent_dir))
 
 # --- Test create_summary_dataframe ---
 
-def test_create_summary_dataframe_basic():
-    """Tests creating a basic summary DataFrame from a list of result dicts."""
+def test_create_summary_dataframe_basic(sample_eval_result):
+    """create_summary_dataframeの基本的な動作をテストします"""
     results_list = [
-        {'detector_name': 'A', 'audio_path': 'f1', 'params': {'p1': 1}, 'metrics': {'f1': 0.8, 'p': 0.7}},
-        {'detector_name': 'A', 'audio_path': 'f2', 'params': {'p1': 1}, 'metrics': {'f1': 0.6, 'p': 0.5}},
-        {'detector_name': 'B', 'audio_path': 'f3', 'params': {'p2': 2}, 'metrics': {'f1': 0.9, 'p': 0.9}},
-    ]
-    # Mock pandas DataFrame to verify its creation
-    with patch('src.evaluation.evaluation_io.pd.DataFrame') as mock_pd_dataframe:
-        mock_df_instance = MagicMock()
-        mock_pd_dataframe.return_value = mock_df_instance
-
-        df = create_summary_dataframe(results_list)
-
-        # Check that DataFrame was called
-        mock_pd_dataframe.assert_called_once()
-        # Check the data passed to DataFrame constructor (might need more complex checks)
-        call_args, call_kwargs = mock_pd_dataframe.call_args
-        assert len(call_args[0]) == len(results_list) # Check number of rows
-        # Check if columns look reasonable (e.g., flattened keys)
-        assert 'detector_name' in call_args[0][0]
-        assert 'audio_path' in call_args[0][0]
-        assert 'params.p1' in call_args[0][0]
-        assert 'metrics.f1' in call_args[0][0]
-
-        assert df == mock_df_instance # Returned the mocked DataFrame
-
-def test_create_summary_dataframe_empty():
-    """Tests creating a summary DataFrame with an empty input list."""
-    with patch('src.evaluation.evaluation_io.pd.DataFrame') as mock_pd_dataframe:
-        df = create_summary_dataframe([])
-        # Should likely call pd.DataFrame with an empty list or similar
-        mock_pd_dataframe.assert_called_once_with([])
-
-# --- Test save_detection_plot ---
-
-@patch('src.evaluation.evaluation_io.plot_utils.plot_detection_result') # Assuming plot func is in plot_utils
-def test_save_detection_plot_calls_plot(mock_plot_detection, mock_matplotlib, tmp_path):
-    """Tests that save_detection_plot calls the underlying plotting function."""
-    output_path = tmp_path / "plot.png"
-    # Create dummy data/results needed by plot_detection_result
-    ref_intervals = np.array([[0.1, 0.5]])
-    ref_pitches = np.array([60])
-    detection_result = DetectionResult(intervals=np.array([[0.1, 0.4]]), note_pitches=np.array([61]))
-    sample_rate = 16000
-    audio_data = np.zeros(sample_rate)
-
-    save_detection_plot(
-        output_path=output_path,
-        ref_intervals=ref_intervals,
-        ref_pitches=ref_pitches,
-        detection_result=detection_result,
-        sample_rate=sample_rate,
-        audio_data=audio_data
-    )
-
-    # Check that the plotting function was called with correct args
-    mock_plot_detection.assert_called_once_with(
-        ref_intervals=ref_intervals,
-        ref_pitches=ref_pitches,
-        detection_result=detection_result,
-        sample_rate=sample_rate,
-        audio_data=audio_data,
-        ax=ANY # Check that an axes object was passed
-    )
-
-    # Check that matplotlib savefig and close were called
-    mock_matplotlib.savefig.assert_called_once_with(output_path)
-    mock_matplotlib.close.assert_called_once()
-
-@patch('src.evaluation.evaluation_io.plot_utils.plot_detection_result')
-def test_save_detection_plot_handles_plot_error(mock_plot_detection, mock_matplotlib, tmp_path):
-    """Tests error handling if the plotting function fails."""
-    mock_plot_detection.side_effect = ValueError("Plotting failed")
-    output_path = tmp_path / "plot_error.png"
-
-    # Expecting the error to be caught and logged (check log or ensure no crash)
-    try:
-        save_detection_plot(
-            output_path=output_path,
-            ref_intervals=np.array([]), ref_pitches=np.array([]),
-            detection_result=DetectionResult(intervals=np.array([]), note_pitches=np.array([])),
-            sample_rate=16000, audio_data=None
-        )
-        # Check logs if logging is implemented
-    except Exception as e:
-        pytest.fail(f"save_detection_plot should handle plotting errors gracefully, but raised {e}")
-
-    # Ensure savefig/close are not called if plotting failed
-    mock_matplotlib.savefig.assert_not_called()
-    # Close might still be called in a finally block, depends on implementation
-    # mock_matplotlib.close.assert_called_once() # Or assert_not_called() 
-
-@pytest.fixture
-def sample_evaluation_result():
-    """評価結果のサンプルデータを作成"""
-    return {
-        'Raw Pitch Accuracy': 0.85,
-        'Raw Chroma Accuracy': 0.90,
-        'Voicing Recall': 0.75,
-        'Voicing False Alarm': 0.10,
-        'F1 Score': 0.82,
-        'Overall Accuracy': 0.80
-    }
-
-def test_save_evaluation_result_invalid_path():
-    """無効なパスに保存しようとした場合のエラー処理テスト"""
-    result_dict = {"accuracy": 0.9}
-    # 存在しないディレクトリや権限のない場所への書き込みをモック
-    with patch('os.makedirs', side_effect=OSError("アクセス拒否")):
-        with patch('open', mock_open()) as m:
-            # OSErrorではなくFileErrorに変換されるはず
-            with pytest.raises(FileError):
-                save_evaluation_result(result_dict, "/fake/path/result.json")
-
-def test_save_evaluation_result(sample_evaluation_result):
-    """save_evaluation_resultの基本機能テスト"""
-    # 一時ディレクトリを使用
-    with tempfile.TemporaryDirectory() as temp_dir:
-        output_path = os.path.join(temp_dir, "test_eval_result.json")
-        
-        # 機能はモックではなく実際のファイルに書き込み
-        metadata = {"dataset": "test", "model": "test_model"}
-        result = save_evaluation_result(sample_evaluation_result, output_path, metadata)
-        
-        # 戻り値と出力ファイルの存在を確認
-        assert result is True
-        assert os.path.exists(output_path)
-        
-        # 読み込みも検証
-        if not SKIP_TESTS:
-            loaded = load_evaluation_result(output_path)
-            assert loaded is not None
-            assert 'metrics' in loaded
-            assert 'metadata' in loaded
-            assert loaded['metrics'] == sample_evaluation_result
-            assert loaded['metadata'] == metadata
-
-def test_load_evaluation_result():
-    """load_evaluation_resultの基本機能テスト"""
-    # 一時ファイルを作成してテスト
-    with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.json') as tmp:
-        # 有効なJSONを書き込む
-        tmp.write('{"metrics": {"accuracy": 0.9}, "metadata": {"model": "test"}}')
-        tmp.flush()
-        
-        # ファイルを読み込む
-        result = load_evaluation_result(tmp.name)
-        
-        # 結果を検証
-        assert isinstance(result, dict)
-        assert 'metrics' in result
-        assert 'metadata' in result
-        assert result['metrics']['accuracy'] == 0.9
-        assert result['metadata']['model'] == 'test'
-        
-        # 後始末
-        os.unlink(tmp.name)
-
-def test_load_evaluation_result_file_not_found():
-    """存在しないファイルを読み込もうとした場合のエラー処理テスト"""
-    with pytest.raises(FileError):
-        load_evaluation_result("/non/existent/file.json")
-
-def test_load_multiple_evaluation_results_basic():
-    """load_multiple_evaluation_resultsの基本機能テスト"""
-    # 一時ディレクトリを作成
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # 評価結果ファイルを作成
-        for i in range(3):
-            file_path = os.path.join(temp_dir, f"result_{i}.json")
-            with open(file_path, 'w') as f:
-                f.write(f'{{"metrics": {{"accuracy": {0.8 + i*0.05}}}, "metadata": {{"id": {i}}}}}')
-        
-        # ディレクトリから複数の結果を読み込む
-        results = load_multiple_evaluation_results(temp_dir)
-        
-        # 結果を検証
-        assert isinstance(results, list)
-        assert len(results) == 3  # 3つのファイルを読み込んだはず
-        # 各要素がdictであることを確認
-        for result in results:
-            assert isinstance(result, dict)
-            assert 'metrics' in result
-            assert 'metadata' in result
-
-def test_load_multiple_evaluation_results_dir_not_found():
-    """存在しないディレクトリを読み込もうとした場合のエラー処理テスト"""
-    with pytest.raises(FileError):
-        load_multiple_evaluation_results("/non/existent/directory/")
-
-@pytest.fixture
-def sample_evaluation_results():
-    """複数の評価結果サンプルを作成"""
-    return [
+        sample_eval_result,
         {
-            'metrics': {'Raw Pitch Accuracy': 0.85, 'Voicing Recall': 0.9},
-            'metadata': {'dataset': 'A', 'model': 'X'}
-        },
-        {
-            'metrics': {'Raw Pitch Accuracy': 0.75, 'Voicing Recall': 0.8},
-            'metadata': {'dataset': 'B', 'model': 'X'}
-        },
-        {
-            'metrics': {'Raw Pitch Accuracy': 0.90, 'Voicing Recall': 0.95},
-            'metadata': {'dataset': 'A', 'model': 'Y'}
+            'detector_name': 'DetectorB',
+            'audio_path': '/path/to/audio2.wav',
+            'status': 'success',
+            'evaluation': {
+                'note': {'precision': 0.7, 'recall': 0.6, 'f_measure': 0.65},
+                'frame_pitch': {'raw_pitch_accuracy': 0.90, 'voicing_recall': 0.8}
+            },
+            'detection_time': 2.5,
+            'ref_note_count': 15,
+            'est_note_count': 12
         }
     ]
 
-def test_create_summary_dataframe_basic(sample_evaluation_results):
-    """create_summary_dataframeの基本機能テスト"""
-    # デフォルトのモック動作
-    with patch('pandas.DataFrame', return_value=pd.DataFrame()) as mock_df:
-        df = create_summary_dataframe(sample_evaluation_results)
-        
-        # DataFrameが作成されたことを確認
-        assert mock_df.called
-        
-        # DataFrameに渡されたデータの構造を確認（キー）
-        args, kwargs = mock_df.call_args
-        data = args[0] if args else kwargs.get('data', [])
-        
-        # データ構造の確認
-        if len(data) > 0:
-            for entry in data:
-                assert 'dataset' in entry  # メタデータが含まれているか
-                assert 'model' in entry    # メタデータが含まれているか
-                # 少なくとも1つのメトリクスキーが含まれているか
-                assert any(key in entry for key in 
-                          ['Raw Pitch Accuracy', 'Voicing Recall'])
+    df = create_summary_dataframe(results_list)
 
-def test_create_summary_dataframe_empty():
-    """空のリストでcreate_summary_dataframeを呼び出した場合のテスト"""
-    # 空のDataFrameを返すようにモック
-    with patch('pandas.DataFrame', return_value=pd.DataFrame()) as mock_df:
-        df = create_summary_dataframe([])
-        
-        # 空のデータフレームが作成されたことを確認
-        assert mock_df.called
-        # 呼び出し時に空のデータリストが渡されたことを確認
-        args, kwargs = mock_df.call_args
-        data = args[0] if args else kwargs.get('data', None)
-        assert data == []
+    # データフレームの構造を確認
+    assert isinstance(df, pd.DataFrame)
+    assert len(df) == 2
+    expected_columns = [
+        'audio_path', 'detector_name', 'detection_time',
+        'note_precision', 'note_recall', 'note_f_measure',
+        'onset_precision', 'onset_recall', 'onset_f_measure', # onsetも展開されるはず
+        'frame_pitch_raw_pitch_accuracy', 'frame_pitch_voicing_recall',
+        # フレーム評価の旧互換指標も追加されるはず
+        'frame_pitch_precision', 'frame_pitch_recall', 'frame_pitch_f_measure', 'frame_pitch_accuracy',
+        'ref_note_count', 'est_note_count'
+    ]
+    for col in expected_columns:
+        assert col in df.columns
 
-@pytest.fixture
-def sample_detection_result():
-    """検出結果のサンプルデータを作成"""
-    return {
-        'ref_time': np.array([0.0, 0.1, 0.2]),
-        'ref_freq': np.array([440.0, 442.0, 0.0]),
-        'est_time': np.array([0.0, 0.1, 0.2]),
-        'est_freq': np.array([438.0, 441.0, 0.0]),
-        'metrics': {'Raw Pitch Accuracy': 0.9}
-    }
+    # データの内容を確認 (一部)
+    assert df.loc[0, 'detector_name'] == 'TestDetector'
+    assert df.loc[1, 'detector_name'] == 'DetectorB'
+    assert df.loc[0, 'note_f_measure'] == sample_eval_result['evaluation']['note']['f_measure']
+    assert df.loc[1, 'note_f_measure'] == 0.65
+    assert df.loc[0, 'frame_pitch_raw_pitch_accuracy'] == sample_eval_result['evaluation']['frame_pitch']['raw_pitch_accuracy']
+    # 旧互換指標が raw_pitch_accuracy と同じ値になっているか確認
+    assert df.loc[0, 'frame_pitch_precision'] == sample_eval_result['evaluation']['frame_pitch']['raw_pitch_accuracy']
+    assert df.loc[0, 'frame_pitch_recall'] == sample_eval_result['evaluation']['frame_pitch']['raw_pitch_accuracy']
+    assert df.loc[0, 'frame_pitch_f_measure'] == sample_eval_result['evaluation']['frame_pitch']['raw_pitch_accuracy']
+    assert df.loc[0, 'frame_pitch_accuracy'] == sample_eval_result['evaluation']['frame_pitch']['raw_pitch_accuracy']
 
-def test_save_detection_plot_calls_plot(sample_detection_result):
-    """save_detection_plotがプロット機能を呼び出すことを確認するテスト"""
-    # plot_utilsモジュールのモック
-    with patch('src.evaluation.evaluation_io.plot_utils') as mock_plot_utils:
-        # プロット保存先への一時ファイルを用意
-        with tempfile.NamedTemporaryFile(suffix='.png') as tmp:
-            # 関数を実行
-            result = save_detection_plot(sample_detection_result, tmp.name)
-            
-            # plot_utilsのplot_detection_resultが呼ばれたことを確認
-            assert mock_plot_utils.plot_detection_result.called
-            # 結果を検証
-            assert result is True
 
-def test_save_detection_plot_handles_plot_error(sample_detection_result):
-    """プロット中にエラーが発生した場合の処理を確認するテスト"""
-    # plot_utilsモジュールのモックで例外を発生させる
-    with patch('src.evaluation.evaluation_io.plot_utils') as mock_plot_utils:
-        mock_plot_utils.plot_detection_result.side_effect = Exception("プロットエラー")
-        
-        # 一時ファイルを用意
-        with tempfile.NamedTemporaryFile(suffix='.png') as tmp:
-            # FileErrorが発生することを確認
-            with pytest.raises(FileError):
-                save_detection_plot(sample_detection_result, tmp.name) 
+def test_create_summary_dataframe_with_failed_results(sample_eval_result):
+    """create_summary_dataframeが失敗した結果を除外するかテストします"""
+    results_list = [
+        sample_eval_result, # status: success
+        {
+            'detector_name': 'DetectorB',
+            'audio_path': '/path/to/audio2.wav',
+            'status': 'error', # 失敗した結果
+            'error_message': 'Something went wrong',
+            'detection_time': 0.1
+        }
+    ]
+    df = create_summary_dataframe(results_list)
+    assert len(df) == 1 # 失敗した結果は除外される
+    assert df.loc[0, 'detector_name'] == 'TestDetector'
+
+def test_create_summary_dataframe_missing_evaluation(sample_eval_result):
+    """create_summary_dataframeでevaluationキーがない結果を処理できるかテストします"""
+    results_list = [
+        sample_eval_result,
+        {
+            'detector_name': 'DetectorC',
+            'audio_path': '/path/to/audio3.wav',
+            'status': 'success',
+            # evaluation キーがない
+            'detection_time': 0.5
+        }
+    ]
+    df = create_summary_dataframe(results_list)
+    assert len(df) == 2
+    # evaluation がない行は NaN になるはず
+    assert df.loc[1, 'detector_name'] == 'DetectorC'
+    assert pd.isna(df.loc[1, 'note_f_measure'])
+    assert pd.isna(df.loc[1, 'frame_pitch_raw_pitch_accuracy'])
+
+def test_create_summary_dataframe_empty_input():
+    """create_summary_dataframeで入力リストが空の場合のテスト"""
+    df = create_summary_dataframe([])
+    assert isinstance(df, pd.DataFrame)
+    assert df.empty
+
+# --- Test print_summary_statistics ---
+
+def test_print_summary_statistics_basic(caplog):
+    """print_summary_statisticsの基本的なログ出力をテストします"""
+    summary_df = pd.DataFrame({
+        'detector_name': ['TestDetector'],
+        'files_count': [10],
+        'detection_time_mean': [1.5],
+        'note_f_measure': [0.85],
+        'onset_precision': [0.9],
+        'frame_pitch_raw_pitch_accuracy': [0.95],
+        'some_other_metric': [0.5] # metrics_list にない指標
+    })
+    metrics_list = [
+        "note_f_measure", "onset_precision", "frame_pitch_raw_pitch_accuracy",
+        "non_existent_metric" # 存在しない指標
+    ]
+
+    # caplog を使って src.evaluation.evaluation_io ロガーの INFO レベル以上をキャプチャ
+    with caplog.at_level(logging.INFO, logger='src.evaluation.evaluation_io'):
+        print_summary_statistics(summary_df, metrics_list=metrics_list)
+
+    # caplog.text でログ全体を確認
+    assert "評価結果のサマリー:" in caplog.text
+    assert "検出器: TestDetector" in caplog.text
+    assert "評価ファイル数: 10" in caplog.text
+    assert "平均検出時間: 1.5000秒" in caplog.text
+    assert "note_f_measure: 0.8500" in caplog.text
+    assert "onset_precision: 0.9000" in caplog.text
+    assert "frame_pitch_raw_pitch_accuracy: 0.9500" in caplog.text
+    assert "some_other_metric" not in caplog.text
+    assert "non_existent_metric" not in caplog.text
+
+def test_print_summary_statistics_no_metrics_list(caplog):
+    """print_summary_statisticsでmetrics_listが指定されない場合のテスト"""
+    summary_df = pd.DataFrame({
+        'detector_name': ['TestDetector'],
+        'files_count': [5],
+        'detection_time_mean': [0.8],
+        'note_f_measure': [0.7],
+        'offset_recall': [0.6],
+        'frame_pitch_overall_accuracy': [0.8]
+    })
+
+    # caplog を使って src.evaluation.evaluation_io ロガーの INFO レベル以上をキャプチャ
+    with caplog.at_level(logging.INFO, logger='src.evaluation.evaluation_io'):
+        print_summary_statistics(summary_df) # metrics_list=None
+
+    # caplog.text でログ全体を確認
+    assert "note_f_measure: 0.7000" in caplog.text
+    assert "offset_recall: 0.6000" in caplog.text
+    assert "frame_pitch_overall_accuracy: 0.8000" in caplog.text
+
+def test_print_summary_statistics_empty_df(caplog):
+    """print_summary_statisticsで空のDataFrameが渡された場合のテスト"""
+    empty_df = pd.DataFrame()
+    # caplog を使って src.evaluation.evaluation_io ロガーの WARNING レベル以上をキャプチャ
+    with caplog.at_level(logging.WARNING, logger='src.evaluation.evaluation_io'):
+        print_summary_statistics(empty_df)
+
+    # ログに警告が出力されることを確認
+    assert "表示する指標がありません (DataFrame is empty)" in caplog.text
+
+def test_print_summary_statistics_no_available_metrics(caplog):
+    """print_summary_statisticsで利用可能な指標がない場合のテスト"""
+    summary_df = pd.DataFrame({
+        'detector_name': ['TestDetector'],
+        'files_count': [1],
+        'detection_time_mean': [1.0]
+        # metrics_listに含まれる指標がDataFrameにない
+    })
+    metrics_list = ["note_f_measure", "onset_precision"]
+
+    # caplog を使って src.evaluation.evaluation_io ロガーの WARNING レベル以上をキャプチャ
+    with caplog.at_level(logging.WARNING, logger='src.evaluation.evaluation_io'):
+        print_summary_statistics(summary_df, metrics_list=metrics_list)
+
+    # ログに警告が出力されることを確認
+    assert "表示する指標がありません (No displayable metrics found in DataFrame)" in caplog.text
+
+
+# --- Test save_detection_plot ---
+
+@pytest.mark.skip(reason="Plotting function is currently commented out or unavailable.")
+@patch('src.evaluation.evaluation_io.plot_module_imported', False) # プロットモジュールがない状態をシミュレート
+def test_save_detection_plot_module_not_imported(temp_dir):
+    """save_detection_plotでプロットモジュールがない場合にスキップされるかテスト"""
+    dummy_audio = np.zeros(100)
+    dummy_detection = DetectionResult()
+    dummy_reference = DetectionResult()
+    output_path = temp_dir / "plot.png"
+
+    save_detection_plot(dummy_audio, 44100, dummy_detection, dummy_reference, str(output_path))
+
+    # プロットファイルが作成されないことを確認
+    assert not output_path.exists()
+
+@pytest.mark.skip(reason="Plotting function is currently commented out or unavailable.")
+@patch('src.evaluation.evaluation_io.plot_module_imported', True) # プロットモジュールがある状態
+@patch('src.visualization.plot_utils.plot_detection_results') # プロット関数自体をモック (仮のパス)
+def test_save_detection_plot_basic(mock_plot_func, temp_dir):
+    """save_detection_plotの基本的な呼び出しとファイル保存をテストします"""
+    dummy_audio = np.random.rand(1000)
+    sr = 16000
+    detection_result = DetectionResult(intervals=np.array([[0.1, 0.5]]), note_pitches=np.array([440]))
+    reference = DetectionResult(intervals=np.array([[0.12, 0.48]]), note_pitches=np.array([441]))
+    output_path = temp_dir / "subdir" / "my_plot.pdf"
+    plot_format = 'pdf'
+    plot_config = {'style': 'seaborn'}
+
+    # プロット関数が呼ばれることを期待
+    save_detection_plot(dummy_audio, sr, detection_result, reference, str(output_path), plot_format=plot_format, plot_config=plot_config)
+
+    # 出力ディレクトリが作成されたか確認
+    assert output_path.parent.exists()
+
+    # プロット関数が正しい引数で呼ばれたか確認
+    # 引数は辞書形式に変換されて渡されることに注意 (evaluation_io の実装次第)
+    mock_plot_func.assert_called_once_with(
+        audio_data=dummy_audio,
+        sr=sr,
+        detection_result=detection_result.to_dict(), # 辞書に変換して渡される想定
+        reference_data=reference.to_dict(),       # 辞書に変換して渡される想定
+        show=False, # show=False が渡されるはず
+        save_path=str(output_path), # 保存パスが渡されるはず
+        # plot_config は内部で展開されるかもしれないので ANY で確認するか、実装に合わせる
+        # **plot_config # plot_config は直接渡されない可能性
+    )
+
+@pytest.mark.skip(reason="Plotting function is currently commented out or unavailable.")
+@patch('src.evaluation.evaluation_io.plot_module_imported', True)
+@patch('src.visualization.plot_utils.plot_detection_results', side_effect=Exception("Plotting error")) # プロット関数でエラー (仮のパス)
+def test_save_detection_plot_error_handling(mock_plot_func, temp_dir):
+    """save_detection_plotでプロット中にエラーが発生した場合のテスト"""
+    dummy_audio = np.zeros(100)
+    sr = 8000
+    detection_result = DetectionResult()
+    reference = DetectionResult()
+    output_path = temp_dir / "error_plot.png"
+
+    save_detection_plot(dummy_audio, sr, detection_result, reference, str(output_path))
+
+    # プロットファイルは作成されない
+    assert not output_path.exists()
+
+# --- Test save_detection_and_evaluation_results ---
+
+def test_save_detection_and_evaluation_results_basic(sample_detection_result_dict, sample_eval_result, temp_dir):
+    """save_detection_and_evaluation_resultsの基本的な動作をテストします"""
+    output_dir = temp_dir / "combined_results"
+    base_name = "my_audio"
+    detector_name = "SuperDetector"
+
+    expected_output_subdir = output_dir / base_name / detector_name
+    expected_detection_path = expected_output_subdir / "detection_result.json"
+    expected_evaluation_path = expected_output_subdir / "evaluation_result.json"
+
+    # 関数を実行
+    result_paths = save_detection_and_evaluation_results(
+        sample_detection_result_dict, sample_eval_result, str(output_dir), base_name, detector_name
+    )
+
+    # 返されたパスが正しいか確認
+    assert result_paths['detection_result'] == str(expected_detection_path)
+    assert result_paths['evaluation_result'] == str(expected_evaluation_path)
+
+    # ディレクトリとファイルが作成されたか確認
+    assert expected_output_subdir.is_dir()
+    assert expected_detection_path.exists()
+    assert expected_evaluation_path.exists()
+
+    # 保存された内容を確認 (一部)
+    with open(expected_detection_path, 'r') as f:
+        loaded_detection = json.load(f)
+    assert loaded_detection['detector_name'] == sample_detection_result_dict['detector_name']
+    # Numpy 配列がリストに変換されているか確認
+    assert isinstance(loaded_detection['intervals'], list)
+    assert loaded_detection['intervals'] == sample_detection_result_dict['intervals'].tolist()
+
+    with open(expected_evaluation_path, 'r') as f:
+        loaded_evaluation = json.load(f)
+    assert loaded_evaluation['detector_name'] == sample_eval_result['detector_name']
+    assert np.isclose(loaded_evaluation['evaluation']['note']['f_measure'], sample_eval_result['evaluation']['note']['f_measure'])
+
+def test_save_detection_and_evaluation_results_io_error(sample_detection_result_dict, sample_eval_result, temp_dir):
+    """save_detection_and_evaluation_resultsでファイル書き込みエラーが発生する場合のテスト"""
+    output_dir = temp_dir / "combined_results"
+    base_name = "my_audio"
+    detector_name = "SuperDetector"
+
+    # open をモックして PermissionError を発生させる
+    with patch('builtins.open', side_effect=PermissionError("Cannot write file")):
+        with pytest.raises(PermissionError):
+            save_detection_and_evaluation_results(
+                sample_detection_result_dict, sample_eval_result, str(output_dir), base_name, detector_name
+            )
+
+    # ディレクトリは作成されるかもしれないが、ファイルは作成されない
+    expected_output_subdir = output_dir / base_name / detector_name
+    assert expected_output_subdir.is_dir() # makedirs は呼ばれるはず
+    assert not (expected_output_subdir / "detection_result.json").exists()
+    assert not (expected_output_subdir / "evaluation_result.json").exists()

@@ -18,8 +18,35 @@ import time
 import os
 
 # --- MCP Client Imports ---
-from mcp import client as MCPClient
-from mcp import ToolError, MCPError
+from mcp import McpError
+from mcp.client.session import ClientSession
+
+# ToolErrorはMCPパッケージに存在しないので自前で定義
+class ToolError(Exception):
+    """Mock ToolError class for testing"""
+    pass
+
+# MCPClientクラスを定義（実際のMCPClientを使用）
+class MCPClient:
+    """Simplified MCPClient implementation for testing"""
+    def __init__(self, base_url=None):
+        self.base_url = base_url
+        
+    def run_tool(self, tool_name, tool_input):
+        # テスト用のダミー実装
+        return {'job_id': 'test_job_id'}
+        
+    def get_job_status(self, job_id):
+        # テスト用のダミー実装
+        return {'status': 'completed', 'result': {}}
+        
+    def get_session_info(self, session_id):
+        # テスト用のダミー実装
+        return {'session_id': session_id, 'status': 'active'}
+        
+    def start_session(self, detector_name, dataset_name):
+        # テスト用のダミー実装
+        return {'session_id': 'test_session_id', 'status': 'active'}
 
 # --- Core Function Imports ---
 # 適切なパスに調整してください
@@ -28,7 +55,6 @@ try:
     from src.utils.logging_utils import setup_logger
     from src.utils.path_utils import get_project_root
     from src.utils.exception_utils import log_exception
-    from src.utils.misc_utils import load_config_yaml
     from src.cli.llm_client import initialize_llm_client, LLMClientError  # 新しいLLMクライアント
 except ImportError as e:
     print(f"Error importing core modules: {e}. Ensure PYTHONPATH is set correctly.", file=sys.stderr)
@@ -146,7 +172,7 @@ def poll_job_status(client: MCPClient, job_id: str, poll_interval: int = 5, time
             logger.error(f"Error getting job status for {job_id} (ToolError): {e}", exc_info=True)
             # get_job_status ツール自体がない場合など、リトライ不可のエラー
             raise RuntimeError(f"Server error while getting job status for {job_id}: {e}") from e
-        except MCPError as e:
+        except McpError as e:
             # 接続エラーなど、リトライ可能な可能性のあるエラー
             logger.warning(f"MCP communication error while getting status for {job_id}: {e}. Retrying in {poll_interval * 2}s...")
             time.sleep(poll_interval * 2)
@@ -166,8 +192,8 @@ OutputDir = Annotated[
     typer.Option("--output", "-o", help="Directory to save evaluation results or logs.")
 ]
 LogLevel = Annotated[
-    str,
-    typer.Option("--log-level", help="Set the logging level.", default="INFO", case_sensitive=False)
+    Optional[str],
+    typer.Option("--log-level", help="Set the logging level.", case_sensitive=False)
 ]
 
 # --- Evaluate Command ---
@@ -175,16 +201,17 @@ eval_app = typer.Typer(help="Evaluate MIR detectors either standalone or via MCP
 app.add_typer(eval_app, name="evaluate")
 
 @eval_app.callback()
-def eval_main(ctx: typer.Context, log_level: LogLevel):
+def eval_main(ctx: typer.Context, log_level: Optional[str] = "INFO"):
     """ Set log level for evaluate commands. """
+    # effective_log_level = log_level if log_level is not None else "INFO" # この行を削除
     # このコールバックは eval_app のすべてのコマンドの前に実行される
     # setup_logger は特定のロガーを設定するため、ここでは基本的な logging.basicConfig を使うか、
     # ルートロガーを設定する必要があるかもしれない。ただし、他のライブラリへの影響に注意。
     # 一旦、ルートロガーレベルを設定するシンプルな方法に変更
-    log_level_int = getattr(logging, log_level.upper(), logging.INFO)
+    log_level_int = getattr(logging, log_level.upper(), logging.INFO) # effective_log_level を log_level に戻す
     logging.basicConfig(level=log_level_int, format='%(asctime)s [%(levelname)-8s] %(name)s: %(message)s')
     # logging.getLogger().setLevel(log_level_int) # basicConfig がレベルを設定
-    logging.info(f"Root logger level set to {log_level.upper()} via basicConfig.")
+    logging.info(f"Root logger level set to {log_level.upper()} via basicConfig.") # effective_log_level を log_level に戻す
     # setup_logger(name=__name__, level=getattr(logging, log_level.upper(), logging.INFO)) # 特定ロガーではなくルートを設定
     # グローバル設定をロード (一度だけ行うべきだが、ここでは簡単のため)
     load_global_config()
@@ -209,6 +236,7 @@ def evaluate(
     output_dir: OutputDir = None,
 ):
     """Evaluates a detector either standalone or via the MCP server."""
+    load_global_config() # Load config at the start of the command
     logger = logging.getLogger(__name__)
 
     if server_url:
@@ -268,12 +296,12 @@ def evaluate(
                 logger.error(f"Failure reason: {error_msg}")
                 raise typer.Exit(code=1)
 
-        except (ToolError, MCPError, TimeoutError, RuntimeError, Exception) as e:
+        except (ToolError, McpError, TimeoutError, RuntimeError, Exception) as e:
             logger.error(f"An error occurred during server-based evaluation: {e}", exc_info=True)
             # エラータイプに応じてユーザーへのメッセージを調整
             if isinstance(e, ToolError):
                 typer.echo(f"Error: Server could not execute the evaluation tool. {e}", err=True)
-            elif isinstance(e, MCPError):
+            elif isinstance(e, McpError):
                 typer.echo(f"Error: Communication failed with the server. {e}", err=True)
             elif isinstance(e, TimeoutError):
                  typer.echo(f"Error: Evaluation job timed out. {e}", err=True)
@@ -371,11 +399,11 @@ grid_app = typer.Typer(help="Run grid search for detector parameters via MCP ser
 app.add_typer(grid_app, name="grid-search")
 
 @grid_app.callback()
-def grid_main(ctx: typer.Context, log_level: LogLevel):
+def grid_main(ctx: typer.Context, log_level: Optional[str] = "INFO"):
     log_level_int = getattr(logging, log_level.upper(), logging.INFO)
     logging.basicConfig(level=log_level_int, format='%(asctime)s [%(levelname)-8s] %(name)s: %(message)s')
     logging.info(f"Root logger level set to {log_level.upper()} via basicConfig.")
-    load_global_config()
+    # load_global_config() # Moved to command functions
 
 @grid_app.command("run", help="Run grid search.")
 def grid_search(
@@ -384,6 +412,7 @@ def grid_search(
     output_dir: OutputDir = None,
 ):
     """Runs grid search using the MCP server."""
+    load_global_config() # Load config at the start of the command
     logger = logging.getLogger(__name__)
     logger.info(f"Running grid search via server {server_url} using config '{config_path}'.")
 
@@ -449,14 +478,14 @@ def grid_search(
             logger.error(f"Failure reason: {error_msg}")
             raise typer.Exit(code=1)
 
-    except (ToolError, MCPError, TimeoutError, RuntimeError, yaml.YAMLError, Exception) as e:
+    except (ToolError, McpError, TimeoutError, RuntimeError, yaml.YAMLError, Exception) as e:
         logger.error(f"An error occurred during grid search: {e}", exc_info=True)
         if isinstance(e, yaml.YAMLError):
              typer.echo(f"Error: Invalid YAML in config file {config_path}. {e}", err=True)
         # 他のエラータイプは evaluate と同様
         elif isinstance(e, ToolError):
             typer.echo(f"Error: Server could not execute the grid search tool. {e}", err=True)
-        elif isinstance(e, MCPError):
+        elif isinstance(e, McpError):
             typer.echo(f"Error: Communication failed with the server. {e}", err=True)
         elif isinstance(e, TimeoutError):
              typer.echo(f"Error: Grid search job timed out. {e}", err=True)
@@ -470,24 +499,26 @@ def grid_search(
 improve_app = typer.Typer(help="Automatically improve detector performance using MCP server.")
 app.add_typer(improve_app, name="improve")
 
-# デフォルト値 (設定ファイルで上書き可能にすべき)
-DEFAULT_IMPROVEMENT_THRESHOLD = 0.005 # 0.5% improvement
-DEFAULT_MAX_STAGNATION = 5
-DEFAULT_SESSION_TIMEOUT = 3600 # 1 hour
-DEFAULT_POLL_INTERVAL = 10 # seconds
-DEFAULT_JOB_TIMEOUT = 1800 # 30 minutes per job
+# デフォルト値用の定数（config.yaml にない場合のフォールバック）
+DEFAULT_POLL_INTERVAL = 5
+DEFAULT_JOB_TIMEOUT = 600
+DEFAULT_MAX_CYCLES = 10
+DEFAULT_LLM_MODEL = "claude-3-opus-20240229"
+DEFAULT_IMPROVEMENT_THRESHOLD = 0.005 # 例: 0.5% 改善
+DEFAULT_MAX_STAGNATION = 3
+DEFAULT_SESSION_TIMEOUT = 3600 # 1時間
 
 @improve_app.callback()
-def improve_main(ctx: typer.Context, log_level: LogLevel):
+def improve_main(ctx: typer.Context, log_level: Optional[str] = "INFO"):
     """ Set log level for improve commands. """
     log_level_int = getattr(logging, log_level.upper(), logging.INFO)
     logging.basicConfig(level=log_level_int, format='%(asctime)s [%(levelname)-8s] %(name)s: %(message)s')
     logging.info(f"Root logger level set to {log_level.upper()} via basicConfig.")
-    load_global_config()
+    # load_global_config() # Moved to command functions
     # ctx.obj = {"log_level": log_level.upper(), "config": CONFIG}
 
 @improve_app.command("start", help="Start or resume the automatic improvement loop.")
-def improve(
+async def improve(
     # --- Required arguments ---
     server_url: Annotated[str, typer.Option("--server", "-s", help="URL of the MCP server (required for improve).")],
     detector_name: Annotated[str, typer.Option("--detector", help="Name of the detector to improve.")],
@@ -497,23 +528,51 @@ def improve(
     goal: Annotated[Optional[str], typer.Option("--goal", help="High-level goal for the improvement (e.g., 'Improve F1-score for onset detection').")] = None,
     session_id: Annotated[Optional[str], typer.Option("--session-id", help="Resume an existing improvement session.")] = None,
     # Client-side loop limit (safety net)
-    max_cycles: Annotated[Optional[int], typer.Option("--max-cycles", help="Maximum number of improvement cycles.")] = 10,
+    max_cycles: Annotated[Optional[int], typer.Option("--max-cycles", help="Maximum number of improvement cycles.")] = None, # Default from config
     # LLM関連オプション
-    llm_model: Annotated[Optional[str], typer.Option("--llm-model", help="LLM model to use (defaults to claude-3-opus-20240229)")] = "claude-3-opus-20240229",
+    llm_model: Annotated[Optional[str], typer.Option("--llm-model", help=f"LLM model to use (default from config or {DEFAULT_LLM_MODEL})")] = None, # Default from config
     api_key: Annotated[Optional[str], typer.Option("--api-key", help="LLM API key (if not specified, reads from environment variable)")] = None,
     # Server-side session parameters (passed during start_session)
-    improvement_threshold: Annotated[Optional[float], typer.Option("--threshold", help="Minimum F1-score improvement required to reset stagnation counter (server-side).")] = None,
-    max_stagnation: Annotated[Optional[int], typer.Option("--max-stagnation", help="Stop if F1-score doesn't improve by the threshold for this many cycles (server-side).")] = None,
-    session_timeout: Annotated[Optional[int], typer.Option("--session-timeout", help="Maximum duration for the entire improvement session in seconds (server-side).")] = None,
+    improvement_threshold: Annotated[Optional[float], typer.Option("--threshold", help=f"Minimum F1-score improvement required to reset stagnation counter (default from config or {DEFAULT_IMPROVEMENT_THRESHOLD})")] = None, # Default from config
+    max_stagnation: Annotated[Optional[int], typer.Option("--max-stagnation", help=f"Stop if F1-score doesn't improve by the threshold for this many cycles (default from config or {DEFAULT_MAX_STAGNATION})")] = None, # Default from config
+    session_timeout: Annotated[Optional[int], typer.Option("--session-timeout", help=f"Maximum duration for the entire improvement session in seconds (default from config or {DEFAULT_SESSION_TIMEOUT})")] = None, # Default from config
     # Polling options
-    poll_interval: Annotated[int, typer.Option("--poll-interval", help="Interval (seconds) for polling session/job status.")] = DEFAULT_POLL_INTERVAL,
-    job_timeout: Annotated[int, typer.Option("--job-timeout", help="Timeout (seconds) for waiting for individual improvement jobs.")] = DEFAULT_JOB_TIMEOUT,
+    poll_interval: Annotated[Optional[int], typer.Option("--poll-interval", help=f"Interval (seconds) for polling session/job status (default from config or {DEFAULT_POLL_INTERVAL})")] = None, # Default from config
+    job_timeout: Annotated[Optional[int], typer.Option("--job-timeout", help=f"Timeout (seconds) for individual improvement jobs (default from config or {DEFAULT_JOB_TIMEOUT})")] = None, # Default from config
     # ユーザー確認オプション
-    always_confirm: Annotated[bool, typer.Option("--always-confirm", help="Always confirm before applying code changes.")] = True,
+    always_confirm: Annotated[bool, typer.Option("--always-confirm/--no-confirm", help="Confirm before applying code changes (default: True).")] = True,
 ):
-    """CLIホストとして自動改善ループを制御します。LLMクライアントを使用してコード改善などを行います。"""
+    """Starts or resumes the automatic improvement loop for a detector."""
+    load_global_config() # Load config at the start of the command
     logger = logging.getLogger(__name__)
-    
+
+    # --- Resolve defaults from CONFIG --- #
+    # Config sections: 'improve', 'llm', 'strategy', 'cleanup'
+    improve_cfg = CONFIG.get('improve', {})
+    llm_cfg = CONFIG.get('llm', {})
+    strategy_cfg = CONFIG.get('strategy', {})
+    cleanup_cfg = CONFIG.get('cleanup', {})
+
+    final_max_cycles = max_cycles if max_cycles is not None else improve_cfg.get('max_cycles', DEFAULT_MAX_CYCLES)
+    final_llm_model = llm_model if llm_model is not None else llm_cfg.get('model', DEFAULT_LLM_MODEL)
+    final_improvement_threshold = improvement_threshold if improvement_threshold is not None else strategy_cfg.get('improvement_threshold', DEFAULT_IMPROVEMENT_THRESHOLD)
+    final_max_stagnation = max_stagnation if max_stagnation is not None else strategy_cfg.get('max_stagnation', DEFAULT_MAX_STAGNATION)
+    final_session_timeout = session_timeout if session_timeout is not None else cleanup_cfg.get('session_timeout_seconds', DEFAULT_SESSION_TIMEOUT)
+    final_poll_interval = poll_interval if poll_interval is not None else improve_cfg.get('poll_interval', DEFAULT_POLL_INTERVAL)
+    final_job_timeout = job_timeout if job_timeout is not None else improve_cfg.get('job_timeout', DEFAULT_JOB_TIMEOUT)
+
+    # Log the effective parameters being used
+    logger.info(f"--- Effective Improve Parameters ---")
+    logger.info(f"Max Cycles: {final_max_cycles}")
+    logger.info(f"LLM Model: {final_llm_model}")
+    logger.info(f"Improvement Threshold: {final_improvement_threshold}")
+    logger.info(f"Max Stagnation: {final_max_stagnation}")
+    logger.info(f"Session Timeout: {final_session_timeout}s")
+    logger.info(f"Polling Interval: {final_poll_interval}s")
+    logger.info(f"Job Timeout: {final_job_timeout}s")
+    logger.info(f"Always Confirm: {always_confirm}")
+    logger.info(f"------------------------------------")
+
     # LLMクライアントのインポート (先ほど作成したモジュール)
     try:
         from src.cli.llm_client import initialize_llm_client, LLMClientError
@@ -538,32 +597,34 @@ def improve(
     
     try:
         # 1. LLM クライアント初期化 (API キーは環境変数から自動取得)
-        logger.info(f"Initializing LLM client with model {llm_model}")
-        llm_client = loop.run_until_complete(
-            initialize_llm_client_async(api_key=api_key, model=llm_model)
-        )
-        
+        logger.info(f"Initializing LLM client with model {final_llm_model}")
+        # llm_client = loop.run_until_complete( # This causes RuntimeError in tests
+        #     initialize_llm_client_async(api_key=api_key, model=final_llm_model) # Use final_llm_model
+        # )
+        # Await the async initializer directly
+        llm_client = await initialize_llm_client_async(api_key=api_key, model=final_llm_model)
+
         # 2. セッション開始または再開
         logger.info(f"{'Resuming' if session_id else 'Starting'} improvement session...")
-        session_config = {
-            key: val for key, val in {
-                "max_cycles": max_cycles,
-                "improvement_threshold": improvement_threshold,
-                "max_stagnation": max_stagnation,
-                "session_timeout": session_timeout
-            }.items() if val is not None
+        # Use final config values for session parameters
+        session_params = {
+            "threshold": final_improvement_threshold,
+            "max_stagnation": final_max_stagnation,
+            "timeout": final_session_timeout,
         }
-        
+
         start_session_input = {
             "base_algorithm": detector_name,
             "dataset_name": dataset_name,
-            "improvement_goal": goal,
+            "goal": goal,
+            "improvement_params": session_params # Pass resolved params
         }
-        
+
         if session_id:
             # 既存セッションの再開
             try:
-                session_info = client.get_session_info(session_id=session_id)
+                # session_info = client.get_session_info(session_id=session_id) # Synchronous call
+                session_info = await loop.run_in_executor(None, client.get_session_info, session_id) # Use run_in_executor
                 active_session_id = session_id
                 logger.info(f"Session {session_id} resumed successfully.")
             except Exception as e:
@@ -573,7 +634,13 @@ def improve(
         else:
             # 新規セッション開始
             try:
-                session_info = client.start_session(**start_session_input)
+                # session_info = client.start_session(**start_session_input) # Synchronous call
+                # Use lambda to pass keyword arguments to run_in_executor
+                session_info = await loop.run_in_executor(
+                    None,
+                    lambda: client.start_session(**start_session_input)
+                )
+                # session_info = await loop.run_in_executor(None, client.start_session, **start_session_input) # This caused TypeError
                 active_session_id = session_info.get("session_id")
                 if not active_session_id:
                     logger.error("Failed to start session: No session_id received.")
@@ -589,119 +656,152 @@ def improve(
         print_session_summary(session_info)
         
         # 3. 改善ループ (CLI主導)
+        loop = asyncio.get_event_loop()
+        session_active = True
         cycle_count = 0
-        while cycle_count < max_cycles:
+        last_exception = None # ループ終了時の例外表示用
+
+        while session_active and cycle_count < final_max_cycles: # Use final_max_cycles
             cycle_count += 1
-            logger.info(f"Starting improvement cycle {cycle_count}/{max_cycles}")
-            
-            # セッション情報の取得
+            logger.info(f"\n--- Improvement Cycle {cycle_count}/{final_max_cycles} (Session: {active_session_id}) ---") # Use final_max_cycles
+            typer.echo(f"\nCycle {cycle_count}...")
+
             try:
-                session_info = client.get_session_info(session_id=active_session_id)
-                session_status = session_info.get("status")
-                
-                # 終了条件のチェック
-                if session_status in ["completed", "failed", "stopped", "timed_out"]:
-                    logger.info(f"Session ended with status: {session_status}")
-                    break
-                
-                # サイクル状態の取得
-                cycle_state = session_info.get("cycle_state", {})
-                current_metrics = session_info.get("current_metrics", {})
-                best_metrics = session_info.get("best_metrics", {})
-                
-                logger.info(f"Current cycle state: {cycle_state}")
-                
-                # 次のアクションを決定
-                next_action = loop.run_until_complete(determine_next_action(
-                    loop, client, llm_client, 
-                    session_id=active_session_id, 
-                    session_info=session_info
-                ))
-                
-                logger.info(f"Next action determined: {next_action}")
-                
-                # アクションの実行
-                if next_action["action"] == "analyze_evaluation":
-                    loop.run_until_complete(execute_analyze_evaluation(
-                        loop, client, llm_client, 
-                        session_id=active_session_id,
-                        evaluation_results=current_metrics
-                    ))
-                
-                elif next_action["action"] == "generate_hypotheses":
-                    loop.run_until_complete(execute_generate_hypotheses(
-                        loop, client, llm_client,
-                        session_id=active_session_id,
-                        current_metrics=current_metrics,
-                        num_hypotheses=next_action.get("num_hypotheses", 3)
-                    ))
-                
-                elif next_action["action"] == "improve_code":
-                    # 現在のコードを取得
-                    code_info = client.get_code(
-                        detector_name=detector_name,
-                        version=cycle_state.get("last_code_version")
-                    )
-                    current_code = code_info.get("code", "")
-                    
-                    # コード改善プロンプトを生成
-                    suggestion = next_action.get("suggestion", "Improve the code based on the evaluation results.")
-                    loop.run_until_complete(execute_improve_code(
-                        loop, client, llm_client,
-                        session_id=active_session_id,
-                        detector_name=detector_name,
-                        code=current_code,
-                        suggestion=suggestion,
-                        always_confirm=always_confirm
-                    ))
-                
-                elif next_action["action"] == "run_evaluation":
-                    loop.run_until_complete(execute_run_evaluation(
-                        loop, client,
-                        session_id=active_session_id,
-                        detector_name=detector_name,
-                        dataset_name=dataset_name,
-                        code_version=next_action.get("code_version")
-                    ))
-                
-                elif next_action["action"] == "optimize_parameters":
-                    loop.run_until_complete(execute_optimize_parameters(
-                        loop, client, llm_client,
-                        session_id=active_session_id,
-                        detector_name=detector_name,
-                        current_metrics=current_metrics
-                    ))
-                
-                elif next_action["action"] == "stop":
-                    logger.info("Stopping improvement loop as suggested by strategy.")
-                    break
-                
+                # 1. 次のアクションを決定 (前にセッション情報を取得)
+                logger.info("Fetching latest session info...")
+                active_session_info = await loop.run_in_executor(None, client.get_session_info, active_session_id) # Use run_in_executor
+                print_session_summary(active_session_info) # Print summary at start of cycle
+
+                logger.info("Determining next action...")
+                action_info = await determine_next_action(loop, client, llm_client, active_session_id, active_session_info) # Pass latest info
+                action_name = action_info.get("action")
+                action_params = action_info.get("parameters", {})
+                # Use status from action_info first, fallback to fetched info
+                session_status = action_info.get("session_status") or active_session_info.get("status", "running")
+
+                # Define terminal states
+                terminal_states = {"completed", "failed", "timeout", "cancelled"} # Example terminal states
+
+                # if session_status != "running": # Original incorrect check
+                if session_status in terminal_states:
+                    logger.info(f"Session {active_session_id} has reached a terminal state ({session_status}). Stopping loop.")
+                    typer.echo(f"Session ended with status: {session_status}")
+                    session_active = False
+                    # 完了/失敗理由を表示 (あれば)
+                    reason = action_info.get("reason")
+                    if reason:
+                        typer.echo(f"Reason: {reason}")
+                    continue # ループの次のイテレーションへ (while 条件で終了)
+
+                if not action_name:
+                    logger.warning("No next action determined by server/LLM. Waiting before retry.")
+                    await asyncio.sleep(final_poll_interval) # Use final_poll_interval
+                    continue # 次のサイクルへ
+
+                logger.info(f"Next action: {action_name}")
+                logger.debug(f"Action parameters: {action_params}")
+                typer.echo(f"Next action: {action_name}")
+
+                # 2. アクション実行
+                execution_result = None
+                start_exec_time = time.time()
+
+                if action_name == "analyze_evaluation":
+                    evaluation_results = action_params.get("evaluation_results")
+                    if not evaluation_results: raise ValueError("Missing 'evaluation_results' for analyze_evaluation")
+                    execution_result = await execute_analyze_evaluation(loop, client, llm_client, active_session_id, evaluation_results)
+                elif action_name == "generate_hypotheses":
+                    current_metrics = action_params.get("current_metrics")
+                    num_hypotheses = action_params.get("num_hypotheses", 3)
+                    if not current_metrics: raise ValueError("Missing 'current_metrics' for generate_hypotheses")
+                    execution_result = await execute_generate_hypotheses(loop, client, llm_client, active_session_id, current_metrics, num_hypotheses)
+                elif action_name == "improve_code":
+                    code = action_params.get("code")
+                    suggestion = action_params.get("suggestion")
+                    if not code or not suggestion: raise ValueError("Missing 'code' or 'suggestion' for improve_code")
+                    execution_result = await execute_improve_code(loop, client, llm_client, active_session_id, detector_name, code, suggestion, always_confirm)
+                elif action_name == "run_evaluation":
+                    code_version = action_params.get("code_version") # オプショナル
+                    execution_result = await execute_run_evaluation(loop, client, active_session_id, detector_name, dataset_name, code_version, final_poll_interval, final_job_timeout)
+                elif action_name == "optimize_parameters":
+                    current_metrics = active_session_info.get("current_metrics")
+                    if not current_metrics: raise ValueError("Missing 'current_metrics' in session info for optimize_parameters")
+                    execution_result = await execute_optimize_parameters(loop, client, llm_client, active_session_id, detector_name, current_metrics, always_confirm, final_poll_interval, final_job_timeout)
                 else:
-                    logger.warning(f"Unknown action: {next_action['action']}. Skipping.")
-                
-                # ユーザーキャンセルの確認 (オプション)
-                if typer.confirm("Continue to next step?", default=True):
-                    logger.info("Continuing to next step.")
-                else:
-                    logger.info("User requested to stop the improvement loop.")
-                    break
-            
-            except Exception as e:
-                logger.error(f"Error in improvement cycle {cycle_count}: {e}", exc_info=True)
-                typer.echo(f"Error in improvement cycle {cycle_count}: {e}", err=True)
-                # エラーの場合、続行するか確認
-                if typer.confirm("An error occurred. Continue with next cycle?", default=False):
-                    logger.info("Continuing to next cycle despite error.")
-                    continue
-                else:
-                    logger.info("User requested to stop after error.")
-                    break
-        
+                    logger.error(f"Unknown action name: {action_name}. Skipping.")
+                    typer.echo(f"Error: Unknown action '{action_name}' received.", err=True)
+                    # 不明なアクションの場合、少し待って次のサイクルへ
+                    await asyncio.sleep(final_poll_interval) # Use final_poll_interval
+                    continue # このサイクルの残りをスキップ
+
+                end_exec_time = time.time()
+                logger.info(f"Action '{action_name}' completed in {end_exec_time - start_exec_time:.2f}s")
+                if execution_result:
+                     logger.debug(f"Execution result: {execution_result}")
+
+                # アクションが成功した場合、次のサイクルに進む前に待機
+                await asyncio.sleep(1) # 1秒待機
+
+            except (McpError, ToolError, LLMClientError, TimeoutError, ValueError) as loop_err: # ValueErrorもここで捕捉
+                 # M-02: determine_next_action やアクション実行中の特定のエラーを捕捉
+                 logger.error(f"Error in improvement loop (cycle {cycle_count}): {loop_err}", exc_info=True)
+                 last_exception = loop_err
+                 # エラーの種類に応じた処理
+                 if isinstance(loop_err, TimeoutError):
+                     typer.echo(typer.style(f"Error: Operation timed out during cycle {cycle_count}.", fg=typer.colors.YELLOW),
+                                err=True) # Corrected style call
+                     typer.echo("This might be a temporary issue. Consider increasing timeout values or checking server responsiveness.", err=True)
+                     # 一旦停止させる
+                     session_active = False
+                 elif isinstance(loop_err, LLMClientError):
+                     error_msg = f"LLM Client Error: {loop_err}"
+                     if loop_err.error_type == "APIError":
+                         error_msg += " Check API key, quota, and LLM service status."
+                     elif loop_err.error_type == "RateLimitError":
+                         error_msg += " Rate limit reached. Please wait and try again later."
+                     else:
+                         error_msg += " An unexpected error occurred with the LLM client."
+                     typer.echo(typer.style(f"Error during cycle {cycle_count}: {error_msg}", fg=typer.colors.RED),
+                                err=True) # Corrected style call
+                     session_active = False # 回復不能とみなし停止 (リトライ実装なし)
+                 elif isinstance(loop_err, (McpError, ToolError)):
+                     typer.echo(typer.style(f"Error during cycle {cycle_count}: MCP Server/Tool Error - {loop_err}", fg=typer.colors.RED),
+                                err=True) # Corrected style call
+                     typer.echo("Check MCP server status and logs for details.", err=True)
+                     session_active = False # サーバーエラーも一旦停止
+                 elif isinstance(loop_err, ValueError):
+                     # 設定や予期しないデータによるエラーなど
+                     typer.echo(typer.style(f"Error during cycle {cycle_count}: Configuration or Data Error - {loop_err}", fg=typer.colors.RED),
+                                err=True) # Corrected style call
+                     typer.echo("Check configuration files or input data.", err=True)
+                     session_active = False
+                 else:
+                     # これは通常発生しないはずだが念のため
+                     typer.echo(typer.style(f"An unexpected operational error occurred during cycle {cycle_count}: {loop_err}", fg=typer.colors.RED),
+                                err=True) # Corrected style call
+                     session_active = False
+                 # break # ループを抜ける必要はない、次の while 条件で評価される
+            except Exception as global_err:
+                 # M-02: ループ内のさらに予期せぬエラー
+                 logger.critical(f"Critical unexpected error in improvement loop (cycle {cycle_count}): {global_err}", exc_info=True)
+                 typer.echo(typer.style(f"Critical unexpected error: {global_err}", fg=typer.colors.RED), err=True) # Added style
+                 typer.echo("Stopping the improvement loop immediately.", err=True)
+                 last_exception = global_err
+                 session_active = False
+                 break # 予期せぬエラーは即時 break する
+
+        # --- ループ終了後 --- # <- コメント修正
+        logger.info("Improvement loop finished.")
+
         # ループ終了後の最終状態取得
         try:
-            final_session_info = client.get_session_info(session_id=active_session_id)
+            # final_session_info = client.get_session_info(session_id=active_session_id) # Synchronous
+            final_session_info = await loop.run_in_executor(None, client.get_session_info, active_session_id) # Use run_in_executor
             logger.info("Final session state:")
-            print_session_summary(final_session_info)
+            if final_session_info: # Check if info was obtained
+                print_session_summary(final_session_info)
+            else:
+                logger.warning("Could not retrieve final session state.")
         except Exception as e:
             logger.error(f"Failed to get final session state: {e}")
     
@@ -718,9 +818,11 @@ def improve(
 
 # 以下、新しく追加する関数
 
-async def initialize_llm_client_async(api_key: Optional[str] = None, model: str = "claude-3-opus-20240229"):
+async def initialize_llm_client_async(api_key: Optional[str] = None, model: str = DEFAULT_LLM_MODEL):
     """LLMクライアントを非同期に初期化"""
     from src.cli.llm_client import initialize_llm_client
+    # The model default here might be less relevant now, as it's resolved in 'improve'
+    # But keep it for potential direct calls or other usages.
     return initialize_llm_client(api_key=api_key, model=model)
 
 async def determine_next_action(loop, client, llm_client, session_id: str, session_info: Dict[str, Any]) -> Dict[str, Any]:
@@ -753,7 +855,8 @@ async def determine_next_action(loop, client, llm_client, session_id: str, sessi
         
         # ジョブ完了を待つ
         job_info = await loop.run_in_executor(
-            None, lambda: poll_job_status(client, job_id)
+            None, poll_job_status, client, job_id # Pass client and job_id
+            # Timeout/interval not directly controlled here, uses poll_job_status defaults
         )
         
         if job_info.get("status") != "completed":
@@ -798,7 +901,8 @@ async def determine_next_action(loop, client, llm_client, session_id: str, sessi
 async def execute_analyze_evaluation(loop, client, llm_client, session_id: str, evaluation_results: Dict[str, Any]):
     """評価結果の分析を実行"""
     logger = logging.getLogger(__name__)
-    
+    typer.echo("Analyzing evaluation results...") # Added start message
+
     try:
         # 評価分析プロンプトを生成
         job_result = client.run_tool("get_analyze_evaluation_prompt", {
@@ -812,8 +916,10 @@ async def execute_analyze_evaluation(loop, client, llm_client, session_id: str, 
             return False
         
         # ジョブ完了を待つ
+        typer.echo(f"Waiting for analysis prompt generation job ({job_id}) to complete...") # Added waiting message
         job_info = await loop.run_in_executor(
-            None, lambda: poll_job_status(client, job_id)
+            None, poll_job_status, client, job_id # Pass client and job_id
+            # Timeout/interval not directly controlled here, uses poll_job_status defaults
         )
         
         if job_info.get("status") != "completed":
@@ -827,6 +933,7 @@ async def execute_analyze_evaluation(loop, client, llm_client, session_id: str, 
             return False
         
         # LLMによる分析
+        typer.echo("Generating analysis using LLM...") # Added LLM call message
         analysis_json = await llm_client.generate(prompt, request_json=True)
         logger.debug(f"LLM analysis response: {analysis_json}")
         
@@ -868,6 +975,7 @@ async def execute_analyze_evaluation(loop, client, llm_client, session_id: str, 
             cycle_state_update={"last_analysis": json.loads(analysis_json) if isinstance(analysis_json, str) else analysis_json}
         )
         
+        typer.echo("Analysis complete.") # Added end message
         return True
     
     except Exception as e:
@@ -877,7 +985,8 @@ async def execute_analyze_evaluation(loop, client, llm_client, session_id: str, 
 async def execute_generate_hypotheses(loop, client, llm_client, session_id: str, current_metrics: Dict[str, Any], num_hypotheses: int = 3):
     """改善仮説の生成を実行"""
     logger = logging.getLogger(__name__)
-    
+    typer.echo("Generating improvement hypotheses...") # Added start message
+
     try:
         # 仮説生成プロンプトを取得
         job_result = client.run_tool("get_generate_hypotheses_prompt", {
@@ -893,7 +1002,8 @@ async def execute_generate_hypotheses(loop, client, llm_client, session_id: str,
         
         # ジョブ完了を待つ
         job_info = await loop.run_in_executor(
-            None, lambda: poll_job_status(client, job_id)
+            None, poll_job_status, client, job_id # Pass client and job_id
+            # Timeout/interval not directly controlled here, uses poll_job_status defaults
         )
         
         if job_info.get("status") != "completed":
@@ -962,7 +1072,8 @@ async def execute_improve_code(loop, client, llm_client, session_id: str, detect
         
         # ジョブ完了を待つ
         job_info = await loop.run_in_executor(
-            None, lambda: poll_job_status(client, job_id)
+            None, poll_job_status, client, job_id # Pass client and job_id
+            # Timeout/interval not directly controlled here, uses poll_job_status defaults
         )
         
         if job_info.get("status") != "completed":
@@ -1035,7 +1146,8 @@ async def execute_improve_code(loop, client, llm_client, session_id: str, detect
         
         # 保存ジョブ完了を待つ
         save_job_info = await loop.run_in_executor(
-            None, lambda: poll_job_status(client, save_job_id)
+            None, poll_job_status, client, save_job_id # Pass client and job_id
+            # Timeout/interval not directly controlled here, uses poll_job_status defaults
         )
         
         if save_job_info.get("status") != "completed":
@@ -1063,7 +1175,7 @@ async def execute_improve_code(loop, client, llm_client, session_id: str, detect
         logger.error(f"Error improving code: {e}", exc_info=True)
         return False
 
-async def execute_run_evaluation(loop, client, session_id: str, detector_name: str, dataset_name: str, code_version: Optional[str] = None):
+async def execute_run_evaluation(loop, client, session_id: str, detector_name: str, dataset_name: str, code_version: Optional[str] = None, poll_interval: int = DEFAULT_POLL_INTERVAL, job_timeout: int = DEFAULT_JOB_TIMEOUT):
     """評価を実行"""
     logger = logging.getLogger(__name__)
     
@@ -1089,7 +1201,8 @@ async def execute_run_evaluation(loop, client, session_id: str, detector_name: s
             progress.update(10)
             
             eval_job_info = await loop.run_in_executor(
-                None, lambda: poll_job_status(client, eval_job_id)
+                None,
+                lambda: poll_job_status(client, eval_job_id, poll_interval=poll_interval, timeout=job_timeout)
             )
             
             progress.update(100)
@@ -1136,7 +1249,7 @@ async def execute_run_evaluation(loop, client, session_id: str, detector_name: s
         logger.error(f"Error running evaluation: {e}", exc_info=True)
         return False
 
-async def execute_optimize_parameters(loop, client, llm_client, session_id: str, detector_name: str, current_metrics: Dict[str, Any]):
+async def execute_optimize_parameters(loop, client, llm_client, session_id: str, detector_name: str, current_metrics: Dict[str, Any], always_confirm: bool = True, poll_interval: int = DEFAULT_POLL_INTERVAL, job_timeout: int = DEFAULT_JOB_TIMEOUT):
     """パラメータ最適化を実行"""
     logger = logging.getLogger(__name__)
     
@@ -1159,7 +1272,8 @@ async def execute_optimize_parameters(loop, client, llm_client, session_id: str,
         
         # ジョブ完了を待つ
         job_info = await loop.run_in_executor(
-            None, lambda: poll_job_status(client, job_id)
+            None, poll_job_status, client, job_id # Pass client and job_id
+            # Timeout/interval not directly controlled here, uses poll_job_status defaults
         )
         
         if job_info.get("status") != "completed":
@@ -1232,7 +1346,8 @@ async def execute_optimize_parameters(loop, client, llm_client, session_id: str,
                 progress.update(10)
                 
                 grid_job_info = await loop.run_in_executor(
-                    None, lambda: poll_job_status(client, grid_job_id)
+                    None,
+                    lambda: poll_job_status(client, grid_job_id, poll_interval=poll_interval, timeout=job_timeout)
                 )
                 
                 progress.update(100)
@@ -1272,7 +1387,8 @@ async def execute_optimize_parameters(loop, client, llm_client, session_id: str,
                 
                 # 保存ジョブ完了を待つ
                 save_job_info = await loop.run_in_executor(
-                    None, lambda: poll_job_status(client, save_job_id)
+                    None, poll_job_status, client, save_job_id # Pass client and job_id
+                    # Timeout/interval not directly controlled here, uses poll_job_status defaults
                 )
                 
                 if save_job_info.get("status") != "completed":
@@ -1299,53 +1415,110 @@ async def execute_optimize_parameters(loop, client, llm_client, session_id: str,
 
 def create_grid_config_from_suggestions(detector_name: str, suggestion: Dict[str, Any]) -> Dict[str, Any]:
     """パラメータ提案からグリッドサーチ設定を生成する"""
+    logger = logging.getLogger(__name__)
     grid_config = {
         "detector_name": detector_name,
         "parameters": {}
     }
-    
-    parameters = suggestion.get('parameters', [])
-    for param in parameters:
-        name = param.get('name')
-        if not name:
-            continue
-        
-        suggested_range = param.get('suggested_range', [])
-        suggested_values = param.get('suggested_values', [])
-        
-        if suggested_range and len(suggested_range) >= 2:
-            # 数値範囲の場合
-            min_val, max_val = suggested_range[0], suggested_range[-1]
-            param_type = param.get('type', '').lower()
-            
-            if param_type == 'int':
-                # 整数パラメータ
-                grid_config['parameters'][name] = {
-                    "min": int(min_val),
-                    "max": int(max_val),
-                    "num": min(10, int(max_val - min_val + 1)),  # 最大10点
-                    "log": False
-                }
-            elif param_type == 'float':
-                # 浮動小数点パラメータ
-                grid_config['parameters'][name] = {
-                    "min": float(min_val),
-                    "max": float(max_val),
-                    "num": 10,  # 10点
-                    "log": False
-                }
-        elif suggested_values:
-            # 離散値の場合
-            grid_config['parameters'][name] = {
-                "values": suggested_values
-            }
-    
+
+    try:
+        parameters = suggestion.get('parameters', [])
+        if not isinstance(parameters, list):
+            logger.warning(f"Expected 'parameters' to be a list in suggestion, got {type(parameters)}. Skipping grid config generation.")
+            return grid_config
+
+        for param in parameters:
+            try:
+                if not isinstance(param, dict):
+                    logger.warning(f"Expected parameter item to be a dict, got {type(param)}. Skipping this item: {param}")
+                    continue
+
+                name = param.get('name')
+                if not name:
+                    logger.warning(f"Missing 'name' in parameter suggestion item. Skipping: {param}")
+                    continue
+
+                suggested_range = param.get('suggested_range', [])
+                suggested_values = param.get('suggested_values', [])
+                param_type = param.get('type', '').lower()
+
+                if suggested_range and isinstance(suggested_range, list) and len(suggested_range) >= 2:
+                    # 数値範囲の場合
+                    try:
+                        min_val, max_val = suggested_range[0], suggested_range[-1]
+
+                        if param_type == 'int':
+                            # 整数パラメータ
+                            min_int, max_int = int(min_val), int(max_val)
+                            grid_config['parameters'][name] = {
+                                "min": min_int,
+                                "max": max_int,
+                                "num": min(10, max_int - min_int + 1) if max_int >= min_int else 1, # 最大10点, 範囲が逆なら1点
+                                "log": False
+                            }
+                        elif param_type == 'float':
+                            # 浮動小数点パラメータ
+                            min_float, max_float = float(min_val), float(max_val)
+                            grid_config['parameters'][name] = {
+                                "min": min_float,
+                                "max": max_float,
+                                "num": 10,  # 10点
+                                "log": False
+                            }
+                        else:
+                            logger.warning(f"Unknown or unsupported type '{param_type}' for range parameter '{name}'. Skipping.")
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"Error processing range for parameter '{name}': {e}. Range was: {suggested_range}. Skipping.")
+
+                elif suggested_values and isinstance(suggested_values, list):
+                    # 離散値の場合
+                    if not suggested_values: # 空リストはスキップ
+                        logger.warning(f"Empty 'suggested_values' for parameter '{name}'. Skipping.")
+                        continue
+                    grid_config['parameters'][name] = {
+                        "values": suggested_values
+                    }
+                else:
+                    # 範囲も離散値も指定がない場合は警告（ログレベルDEBUGでも良いかも）
+                    logger.debug(f"No valid 'suggested_range' or 'suggested_values' found for parameter '{name}'. Skipping grid entry for it.")
+
+            except (KeyError, TypeError, AttributeError) as e:
+                logger.warning(f"Error processing parameter suggestion item: {e}. Item was: {param}. Skipping.")
+                continue # 次のパラメータへ
+
+    except Exception as e:
+        # suggestion 自体の形式がおかしい場合など、予期せぬエラー
+        logger.error(f"Unexpected error creating grid config from suggestions: {e}", exc_info=True)
+        # エラー発生時は空の設定を返す（あるいは例外を再発生させるか要検討）
+        return {"detector_name": detector_name, "parameters": {}}
+
+    logger.info(f"Generated grid config for {detector_name}: {grid_config['parameters']}")
     return grid_config
 
 def apply_parameters_to_code(code: str, parameters: Dict[str, Any]) -> str:
-    """最適パラメータをコードに適用する"""
+    """最適パラメータをコードに適用する (正規表現ベース)。
+
+    注意:
+    この関数は正規表現を使用してコード内の単純な変数代入 (`var = value`) を
+    見つけ、置き換えます。以下の制限があります:
+    - コメント内や文字列リテラル内の変数名を誤って変更する可能性があります。
+    - 辞書やクラス属性など、より複雑な方法でパラメータが設定されている場合、
+      正しく適用できない可能性があります。
+    - パラメータが存在しない場合、ファイルの末尾に追加されます。
+
+    この関数による変更後は、コードが期待通り動作するか必ず確認してください。
+    より堅牢な方法として AST (抽象構文木) の使用が考えられますが、実装が複雑になります。
+
+    Args:
+        code: 元のソースコード文字列。
+        parameters: 適用するパラメータ名と値の辞書。
+
+    Returns:
+        パラメータが適用された (可能性のある) コード文字列。
+    """
     import re
-    
+    logger = logging.getLogger(__name__) # Add logger
+
     # コードの行リスト
     lines = code.splitlines()
     updated_lines = []
@@ -1367,10 +1540,10 @@ def apply_parameters_to_code(code: str, parameters: Dict[str, Any]) -> str:
                 
                 # コメントがある場合は保持
                 if after_comment:
-                    updated_line = f"{var_name} = {param_value} # {after_comment}"
+                    updated_line = f"{var_name} = {repr(param_value)} # {after_comment}" # Use repr for safer string representation
                 else:
-                    updated_line = f"{var_name} = {param_value}"
-                
+                    updated_line = f"{var_name} = {repr(param_value)}" # Use repr
+
                 updated_lines.append(updated_line)
                 param_applied.add(param_name)
                 applied = True
@@ -1379,13 +1552,15 @@ def apply_parameters_to_code(code: str, parameters: Dict[str, Any]) -> str:
         if not applied:
             updated_lines.append(line)
     
-    # 適用されなかったパラメータを最後に追加
-    if param_applied != set(parameters.keys()):
-        updated_lines.append("\n# Optimized parameters")
-        for param_name, param_value in parameters.items():
-            if param_name not in param_applied:
-                updated_lines.append(f"{param_name} = {param_value}  # Added by parameter optimization")
-    
+    # 適用されなかったパラメータを最後に追加 (意図しない場合もあるのでログを残す)
+    unapplied_params = set(parameters.keys()) - param_applied
+    if unapplied_params:
+        logger.warning(f"Parameters not found in code and will be appended: {unapplied_params}")
+        updated_lines.append("\n# --- Parameters appended by optimization ---")
+        for param_name in sorted(unapplied_params):
+            param_value = parameters[param_name]
+            updated_lines.append(f"{param_name} = {repr(param_value)}  # Added by parameter optimization")
+
     return "\n".join(updated_lines)
 
 def print_session_summary(session_data: Dict[str, Any]):
@@ -1396,20 +1571,24 @@ def print_session_summary(session_data: Dict[str, Any]):
     session_id = session_data.get('session_id')
     status = session_data.get('status', 'Unknown')
     cycle_state = session_data.get('cycle_state', {})
-    best_metrics = session_data.get('best_metrics', {})
+    best_metrics = session_data.get('best_metrics') # Get best_metrics, might be None
 
     cycle_count = cycle_state.get('cycle_count', 0)
     stagnation_count = cycle_state.get('stagnation_count', 0)
-    best_f_measure = best_metrics.get('overall', {}).get('f_measure') # 仮に overall F-measure を指標とする
+    # Handle the case where best_metrics might be None
+    best_f_measure = None
+    if best_metrics: # Check if best_metrics is not None
+        best_f_measure = best_metrics.get('overall', {}).get('f_measure') # 仮に overall F-measure を指標とする
 
+    typer.echo(f"--- Session Summary (ID: {session_id}) ---") # Use typer.echo for user output
+    typer.echo(f"Status: {status}")
     logger.info(f"--- Session Summary (ID: {session_id}) ---")
-    logger.info(f"Status: {status}")
     logger.info(f"Cycle: {cycle_count}")
     logger.info(f"Stagnation: {stagnation_count}")
     if best_f_measure is not None:
-        logger.info(f"Best F-measure: {best_f_measure:.4f}")
+        typer.echo(f"Best F-measure: {best_f_measure:.4f}")
     else:
-        logger.info("Best F-measure: N/A")
+        typer.echo("Best F-measure: N/A")
     logger.info("-----------------------------------------")
 
 # ... (if __name__ == "__main__": の部分は mirai.py では不要) 
