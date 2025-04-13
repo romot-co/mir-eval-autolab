@@ -4,24 +4,26 @@
 このモジュールでは、ピッチ（周波数）に関連する変換関数やユーティリティを提供します。
 """
 
-import numpy as np
 from typing import Union
+
 import numba
+import numpy as np
+
 
 def hz_to_midi(frequencies: Union[float, np.ndarray, list]) -> Union[float, np.ndarray]:
     """
     周波数（Hz）からMIDIノート番号に変換する
-    
+
     Note
     ----
     この実装は特にNumbaとの互換性とエラー処理の一貫性のために維持されています。
     単純な変換のみが必要な場合はlibrosa.hz_to_midi()を使用してください。
-    
+
     Parameters
     ----------
     frequencies : float or numpy.ndarray or list
         周波数の値または配列 (Hz)
-    
+
     Returns
     -------
     float or numpy.ndarray
@@ -30,18 +32,19 @@ def hz_to_midi(frequencies: Union[float, np.ndarray, list]) -> Union[float, np.n
     # リストまたは他の配列型の入力をnumpy配列に変換
     if not isinstance(frequencies, np.ndarray) and not np.isscalar(frequencies):
         frequencies = np.asarray(frequencies, dtype=float)
-        
-    with np.errstate(divide='ignore', invalid='ignore'):
+
+    with np.errstate(divide="ignore", invalid="ignore"):
         midi_notes = 12 * np.log2(frequencies / 440.0) + 69
-    
+
     # 無効な値（0Hz以下）を0に設定
     if isinstance(midi_notes, np.ndarray):
         midi_notes[~np.isfinite(midi_notes)] = 0
     else:
         if not np.isfinite(midi_notes):
             midi_notes = 0
-    
+
     return midi_notes
+
 
 def midi_to_hz(midi_notes: Union[float, np.ndarray, list]) -> Union[float, np.ndarray]:
     """
@@ -51,12 +54,12 @@ def midi_to_hz(midi_notes: Union[float, np.ndarray, list]) -> Union[float, np.nd
     ----
     この実装は特にNumbaとの互換性とエラー処理の一貫性のために維持されています。
     単純な変換のみが必要な場合はlibrosa.hz_to_midi()を使用してください。
-    
+
     Parameters
     ----------
     midi_notes : float or numpy.ndarray or list
         MIDIノート番号の値または配列
-    
+
     Returns
     -------
     float or numpy.ndarray
@@ -66,34 +69,35 @@ def midi_to_hz(midi_notes: Union[float, np.ndarray, list]) -> Union[float, np.nd
     scalar_input = np.isscalar(midi_notes)
     if not isinstance(midi_notes, np.ndarray) and not scalar_input:
         midi_notes = np.asarray(midi_notes, dtype=float)
-    
+
     # 無効な値（負または0）を0周波数にマッピング
     if isinstance(midi_notes, np.ndarray):
         # ゼロ以下の値を0にする
         midi_notes = np.copy(midi_notes)  # 元の配列を変更しないようにコピー
         zero_mask = midi_notes <= 0
-        
+
         # 周波数を計算
         frequencies = 440.0 * (2.0 ** ((midi_notes - 69) / 12.0))
-        
+
         # 無効なノートを0Hzに設定
         frequencies[zero_mask] = 0.0
-        
+
         return frequencies
     else:
         if midi_notes <= 0:
             return 0.0
         return 440.0 * (2.0 ** ((midi_notes - 69) / 12.0))
 
+
 def cents_to_ratio(cents: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
     """
     セント値を周波数比に変換する
-    
+
     Parameters
     ----------
     cents : float or numpy.ndarray
         セント値
-    
+
     Returns
     -------
     float or numpy.ndarray
@@ -101,33 +105,36 @@ def cents_to_ratio(cents: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
     """
     return 2.0 ** (cents / 1200.0)
 
+
 def ratio_to_cents(ratio: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
     """
     周波数比をセント値に変換する
-    
+
     Parameters
     ----------
     ratio : float or numpy.ndarray
         周波数比
-    
+
     Returns
     -------
     float or numpy.ndarray
         セント値
     """
-    with np.errstate(divide='ignore', invalid='ignore'):
+    with np.errstate(divide="ignore", invalid="ignore"):
         cents = 1200.0 * np.log2(ratio)
-    
+
     # 無効な値を0に設定
     if isinstance(cents, np.ndarray):
         cents[~np.isfinite(cents)] = 0
     else:
         if not np.isfinite(cents):
             cents = 0
-    
+
     return cents
 
+
 # --- Numba accelerated versions --- #
+
 
 @numba.njit(cache=True, fastmath=True)
 def hz_to_cents(frequencies: np.ndarray, reference_hz: float = 10.0) -> np.ndarray:
@@ -156,7 +163,7 @@ def hz_to_cents(frequencies: np.ndarray, reference_hz: float = 10.0) -> np.ndarr
     for i in range(len(frequencies)):
         freq = frequencies[i]
         if freq <= 0:
-            cents_array[i] = -np.inf # Or another indicator for invalid input
+            cents_array[i] = -np.inf  # Or another indicator for invalid input
         else:
             # np.log2 は Numba でサポートされている
             cents_array[i] = 1200.0 * np.log2(freq / reference_hz)
@@ -182,7 +189,9 @@ def cents_to_hz(cents: np.ndarray, reference_hz: float = 10.0) -> np.ndarray:
         周波数（Hz）の配列
     """
     if reference_hz <= 0:
-         return np.zeros_like(cents, dtype=np.float64) # Return 0 Hz for invalid reference
+        return np.zeros_like(
+            cents, dtype=np.float64
+        )  # Return 0 Hz for invalid reference
 
     # isinstanceチェックを削除し、配列処理に特化
     # Assuming valid finite cents input for simplicity here.
@@ -190,4 +199,5 @@ def cents_to_hz(cents: np.ndarray, reference_hz: float = 10.0) -> np.ndarray:
     return reference_hz * (2.0 ** (cents / 1200.0))
     # Scalar handling is removed
 
-# ... rest of the file remains unchanged ... 
+
+# ... rest of the file remains unchanged ...

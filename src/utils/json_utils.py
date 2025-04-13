@@ -6,14 +6,15 @@ JSONシリアライズ関連のユーティリティ関数
 """
 
 import json
-import numpy as np
 from pathlib import Path
+
+import numpy as np
 
 
 class NumpyEncoder(json.JSONEncoder):
     """
     NumPy配列やndarray型、PathオブジェクトなどをJSON形式に変換するためのエンコーダー
-    
+
     Examples
     --------
     >>> import json
@@ -23,7 +24,7 @@ class NumpyEncoder(json.JSONEncoder):
     >>> json.dumps(data, cls=NumpyEncoder)
     '{"array": [1, 2, 3]}'
     """
-    
+
     def default(self, obj):
         if isinstance(obj, np.integer):
             return int(obj)
@@ -32,13 +33,13 @@ class NumpyEncoder(json.JSONEncoder):
         elif isinstance(obj, np.ndarray):
             # 複素数の配列を処理
             if np.issubdtype(obj.dtype, np.complexfloating):
-                return [{'real': item.real, 'imag': item.imag} for item in obj.tolist()]
+                return [{"real": item.real, "imag": item.imag} for item in obj.tolist()]
             return obj.tolist()
         elif isinstance(obj, np.bool_):
             return bool(obj)
         elif isinstance(obj, (np.complex64, np.complex128)):
-            return {'real': obj.real, 'imag': obj.imag}
-        elif hasattr(obj, 'to_json'):
+            return {"real": obj.real, "imag": obj.imag}
+        elif hasattr(obj, "to_json"):
             # カスタムオブジェクトのシリアライズをサポート
             return obj.to_json()
         elif isinstance(obj, Path):
@@ -49,5 +50,5 @@ class NumpyEncoder(json.JSONEncoder):
         #     # シリアライズ不能な型で TypeError が発生しない原因になる
         #     return str(obj)
         # except:
-            # その他は親クラスのdefaultメソッドに委譲
-        return super(NumpyEncoder, self).default(obj) 
+        # その他は親クラスのdefaultメソッドに委譲
+        return super(NumpyEncoder, self).default(obj)

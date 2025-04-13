@@ -29,72 +29,91 @@ result = safe_execute(
 ```
 """
 
-import traceback
-import logging
-from typing import Dict, Any, Optional, Callable, TypeVar, Union, List, Tuple, Type
-import numpy as np
 import datetime
-import tenacity
-import requests
+import logging
 import time
+import traceback
 from functools import wraps
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
-T = TypeVar('T')
+import numpy as np
+import requests
+import tenacity
+
+T = TypeVar("T")
+
 
 # カスタム例外クラス定義
 class MirexError(Exception):
     """基本となるMIREX評価環境の例外クラス"""
+
     pass
 
 
 class DetectionError(MirexError):
     """音検出中に発生するエラー"""
+
     pass
 
 
 class EvaluationError(MirexError):
     """評価処理中に発生するエラー"""
+
     pass
 
 
 class FileError(MirexError):
     """ファイル操作中に発生するエラー"""
+
     pass
 
 
 class ConfigError(MirexError):
     """設定関連のエラー"""
+
     pass
 
 
 class GridSearchError(MirexError):
     """グリッドサーチ処理中に発生するエラー"""
+
     pass
 
 
 class VisualizationError(MirexError):
     """可視化処理中に発生するエラー"""
+
     pass
 
 
 class LLMError(MirexError):
     """LLM API呼び出しや応答処理に関するエラー"""
+
     pass
 
 
 class StateManagementError(MirexError):
     """セッションやジョブの状態管理（DBアクセスなど）に関するエラー"""
+
     pass
 
 
 class SynthesizerError(MirexError):
     """音声合成処理中に発生するエラー"""
+
     pass
 
 
 class SubprocessError(MirexError):
     """サブプロセス実行に関するエラー"""
-    def __init__(self, message: str, returncode: Optional[int] = None, stdout: Optional[str] = None, stderr: Optional[str] = None):
+
+    def __init__(
+        self,
+        message: str,
+        returncode: Optional[int] = None,
+        stdout: Optional[str] = None,
+        stderr: Optional[str] = None,
+    ):
         super().__init__(message)
         self.returncode = returncode
         self.stdout = stdout
@@ -105,15 +124,18 @@ class SubprocessError(MirexError):
         if self.returncode is not None:
             msg += f" (Return Code: {self.returncode})"
         if self.stderr:
-            msg += f"\nStderr: {self.stderr[:500]}..." # 長すぎる場合に切り詰め
+            msg += f"\nStderr: {self.stderr[:500]}..."  # 長すぎる場合に切り詰め
         if self.stdout:
-            msg += f"\nStdout: {self.stdout[:500]}..." # 長すぎる場合に切り詰め
+            msg += f"\nStdout: {self.stdout[:500]}..."  # 長すぎる場合に切り詰め
         return msg
 
 
-def log_exception(logger: logging.Logger, e: Exception, 
-                 message: str = "エラーが発生しました", 
-                 log_level: int = logging.ERROR) -> str:
+def log_exception(
+    logger: logging.Logger,
+    e: Exception,
+    message: str = "エラーが発生しました",
+    log_level: int = logging.ERROR,
+) -> str:
     """
     例外をログに記録し、フォーマットされたエラーメッセージを返します。
 
@@ -135,7 +157,7 @@ def log_exception(logger: logging.Logger, e: Exception,
     """
     error_msg = f"{message}: {str(e)}"
     stack_trace = traceback.format_exc()
-    
+
     if log_level == logging.DEBUG:
         logger.debug(f"{error_msg}\\n{stack_trace}", exc_info=True)
     elif log_level == logging.INFO:
@@ -146,17 +168,19 @@ def log_exception(logger: logging.Logger, e: Exception,
         logger.error(f"{error_msg}\\n{stack_trace}", exc_info=True)
     elif log_level == logging.CRITICAL:
         logger.critical(f"{error_msg}\\n{stack_trace}", exc_info=True)
-    
+
     return f"{error_msg}\\n{stack_trace}"
 
 
-def safe_execute(func: Callable[..., T], 
-                logger: logging.Logger, 
-                error_msg: str = "関数実行中にエラーが発生しました",
-                default_value: Optional[T] = None, 
-                log_level: int = logging.ERROR, 
-                raise_exception: bool = False,
-                **kwargs) -> Union[T, Optional[T]]:
+def safe_execute(
+    func: Callable[..., T],
+    logger: logging.Logger,
+    error_msg: str = "関数実行中にエラーが発生しました",
+    default_value: Optional[T] = None,
+    log_level: int = logging.ERROR,
+    raise_exception: bool = False,
+    **kwargs,
+) -> Union[T, Optional[T]]:
     """
     関数を安全に実行し、例外が発生した場合はログに記録して既定値を返します。
 
@@ -196,7 +220,9 @@ def safe_execute(func: Callable[..., T],
         return default_value
 
 
-def create_error_result(error_msg: str, include_keys: List[str] = None) -> Dict[str, Any]:
+def create_error_result(
+    error_msg: str, include_keys: List[str] = None
+) -> Dict[str, Any]:
     """
     エラー時のデフォルト評価結果を生成します。
 
@@ -213,50 +239,46 @@ def create_error_result(error_msg: str, include_keys: List[str] = None) -> Dict[
         エラー時のデフォルト評価結果
     """
     # 基本的な評価指標
-    metrics = {
-        'precision': 0.0,
-        'recall': 0.0,
-        'f_measure': 0.0
-    }
-    
+    metrics = {"precision": 0.0, "recall": 0.0, "f_measure": 0.0}
+
     # エラー結果の構造
     result = {
-        'precision': 0.0,
-        'recall': 0.0,
-        'f_measure': 0.0,
-        'match_statistics': {
-            'ref_note_count': 0,
-            'est_note_count': 0,
-            'onset_matches': 0,
-            'offset_matches': 0,
-            'pitch_matches': 0,
-            'complete_matches': 0,
-            'onset_errors': [],
-            'offset_errors': [],
-            'pitch_errors': [],
-            'unmatched_ref_notes': 0,
-            'unmatched_est_notes': 0,
-            'average_onset_error': 0.0,
-            'average_offset_error': 0.0,
-            'average_pitch_error': 0.0,
-            'max_onset_error': 0.0,
-            'max_offset_error': 0.0,
-            'max_pitch_error': 0.0,
-            'onset_match_rate': 0.0,
-            'offset_match_rate': 0.0,
-            'pitch_match_rate': 0.0,
-            'complete_match_rate': 0.0
+        "precision": 0.0,
+        "recall": 0.0,
+        "f_measure": 0.0,
+        "match_statistics": {
+            "ref_note_count": 0,
+            "est_note_count": 0,
+            "onset_matches": 0,
+            "offset_matches": 0,
+            "pitch_matches": 0,
+            "complete_matches": 0,
+            "onset_errors": [],
+            "offset_errors": [],
+            "pitch_errors": [],
+            "unmatched_ref_notes": 0,
+            "unmatched_est_notes": 0,
+            "average_onset_error": 0.0,
+            "average_offset_error": 0.0,
+            "average_pitch_error": 0.0,
+            "max_onset_error": 0.0,
+            "max_offset_error": 0.0,
+            "max_pitch_error": 0.0,
+            "onset_match_rate": 0.0,
+            "offset_match_rate": 0.0,
+            "pitch_match_rate": 0.0,
+            "complete_match_rate": 0.0,
         },
-        'error': error_msg,
-        'valid': False
+        "error": error_msg,
+        "valid": False,
     }
-    
+
     # 追加のキーがある場合は追加
     if include_keys:
         for key in include_keys:
             if key not in result:
                 result[key] = 0.0
-    
+
     return result
 
 
@@ -289,11 +311,11 @@ def retry_on_exception(
     retry_exceptions: Optional[Union[Type[Exception], Tuple[Type[Exception], ...]]] = (
         requests.exceptions.RequestException,
         requests.Timeout,
-        LLMError, # LLM関連の一時的なエラーも対象とする場合
-        TimeoutError # tenacity.RetryError が TimeoutError をラップすることがあるため
+        LLMError,  # LLM関連の一時的なエラーも対象とする場合
+        TimeoutError,  # tenacity.RetryError が TimeoutError をラップすることがあるため
     ),
     logger: Optional[logging.Logger] = None,
-    log_message_prefix: str = "リトライ試行"
+    log_message_prefix: str = "リトライ試行",
 ) -> Callable:
     """
     指定された例外が発生した場合に関数をリトライするデコレータ。
@@ -327,6 +349,7 @@ def retry_on_exception(
     tenacity.RetryError
         最大リトライ回数に達しても例外が解消されなかった場合
     """
+
     def before_sleep_log(retry_state: tenacity.RetryCallState):
         """リトライ前にログを出力するコールバック関数"""
         if logger:
@@ -341,13 +364,15 @@ def retry_on_exception(
     retry_config = tenacity.retry(
         stop=tenacity.stop_after_attempt(max_attempts),
         wait=tenacity.wait_exponential(
-            multiplier=initial_delay,
-            exp_base=backoff_factor,
-            max=max_delay
+            multiplier=initial_delay, exp_base=backoff_factor, max=max_delay
         ),
-        retry=tenacity.retry_if_exception_type(retry_exceptions) if retry_exceptions else tenacity.retry_if_exception_type(Exception),
+        retry=(
+            tenacity.retry_if_exception_type(retry_exceptions)
+            if retry_exceptions
+            else tenacity.retry_if_exception_type(Exception)
+        ),
         before_sleep=before_sleep_log if logger else None,
-        reraise=True # tenacity.RetryErrorを発生させる
+        reraise=True,  # tenacity.RetryErrorを発生させる
     )
 
     # デコレータを適用
@@ -360,7 +385,7 @@ def retry_on_exception(
 def wrap_exceptions(
     target_exceptions: List[type],
     wrapper_exception: type,
-    message: Optional[str] = None
+    message: Optional[str] = None,
 ) -> Callable:
     """
     特定の例外を別の例外でラップするデコレータを作成します。
@@ -388,12 +413,19 @@ def wrap_exceptions(
         pass
     ```
     """
+
     def decorator(func):
         def wrapper(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
             except tuple(target_exceptions) as e:
-                error_message = message if message else f"{func.__name__}関数の実行中にエラーが発生しました"
+                error_message = (
+                    message
+                    if message
+                    else f"{func.__name__}関数の実行中にエラーが発生しました"
+                )
                 raise wrapper_exception(f"{error_message}: {str(e)}") from e
+
         return wrapper
-    return decorator 
+
+    return decorator

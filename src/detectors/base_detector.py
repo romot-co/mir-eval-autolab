@@ -2,18 +2,20 @@
 音楽ノート検出の基本クラス
 """
 
-import time
-import numpy as np
-from abc import ABC, abstractmethod
-from typing import Dict, Any
 import logging
+import time
+from abc import ABC, abstractmethod
+from typing import Any, Dict
+
+import numpy as np
+
 
 class BaseDetector(ABC):
     """
     音楽ノート検出の基本クラス
     すべての検出器はこのクラスを継承する必要があります。
     """
-    
+
     def __init__(self, **kwargs):
         """
         検出器の初期化
@@ -24,7 +26,7 @@ class BaseDetector(ABC):
             検出器のパラメータ
         """
         self.params = kwargs
-    
+
     @abstractmethod
     def detect(self, audio_data: np.ndarray, sample_rate: int) -> Dict[str, np.ndarray]:
         """
@@ -72,6 +74,6 @@ class BaseDetector(ABC):
             返される配列のデータ型は通常 float または int です。
         """
         raise NotImplementedError("サブクラスはこのメソッドを実装する必要があります。")
-    
+
     def __str__(self) -> str:
-        return self.__class__.__name__ 
+        return self.__class__.__name__
