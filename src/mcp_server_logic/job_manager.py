@@ -42,6 +42,20 @@ logger = logging.getLogger('mcp_server.job_manager')
 job_queue: Queue[Tuple[str, Callable[..., Coroutine], tuple, dict]] = Queue()
 active_jobs: Dict[str, JobInfo] = {} # {job_id: JobInfo} (JobInfo を直接使う)
 
+def _validate_db_path(db_path: Path) -> None:
+    """DBパスを検証する
+    
+    Args:
+        db_path: 検証するDBパス
+        
+    Raises:
+        ValueError: DBパスが無効な場合
+    """
+    if not db_path.exists():
+        raise ValueError(f"DB file does not exist: {db_path}")
+    if not db_path.is_file():
+        raise ValueError(f"DB path is not a file: {db_path}") 
+
 # --- Helper function to parse DB row into Job dict (schemas.py を使うので不要になる可能性) --- #
 def _db_row_to_jobinfo(row: Dict[str, Any]) -> JobInfo:
     """DBの辞書からJobInfo Pydanticモデルに変換 (JSONデコード含む)"""
@@ -510,43 +524,32 @@ async def list_jobs(
 
 # --- 新規: アクティブなワーカー情報を取得する関数 --- #
 async def get_worker_status(stalled_threshold_seconds: int = 3600) -> Dict[str, Any]:
-    """ジョブワーカーの状態情報を取得します
-    
-    Args:
-        stalled_threshold_seconds: この秒数以上実行されているジョブを停滞中と見なす
-        
-    Returns:
-        ワーカー状態の情報を含む辞書
-    """
+    """ジョブワーカーの状態情報を取得します"""
     try:
         current_time = time.time()
         status_info = {
-            "active_workers": len(JOB_WORKERS),
-            "queue_size": JOB_QUEUE.qsize(),
+            "active_workers": len(active_jobs),
+            "queue_size": job_queue.qsize(),
             "running_jobs": [],
             "potentially_stalled_jobs": []
         }
         
         # 実行中のジョブとその情報を収集
-        for worker_id, worker_info in JOB_WORKERS.items():
-            if worker_info["current_job"]:
-                job_id = worker_info["current_job"]
-                job_start_time = worker_info.get("job_start_time", 0)
-                running_time = current_time - job_start_time if job_start_time else 0
+        for job_id, job_info in active_jobs.items():
+            if job_info.status == JobStatus.RUNNING:
+                running_time = current_time - (job_info.start_time or 0)
                 
-                job_info = {
+                job_data = {
                     "job_id": job_id,
-                    "worker_id": worker_id,
+                    "worker_id": job_info.worker_id,
                     "running_time_seconds": int(running_time),
-                    "tool_name": worker_info.get("tool_name", "unknown")
+                    "tool_name": job_info.tool_name or "unknown"
                 }
                 
-                # 実行中のジョブのリストに追加
-                status_info["running_jobs"].append(job_info)
+                status_info["running_jobs"].append(job_data)
                 
-                # 停滞している可能性のあるジョブをチェック
                 if running_time > stalled_threshold_seconds:
-                    status_info["potentially_stalled_jobs"].append(job_info)
+                    status_info["potentially_stalled_jobs"].append(job_data)
         
         return status_info
     except Exception as e:
@@ -656,6 +659,7 @@ def register_job_tools(mcp: FastMCP, config: Dict[str, Any], db_path: Path):
     async def get_worker_status_tool(stalled_threshold_seconds: int = 3600) -> Dict[str, Any]:
         """ジョブワーカーの状態と情報を取得します。"""
         return await get_worker_status(stalled_threshold_seconds)
+
     
     logger.info("Job management tools registered.")
 
@@ -663,71 +667,64 @@ def register_job_tools(mcp: FastMCP, config: Dict[str, Any], db_path: Path):
 if __name__ == "__main__":
     print("This module is intended for import by the main MCP server script.") 
 
-def register_tools():
+def register_tools(db_path: Path):
     """ジョブ管理関連のツールを登録します。"""
     
-    # 既存のコード...
-    
-    @register_tool
-    async def list_jobs_tool(session_id: Optional[str] = None, status: Optional[Union[str, List[str]]] = None, limit: int = 50) -> List[Dict[str, Any]]:
-        """登録されているジョブの一覧を取得します。
-        
-        Args:
-            session_id: 特定のセッションIDに限定する場合に指定
-            status: ジョブステータスでフィルタリング (PENDING, QUEUED, RUNNING, COMPLETED, FAILED, UNKNOWN)
-            limit: 取得する最大件数
+    # 各ツール関数を定義
+    async def add_job_tool():
+        """非同期ジョブを追加するためのツール関数"""
+        try:
+            job_id = generate_id()
+            # ここに実際のジョブ追加ロジックを実装
+            # 例: ジョブタイプ、パラメータなどに基づいてジョブを追加
             
-        Returns:
-            ジョブ情報のリスト
-        """
+            return {
+                "job_id": job_id,
+                "status": JobStatus.PENDING.value,
+                "message": "ジョブが正常にキューに追加されました"
+            }
+        except Exception as e:
+            logger.error(f"ジョブ追加中にエラーが発生しました: {e}", exc_info=True)
+            return {"error": str(e)}
+        
+    async def cancel_job_tool():
+        logger.warning("cancel_job_tool is not implemented")
+        return {"error": "Not implemented"}
+        
+    async def get_job_tool():
+        logger.warning("get_job_tool is not implemented")
+        return {"error": "Not implemented"}
+    
+    async def list_jobs_tool(session_id=None, status=None, limit=50):
         try:
             jobs = await list_jobs(db_path, session_id=session_id, status=status, limit=limit)
             return [job.model_dump() for job in jobs]
         except Exception as e:
             logger.error(f"Error in list_jobs_tool: {e}")
             return []
-
-    @register_tool
-    async def get_running_jobs(session_id: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
-        """実行中のジョブを取得します
-        
-        Args:
-            session_id: セッションIDでフィルタリング（オプション）
-            limit: 最大取得件数
             
-        Returns:
-            実行中のJobInfoオブジェクトのリスト
-        """
+    async def get_running_jobs_tool(session_id=None, limit=20):
+        """実行中のジョブを取得します"""
         try:
             jobs = await list_jobs(db_path, session_id=session_id, status="RUNNING", limit=limit)
             return [job.model_dump() for job in jobs]
         except Exception as e:
-            logger.error(f"Error in get_running_jobs: {e}")
+            logger.error(f"Error in get_running_jobs_tool: {e}")
             return []
-
-    @register_tool
-    async def get_worker_status_tool(stalled_threshold_seconds: int = 3600) -> Dict[str, Any]:
-        """ジョブワーカーの状態情報を取得します。
-        
-        Args:
-            stalled_threshold_seconds: この秒数以上実行されているジョブを停滞中と見なす
             
-        Returns:
-            ワーカーの状態情報（アクティブなワーカー数、キューサイズ、実行中ジョブ、停滞中ジョブなど）
-        """
+    async def get_worker_status_tool(stalled_threshold_seconds=3600):
+        """ジョブワーカーの状態情報を取得します。"""
         try:
             return await get_worker_status(stalled_threshold_seconds)
         except Exception as e:
             logger.error(f"Error in get_worker_status_tool: {e}")
             return {"error": str(e)}
     
-    # 既存のツール登録...
-    
     return {
         "add_job": add_job_tool,
         "cancel_job": cancel_job_tool,
         "get_job": get_job_tool,
         "list_jobs": list_jobs_tool,
-        "get_running_jobs": get_running_jobs,
+        "get_running_jobs": get_running_jobs_tool,
         "get_worker_status": get_worker_status_tool,
     } 

@@ -53,16 +53,19 @@ DEFAULT_CONFIG = {
         'port': 5002 # uvicorn 起動時にも参照される
     },
     'paths': {
-        'data': 'data',
-        'audio': 'data/audio',
-        'reference': 'data/reference',
-        'improved_versions': 'improved_versions',
-        'evaluation_results': 'evaluation_results',
-        'grid_search_results': 'grid_search_results',
-        'visualizations': 'visualizations',
-        'scientific_output': 'scientific_output',
+        'data': 'datasets',
+        'audio': 'datasets/audio',
+        'reference': 'datasets/reference',
+        'improved_versions': 'code/improved_versions',
+        'evaluation_results': 'output/evaluation_results',
+        'grid_search_results': 'output/grid_search_results',
+        'visualizations': 'output/visualizations',
+        'scientific_output': 'output/scientific_output',
         'db': 'db',
-        'detectors_src': 'src/detectors'
+        'detectors_src': 'code/src/detectors',
+        'templates': 'code/src/templates',
+        'datasets_base': 'datasets',
+        'output_base': 'output'
     },
     'resource_limits': { # デフォルトは configure_resource_limits で動的に決定
         # 'max_concurrent_jobs': 'auto',
@@ -118,8 +121,8 @@ DEFAULT_CONFIG = {
     'datasets': { # デフォルトのデータセット定義は最小限に
         'synthesized_v1': {
             'description': 'Basic synthesized dataset',
-            'audio_dir': 'datasets/synthesized/audio', # paths.audio を参照する方が良いかも
-            'ref_dir': 'datasets/synthesized/labels',   # paths.reference を参照する方が良いかも
+            'audio_dir': 'synthesized_v1/audio', # datasets_base からの相対パス
+            'ref_dir': 'synthesized_v1/labels',   # datasets_base からの相対パス
             'ref_pattern': '*.csv'
         }
     },

@@ -15,25 +15,28 @@ server:
 #       環境変数 (MIREX_*) で上書き可能。
 #       ワークスペースパスは環境変数 MIREX_WORKSPACE またはデフォルト (./.mcp_server_data) で決まる。
 paths:
-  # --- Core Paths (Relative to project root or absolute) ---
-  # Workspace is determined by env var MIREX_WORKSPACE or defaults to '.mcp_server_data'
-  # workspace: ./.mcp_server_data # This will be handled by path_utils based on env/default
+  # --- Source Code Paths ---
+  detectors_src: code/src/detectors
+  templates: code/src/templates # For paper/report generation
 
-  # --- Source Code Paths (Relative to project root) ---
-  detectors_src: src/detectors
-  templates: src/templates # For paper/report generation
+  # --- Improved Versions Path ---
+  improved_versions: code/improved_versions
 
-  # --- Data Paths (Relative to project root or absolute) ---
-  # Base directory for all datasets (used if dataset paths below are relative)
+  # --- Data Paths ---
+  # Base directory for all datasets
   datasets_base: datasets
 
-  # --- Output Base Path (Relative to project root or absolute) ---
-  # All generated results (eval, grid, viz, reports) will go into subdirs here.
-  output_base: output # Environment variable MIREX_OUTPUT_BASE can override this
+  # --- Output Base Path ---
+  output_base: output
 
-  # --- Workspace Subdirs (Relative to determined workspace path) --- (Removed)
-  # db: db # For mcp_server_state.db (Handled by get_db_dir)
-  # improved_versions: improved_versions # AI-generated code (Handled by get_improved_versions_dir)
+  # --- Output Subdirectories ---
+  evaluation_results: output/evaluation_results
+  grid_search_results: output/grid_search_results
+  visualizations: output/visualizations
+  scientific_output: output/scientific_output
+
+  # --- Database Path ---
+  db: db
 
 # === リソース制限 ===
 resource_limits: {}
@@ -134,8 +137,8 @@ datasets:
     description: "基本パターンを含む合成データセット"
     # パスは paths.datasets_base からの相対パス、または絶対パス
     # path_utils.get_dataset_paths() で処理される
-    audio_dir: synthesized/audio # 相対パス (datasets_base 기준)
-    label_dir: synthesized/labels # 相対パス (datasets_base 기준)
+    audio_dir: synthesized_v1/audio # 相対パス (datasets_base 基準)
+    label_dir: synthesized_v1/labels # 相対パス (datasets_base 基準)
     audio_pattern: '*.wav'
     label_pattern: '*.csv'
   # --- 他のデータセット例 --- #
@@ -150,12 +153,12 @@ datasets:
   # Configuration for evaluation datasets
   # dataset_name: Path to audio and reference/label files
   synthetic_v1:
-    audio_dir: "datasets/synthetic_v1/audio"
-    label_dir: "datasets/synthetic_v1/labels"
+    audio_dir: "synthetic_v1/audio"
+    label_dir: "synthetic_v1/labels"
     filelist: null # Optional: Path to a file listing specific files to use
   synthetic_poly_v1:
-    audio_dir: "datasets/synthetic_poly_v1/audio"
-    label_dir: "datasets/synthetic_poly_v1/labels"
+    audio_dir: "synthetic_poly_v1/audio"
+    label_dir: "synthetic_poly_v1/labels"
     filelist: null
   # --- 追加: MedleyDB (v1 or v2) Example --- #
   # User needs to set the actual path to their MedleyDB dataset root

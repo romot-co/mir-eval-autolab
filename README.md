@@ -1,5 +1,7 @@
 # MIR アルゴリズム評価・自動改善プラットフォーム
 
+**このリポジトリ自体の作成にVibeコーディングが可能かも含めた実験環境であり、実用を考慮したものではないことに注意してください**
+
 ## 1. プロジェクト概要
 
 本プロジェクトは、音楽情報検索 (MIR) アルゴリズム（音符検出、オンセット検出、ピッチ推定など）の性能評価、比較、そしてAIを活用した改善を支援するためのプラットフォームです。
@@ -19,7 +21,7 @@
 
 **AI駆動自動改善システム (実験的機能):**
 
-本プロジェクトには、MCPサーバーと `mirai improve` コマンドを用いて、MIRアルゴリズムの改善サイクルを自動化する**実験的な機能**が含まれています。MCPサーバー上で実行される `advance_improvement_cycle` ツールが、評価、分析、仮説生成、コード改善、パラメータ最適化といった一連のステップを管理・実行します。これはAIによるアルゴリズム改善の可能性を探る試みであり、安定性や結果の品質は保証されません。
+本プロジェクトには、MCPサーバーと `mirai improve` コマンドを用いて、MIRアルゴリズムの改善サイクルを自動化する**実験的な機能**が含まれています。`mirai improve start`コマンドは、**CLIホスト主導**で評価、分析、仮説生成、コード改善、パラメータ最適化といった一連のステップを管理・実行します。これはLLM APIを直接呼び出し、AIによるアルゴリズム改善の可能性を探る試みであり、安定性や結果の品質は保証されません。
 
 **AI駆動自動改善システムの詳細なセットアップ、利用方法、トラブルシューティングについては、[`MCP_README.md`](MCP_README.md) を参照してください。**
 
@@ -185,15 +187,15 @@ python -m src.cli.mirai grid-search run \\
 ### 4.3. (実験的) AI駆動自動改善 (`mirai improve start --server`)
 **注意:** これは実験的な機能です。セットアップ、詳細な使い方、内部ロジックについては **[`MCP_README.md`](MCP_README.md)** を参照してください。
 
-MCPサーバーを利用して、評価、分析、仮説生成、LLMによるコード改善/パラメータ最適化のサイクルを自動的に実行します。
+MCPサーバーを利用して、CLIホスト側でLLM APIを直接呼び出し、評価、分析、仮説生成、コード改善/パラメータ最適化のサイクルを自動的に実行します。
 
 ```bash
 # MCPサーバーが別ターミナルなどで起動している前提
 # かつ .env または環境変数にLLM APIキー(ANTHROPIC_API_KEY)が設定されていること
-python -m src.cli.mirai improve start \\
-  --server http://localhost:5002 \\
-  --detector YourDetectorClassName \\
-  --dataset your_dataset_name \\
+python -m src.cli.mirai improve start \
+  --server http://localhost:5002 \
+  --detector YourDetectorClassName \
+  --dataset your_dataset_name \
   --max-cycles 10 # 実行する最大サイクル数
 ```
 *   `improve start` コマンドは、MCPアーキテクチャに準拠したCLIホスト主導の設計を採用しています：

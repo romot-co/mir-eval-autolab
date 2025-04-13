@@ -238,11 +238,11 @@ LLM（大規模言語モデル）を活用し、MIRアルゴリズムの評価�
 2.  **LLM APIキーを設定します。** (`.env` ファイルまたは環境変数 `ANTHROPIC_API_KEY` など)。
 3.  **改善対象とデータセットを指定して `mirai improve start` を実行します。**
     ```bash
-    python -m src.cli.mirai improve start \\
-      --server http://localhost:5002 \\
-      --detector YourDetectorClassName \\
-      --dataset your_dataset_name \\
-      --goal "Improve F1-score for note detection" \\
+    python -m src.cli.mirai improve start \
+      --server http://localhost:5002 \
+      --detector YourDetectorClassName \
+      --dataset your_dataset_name \
+      --goal "Improve F1-score for note detection" \
       --max-cycles 10
     ```
     *   `--server`: MCPサーバーのURL (必須)。
