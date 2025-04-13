@@ -36,7 +36,7 @@ paths:
   # improved_versions: improved_versions # AI-generated code (Handled by get_improved_versions_dir)
 
 # === リソース制限 ===
-resource_limits:
+resource_limits: {}
   # 環境変数 MCP_* で上書き可能
   # 以下のコメントアウトされた項目は core.configure_resource_limits や server 設定で管理されるため削除
   # max_concurrent_jobs: auto

@@ -57,6 +57,7 @@ MOCK_JOB_ID = "job_test456"
 DEFAULT_LLM_MODEL = "claude-3-opus-20240229" # mirai.py の定数と合わせる
 DEFAULT_POLL_INTERVAL = 5
 DEFAULT_JOB_TIMEOUT = 600
+DEFAULT_MAX_CYCLES = 10
 
 # --- 基本的なフィクスチャ ---
 

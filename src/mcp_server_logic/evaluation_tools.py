@@ -12,18 +12,15 @@ from mcp.server.fastmcp import FastMCP
 from src.evaluation.evaluation_runner import run_evaluation as run_evaluation_core # 同期関数
 from src.evaluation.grid_search.core import run_grid_search as run_grid_search_core # 同期関数
 from src.utils import path_utils
-from src.utils.path_utils import get_output_dir, ensure_dir, validate_path_within_allowed_dirs, get_output_base_dir, get_workspace_dir, get_dataset_paths, get_project_root # get_project_root を追加
+from src.utils.path_utils import get_output_dir, ensure_dir, validate_path_within_allowed_dirs, get_output_base_dir, get_workspace_dir, get_dataset_paths, get_project_root, get_available_datasets # get_project_root を追加
 from src.utils.json_utils import NumpyEncoder
 from src.utils.exception_utils import EvaluationError, GridSearchError, FileError, ConfigError # FileError, ConfigError をインポート
 # --- 追加: 履歴イベントスキーマ --- #
-from .schemas import EvaluationCompleteData, ParameterOptimizationCompleteData # Grid Search 完了履歴用
+from .schemas import HistoryEventBaseData # 全てのイベントスキーマをHistoryEventBaseDataに統一
 # --- 追加: エラー時や開始時のスキーマ --- #
 from .schemas import ( # 追加
     EvaluationResultData, GridSearchResultData,
     RunEvaluationInput, RunGridSearchInput, # ツール入力スキーマ
-    HistoryEventBaseData, # 失敗イベント用
-    # Specific event data schemas for failures
-    EvaluationStartedData, EvaluationFailedData, GridSearchStartedData, GridSearchCompleteData, GridSearchFailedData,
     JobStatus # JobStatus をインポートに追加
 ) # 必要に応じて失敗イベントスキーマもインポート
 from . import schemas # schemas モジュール自体をインポート
@@ -211,8 +208,8 @@ async def _run_evaluate_async(
     # --- 履歴記録: 開始 --- #
     if session_id:
         try:
-             # ★ スキーマ: EvaluationStartedData を使用
-             start_event_data = schemas.EvaluationStartedData(
+             # ★ スキーマ: HistoryEventBaseData を使用
+             start_event_data = schemas.HistoryEventBaseData(
                  job_id=job_id,
                  detector_name=detector_name,
                  dataset_name=dataset_name,
@@ -250,8 +247,8 @@ async def _run_evaluate_async(
         # --- 履歴記録: 正常完了 --- #
         if session_id:
             try:
-                # ★ スキーマ: EvaluationCompleteData
-                complete_event_data = schemas.EvaluationCompleteData(
+                # ★ スキーマ: HistoryEventBaseData
+                complete_event_data = schemas.HistoryEventBaseData(
                     job_id=job_id,
                     evaluation_results=results_dict.get('metrics', {}), # metricsを渡す
                     summary=results_dict.get('summary'),
@@ -288,8 +285,8 @@ async def _run_evaluate_async(
         # --- 履歴記録: 失敗時 (エラー発生時のみ) --- #
         if error_occurred and session_id:
             try:
-                # ★ スキーマ: EvaluationFailedData を使用
-                fail_event_data = schemas.EvaluationFailedData(
+                # ★ スキーマ: HistoryEventBaseData を使用
+                fail_event_data = schemas.HistoryEventBaseData(
                     job_id=job_id,
                     error=error_message,
                     error_type=type(e_core).__name__ if 'e_core' in locals() else "EvaluationError",
@@ -354,8 +351,8 @@ async def _execute_grid_search_async(
     # --- 履歴記録: 開始 --- #
     if session_id:
         try:
-            # ★ スキーマ: GridSearchStartedData を使用
-            start_event_data = schemas.GridSearchStartedData(
+            # ★ スキーマ: HistoryEventBaseData を使用
+            start_event_data = schemas.HistoryEventBaseData(
                 job_id=job_id,
                 detector_name=detector_name,
                 code_version=code_version,
@@ -388,8 +385,8 @@ async def _execute_grid_search_async(
         # --- 履歴記録: 正常完了 --- #
         if session_id:
             try:
-                # ★ スキーマ: GridSearchCompleteData を使用
-                complete_event_data = schemas.GridSearchCompleteData(
+                # ★ スキーマ: HistoryEventBaseData を使用
+                complete_event_data = schemas.HistoryEventBaseData(
                     job_id=job_id,
                     summary=results_dict.get('summary'),
                     best_params=results_dict.get('best_params'),
@@ -424,8 +421,8 @@ async def _execute_grid_search_async(
         # --- 履歴記録: 失敗時 (エラー発生時のみ) --- #
         if error_occurred and session_id:
             try:
-                # ★ スキーマ: GridSearchFailedData を使用
-                fail_event_data = schemas.GridSearchFailedData(
+                # ★ スキーマ: HistoryEventBaseData を使用
+                fail_event_data = schemas.HistoryEventBaseData(
                     job_id=job_id,
                     error=error_message,
                     error_type=type(e_core).__name__ if 'e_core' in locals() else "GridSearchError",
@@ -448,6 +445,18 @@ def register_evaluation_tools(
     """評価とグリッドサーチ関連のツールをMCPツールとして登録します。"""
     logger.info("Registering evaluation and grid search tools...")
 
+    # --- データセット一覧取得ツール --- #
+    @mcp.tool("list_datasets")
+    async def list_datasets_tool() -> List[Dict[str, Any]]:
+        """使用可能なデータセットの一覧とその基本情報を取得します。"""
+        try:
+            datasets = get_available_datasets(config)
+            logger.info(f"データセット一覧を取得しました: {len(datasets)}件")
+            return datasets
+        except Exception as e:
+            logger.error(f"データセット一覧取得中にエラーが発生しました: {e}", exc_info=True)
+            return [{"error": f"データセット一覧取得中にエラー: {str(e)}"}]
+
     # --- Helper to start evaluation/grid search jobs --- #
     async def _start_evaluation_job(
         task_coroutine_factory: Callable[..., Coroutine],
@@ -460,7 +469,8 @@ def register_evaluation_tools(
         logger.info(f"Requesting to start {job_description} with args: {kwargs}")
         try:
             # ファクトリに関数を渡してコルーチンオブジェクトを作成
-            task_coroutine = task_coroutine_factory(**kwargs)
+            # job_idにはプレースホルダーを渡す（実際のIDはstart_async_job_funcで生成される）
+            task_coroutine = task_coroutine_factory(job_id="placeholder", **kwargs)
             # start_async_job_func を呼び出してジョブを開始し、結果 (JobStartResponse辞書) を取得
             # tool_name と session_id も渡すように変更
             job_start_response = await start_async_job_func(task_coroutine, tool_name=tool_name, session_id=session_id)
@@ -479,7 +489,7 @@ def register_evaluation_tools(
         config=config
     )
     # ★ 入力スキーマを適用
-    @mcp.tool("run_evaluation", input_schema=RunEvaluationInput)
+    @mcp.tool("run_evaluation")
     async def run_evaluation_tool(
         # スキーマに合わせてシグネチャを完全に書き換え
         detector_name: str,
@@ -492,6 +502,11 @@ def register_evaluation_tools(
         output_dir: Optional[str] = None, # ユーザー指定用として残す (スキーマにはない)
     ) -> Dict[str, Any]: # JobStartResponse 形式
         """指定された検出器とデータセットで評価ジョブを開始します。"""
+        # dataset_nameが指定されていない場合はconfig['evaluation']['default_dataset']を使用
+        if dataset_name is None:
+            dataset_name = config.get('evaluation', {}).get('default_dataset', 'synthesized_v1')
+            logger.info(f"dataset_nameが指定されていないため、デフォルト値 '{dataset_name}' を使用します")
+        
         # スキーマで検証された引数 + output_dir を kwargs にまとめる
         kwargs = {
             "detector_name": detector_name,
@@ -503,13 +518,12 @@ def register_evaluation_tools(
             "detector_params": detector_params,
             "save_plots": save_plots,
             "save_results_json": save_results_json,
+            "user_output_dir": output_dir, # スキーマ外の引数を kwargs に含める
         }
         return await _start_evaluation_job(
             run_evaluation_factory,
             "run_evaluation",
-            session_id=session_id,
-            user_output_dir=output_dir, # スキーマ外の引数として渡す
-            **kwargs # スキーマ検証済み引数を渡す
+            **kwargs # スキーマ検証済み引数 + user_output_dir を渡す
         )
 
     # --- run_grid_search ツール --- #
@@ -520,7 +534,7 @@ def register_evaluation_tools(
         config=config
     )
     # ★ 入力スキーマを適用
-    @mcp.tool("run_grid_search", input_schema=RunGridSearchInput)
+    @mcp.tool("run_grid_search")
     async def run_grid_search_tool(
         # スキーマに合わせてシグネチャを完全に書き換え
         grid_config: Dict[str, Any],
@@ -538,12 +552,11 @@ def register_evaluation_tools(
             "best_metric": best_metric,
             "session_id": session_id,
             "code_version": code_version,
+            "user_output_dir": output_dir, # スキーマ外の引数を kwargs に含める
         }
         return await _start_evaluation_job(
             run_grid_search_factory,
             "run_grid_search",
-            session_id=session_id,
-            user_output_dir=output_dir,
             **kwargs
         )
 

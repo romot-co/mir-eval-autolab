@@ -337,7 +337,7 @@ def test_extract_code_from_text(text, expected):
     assert extract_code_from_text(text) == expected
 
 def test_extract_code_from_text_different_language():
-     text = "```javascript\nconsole.log('hi');\n```"
+    text = "```javascript\nconsole.log('hi');\n```"
     assert extract_code_from_text(text) is None
 
 # --- Tests for LLM Client (e.g., ClaudeClient) ---
@@ -353,19 +353,19 @@ async def test_llm_client_generate_text_success(mock_llm_client, mock_httpx_clie
 
     # ダミー実装の場合 - httpx clientを直接セットアップ
     if DUMMY_IMPLEMENTATION:
-    # Configure the mock httpx response
-    mock_response = MagicMock(spec=httpx.Response)
-    mock_response.status_code = 200
-    mock_response.json.return_value = {"completion": "LLM response text", "stop_reason": "stop_sequence"}
-    mock_response.raise_for_status = MagicMock() # Does nothing on success
-    mock_httpx_client.post.return_value = mock_response
+        # Configure the mock httpx response
+        mock_response = MagicMock(spec=httpx.Response)
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"completion": "LLM response text", "stop_reason": "stop_sequence"}
+        mock_response.raise_for_status = MagicMock() # Does nothing on success
+        mock_httpx_client.post.return_value = mock_response
 
-    # Call the generate_text method on the potentially mocked client
-    result = await mock_llm_client.generate_text(prompt, model, max_tokens, temperature, stop_sequences)
+        # Call the generate_text method on the potentially mocked client
+        result = await mock_llm_client.generate_text(prompt, model, max_tokens, temperature, stop_sequences)
 
     # ダミー実装が使用されている場合、httpxクライアントの呼び出しを確認
     if DUMMY_IMPLEMENTATION:
-    mock_httpx_client.post.assert_called_once()
+        mock_httpx_client.post.assert_called_once()
         # レスポンスの内容が期待値通りか確認
         assert result.get("completion") is not None
     else:
@@ -378,9 +378,9 @@ async def test_llm_client_generate_text_api_error(mock_llm_client, mock_httpx_cl
     prompt = "Error prompt"
 
     if DUMMY_IMPLEMENTATION:
-    # Configure the mock httpx response for a 400 error
-    mock_response = MagicMock(spec=httpx.Response)
-    mock_response.status_code = 400
+        # Configure the mock httpx response for a 400 error
+        mock_response = MagicMock(spec=httpx.Response)
+        mock_response.status_code = 400
         mock_request = MagicMock()
         mock_request.url = "http://dummy/url"
         mock_response.request = mock_request
@@ -390,7 +390,7 @@ async def test_llm_client_generate_text_api_error(mock_llm_client, mock_httpx_cl
         mock_httpx_client.post.side_effect = error
         
         # LLMErrorが発生することを期待
-    with pytest.raises(LLMError, match="API request failed: 400"):
+        with pytest.raises(LLMError, match="API request failed: 400"):
             await mock_llm_client.generate_text(prompt, "model", 100, 0.7, [])
     else:
         # 実際の実装の場合は、テストをスキップ

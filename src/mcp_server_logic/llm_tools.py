@@ -442,60 +442,206 @@ def register_llm_tools(
             return {"job_id": None, "status": schemas.JobStatus.FAILED.value, "error": f"Failed to start {tool_name} job: {e}"}
 
     # Improve Code Prompt Tool
-    @mcp.tool("get_improve_code_prompt", input_schema=schemas.GetImproveCodePromptInput)
+    @mcp.tool("get_improve_code_prompt")
     async def get_improve_code_prompt_tool(session_id: str, code: str, suggestion: str, original_code_version_hash: Optional[str] = None) -> Dict[str, Any]:
         """コード改善のためのプロンプトを生成するジョブを開始します。"""
         return await _start_prompt_gen_job(
             _run_get_improve_code_prompt_async, "get_improve_code_prompt", session_id,
-            session_id=session_id, code=code, suggestion=suggestion, original_code_version_hash=original_code_version_hash
+            code=code, suggestion=suggestion, original_code_version_hash=original_code_version_hash
         )
 
     # Suggest Parameters Prompt Tool
-    @mcp.tool("get_suggest_parameters_prompt", input_schema=schemas.GetSuggestParametersPromptInput)
+    @mcp.tool("get_suggest_parameters_prompt")
     async def get_suggest_parameters_prompt_tool(session_id: str, detector_code: str, analysis_results: Optional[Dict[str, Any]] = None, current_metrics: Optional[Dict[str, Any]] = None, cycle_state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """パラメータ提案のためのプロンプトを生成するジョブを開始します。"""
         return await _start_prompt_gen_job(
             _run_get_suggest_parameters_prompt_async, "get_suggest_parameters_prompt", session_id,
-            session_id=session_id, detector_code=detector_code, analysis_results=analysis_results, current_metrics=current_metrics, cycle_state=cycle_state
+            detector_code=detector_code, analysis_results=analysis_results, current_metrics=current_metrics, cycle_state=cycle_state
         )
 
     # Analyze Evaluation Prompt Tool
-    @mcp.tool("get_analyze_evaluation_prompt", input_schema=schemas.GetAnalyzeEvaluationPromptInput)
+    @mcp.tool("get_analyze_evaluation_prompt")
     async def get_analyze_evaluation_prompt_tool(session_id: str, evaluation_results: Dict[str, Any]) -> Dict[str, Any]:
         """評価結果分析のためのプロンプトを生成するジョブを開始します。"""
         return await _start_prompt_gen_job(
             _run_get_analyze_evaluation_prompt_async, "get_analyze_evaluation_prompt", session_id,
-            session_id=session_id, evaluation_results=evaluation_results
+            evaluation_results=evaluation_results
         )
 
     # Suggest Exploration Strategy Prompt Tool
-    @mcp.tool("get_suggest_exploration_strategy_prompt", input_schema=schemas.GetSuggestExplorationStrategyPromptInput)
+    @mcp.tool("get_suggest_exploration_strategy_prompt")
     async def get_suggest_exploration_strategy_prompt_tool(session_id: str) -> Dict[str, Any]:
         """探索戦略提案のためのプロンプトを生成するジョブを開始します。"""
         return await _start_prompt_gen_job(
-            _run_get_suggest_exploration_strategy_prompt_async, "get_suggest_exploration_strategy_prompt", session_id,
-            session_id=session_id
+            _run_get_suggest_exploration_strategy_prompt_async, "get_suggest_exploration_strategy_prompt", session_id
         )
 
     # Generate Hypotheses Prompt Tool
-    @mcp.tool("get_generate_hypotheses_prompt", input_schema=schemas.GetGenerateHypothesesPromptInput)
+    @mcp.tool("get_generate_hypotheses_prompt")
     async def get_generate_hypotheses_prompt_tool(session_id: str, num_hypotheses: int = 3, analysis_results: Optional[Dict[str, Any]] = None, current_metrics: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """改善仮説生成のためのプロンプトを生成するジョブを開始します。"""
         return await _start_prompt_gen_job(
             _run_get_generate_hypotheses_prompt_async, "get_generate_hypotheses_prompt", session_id,
-            session_id=session_id, num_hypotheses=num_hypotheses, analysis_results=analysis_results, current_metrics=current_metrics
+            num_hypotheses=num_hypotheses, analysis_results=analysis_results, current_metrics=current_metrics
         )
 
     # Assess Improvement Prompt Tool
-    @mcp.tool("get_assess_improvement_prompt", input_schema=schemas.GetAssessImprovementPromptInput)
+    @mcp.tool("get_assess_improvement_prompt")
     async def get_assess_improvement_prompt_tool(session_id: str, original_detector_code: str, improved_detector_code: str, evaluation_results_before: Dict[str, Any], evaluation_results_after: Dict[str, Any], hypothesis_tested: Optional[str] = None, user_goal: Optional[str] = None, previous_feedback: Optional[str] = None) -> Dict[str, Any]:
         """改善評価のためのプロンプトを生成するジョブを開始します。"""
         return await _start_prompt_gen_job(
             _run_get_assess_improvement_prompt_async, "get_assess_improvement_prompt", session_id,
-            session_id=session_id, original_detector_code=original_detector_code, improved_detector_code=improved_detector_code, evaluation_results_before=evaluation_results_before, evaluation_results_after=evaluation_results_after, hypothesis_tested=hypothesis_tested, user_goal=user_goal, previous_feedback=previous_feedback
+            original_detector_code=original_detector_code, improved_detector_code=improved_detector_code, evaluation_results_before=evaluation_results_before, evaluation_results_after=evaluation_results_after, hypothesis_tested=hypothesis_tested, user_goal=user_goal, previous_feedback=previous_feedback
         )
 
-    logger.info("LLM Prompt Generation tools registered.")
+    # --- 評価分析ツール ---
+    @mcp.tool("analyze_evaluation")
+    async def analyze_evaluation_tool(
+        session_id: str,
+        evaluation_results: Dict[str, Any],
+        detector_code: Optional[str] = None,
+        user_goal: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """評価結果を分析し、強みと弱み、改善点を特定します。"""
+        try:
+            logger.info(f"評価分析ツール実行: セッション {session_id}")
+            # 評価分析プロンプト生成の非同期タスクを実行
+            task_factory = partial(
+                _run_get_analyze_evaluation_prompt_async,
+                config=config,
+                add_history_func=add_history_async_func,
+                session_id=session_id,
+                evaluation_results=evaluation_results
+            )
+            
+            # プロンプト生成ジョブを開始
+            job_response = await _start_prompt_gen_job(
+                task_factory,
+                "get_analyze_evaluation_prompt",
+                session_id=session_id
+            )
+            return job_response
+            
+        except Exception as e:
+            logger.error(f"評価分析ツール実行中にエラーが発生: {e}", exc_info=True)
+            return {"job_id": None, "status": schemas.JobStatus.FAILED.value, "error": f"Failed to run analyze_evaluation tool: {e}"}
+    
+    # --- 仮説生成ツール ---
+    @mcp.tool("generate_hypotheses")
+    async def generate_hypotheses_tool(
+        session_id: str,
+        num_hypotheses: int = 3,
+        analysis_results: Optional[Dict[str, Any]] = None,
+        current_metrics: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """アルゴリズム改善のための仮説を生成します。"""
+        try:
+            logger.info(f"仮説生成ツール実行: セッション {session_id}, 仮説数 {num_hypotheses}")
+            # 仮説生成プロンプト生成の非同期タスクを実行
+            task_factory = partial(
+                _run_get_generate_hypotheses_prompt_async,
+                config=config,
+                add_history_func=add_history_async_func,
+                session_id=session_id,
+                num_hypotheses=num_hypotheses,
+                analysis_results=analysis_results,
+                current_metrics=current_metrics
+            )
+            
+            # プロンプト生成ジョブを開始
+            job_response = await _start_prompt_gen_job(
+                task_factory,
+                "get_generate_hypotheses_prompt",
+                session_id=session_id
+            )
+            return job_response
+            
+        except Exception as e:
+            logger.error(f"仮説生成ツール実行中にエラーが発生: {e}", exc_info=True)
+            return {"job_id": None, "status": schemas.JobStatus.FAILED.value, "error": f"Failed to run generate_hypotheses tool: {e}"}
+    
+    # --- 戦略提案ツール ---
+    @mcp.tool("suggest_exploration_strategy")
+    async def suggest_exploration_strategy_tool(session_id: str) -> Dict[str, Any]:
+        """次に取るべきアクションの戦略を提案します。"""
+        try:
+            logger.info(f"戦略提案ツール実行: セッション {session_id}")
+            # 戦略提案プロンプト生成の非同期タスクを実行
+            task_factory = partial(
+                _run_get_suggest_exploration_strategy_prompt_async,
+                config=config,
+                add_history_func=add_history_async_func,
+                session_id=session_id
+            )
+            
+            # プロンプト生成ジョブを開始
+            job_response = await _start_prompt_gen_job(
+                task_factory,
+                "get_suggest_exploration_strategy_prompt",
+                session_id=session_id
+            )
+            return job_response
+            
+        except Exception as e:
+            logger.error(f"戦略提案ツール実行中にエラーが発生: {e}", exc_info=True)
+            return {"job_id": None, "status": schemas.JobStatus.FAILED.value, "error": f"Failed to run suggest_exploration_strategy tool: {e}"}
+    
+    # --- 改善効果評価ツール ---
+    @mcp.tool("assess_improvement")
+    async def assess_improvement_tool(
+        session_id: str,
+        original_code: str,
+        improved_code: str,
+        evaluation_results_before: Dict[str, Any],
+        evaluation_results_after: Dict[str, Any],
+        hypothesis_tested: Optional[str] = None,
+        user_goal: Optional[str] = None,
+        previous_feedback: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """コード改善の効果を評価します。"""
+        try:
+            logger.info(f"改善効果評価ツール実行: セッション {session_id}")
+            # 改善評価プロンプト生成の非同期タスクを実行
+            task_factory = partial(
+                _run_get_assess_improvement_prompt_async,
+                config=config,
+                add_history_func=add_history_async_func,
+                session_id=session_id,
+                original_detector_code=original_code,
+                improved_detector_code=improved_code,
+                evaluation_results_before=evaluation_results_before,
+                evaluation_results_after=evaluation_results_after,
+                hypothesis_tested=hypothesis_tested,
+                user_goal=user_goal,
+                previous_feedback=previous_feedback
+            )
+            
+            # プロンプト生成ジョブを開始
+            job_response = await _start_prompt_gen_job(
+                task_factory,
+                "get_assess_improvement_prompt",
+                session_id=session_id
+            )
+            return job_response
+            
+        except Exception as e:
+            logger.error(f"改善効果評価ツール実行中にエラーが発生: {e}", exc_info=True)
+            return {"job_id": None, "status": schemas.JobStatus.FAILED.value, "error": f"Failed to run assess_improvement tool: {e}"}
+
+    logger.info("LLMプロンプト生成ツールと追加MCPツールの登録完了")
+
+async def initialize_llm_client_async(api_key: Optional[str] = None, model: str = "claude-3-opus-20240229"):
+    """LLMクライアントを非同期に初期化
+    
+    Args:
+        api_key: APIキー（Noneの場合は環境変数から取得）
+        model: 使用するモデル名
+        
+    Returns:
+        初期化されたLLMクライアントインスタンス
+    """
+    from src.cli.llm_client import AnthropicClient
+    return AnthropicClient(api_key=api_key, model=model)
 
 # --- Import Guard ---
 if __name__ == "__main__":

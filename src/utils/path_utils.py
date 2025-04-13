@@ -16,6 +16,7 @@ from typing import List, Optional, Union, Tuple, Dict, Any
 import warnings
 from dotenv import load_dotenv, find_dotenv
 import glob # ファイル検索のため追加
+import time
 
 # .envファイルのサポートを追加（利用可能な場合）
 try:
@@ -292,20 +293,20 @@ def get_absolute_path(relative_or_absolute_path: Union[str, Path],
 
 def ensure_dir(dir_path: Union[str, Path], *, check_writable: bool = False) -> Path:
     """
-    指定されたパスのディレクトリが存在することを確認し、存在しない場合は作成する。
-    オプションで書き込み可能かどうかもチェックする。
+    指定されたディレクトリが存在することを確認し、なければ作成する。
+    オプションで書き込み権限があるかチェックする。
 
     Parameters
     ----------
     dir_path : Union[str, Path]
-        確認または作成するディレクトリのパス。
+        確認または作成するディレクトリのパス
     check_writable : bool, optional
-        ディレクトリが書き込み可能かどうかのチェックを行うか, by default False
+        True の場合、ディレクトリへの書き込み権限をテストする, by default False
 
     Returns
     -------
     Path
-        確認または作成されたディレクトリの絶対パス。
+        確認されたディレクトリの絶対パス
 
     Raises
     ------
@@ -317,26 +318,50 @@ def ensure_dir(dir_path: Union[str, Path], *, check_writable: bool = False) -> P
     if not isinstance(dir_path, (str, Path)):
         raise TypeError(f"dir_path must be a string or Path object, got {type(dir_path)}")
 
+    logger.debug(f"Ensuring directory exists and is valid: {dir_path}")
     try:
         path = Path(dir_path).resolve()
+        logger.debug(f"Resolved path: {path}")
         # ディレクトリが存在しない場合は作成
         if not path.exists():
-            logger.info(f"ディレクトリが存在しないため作成します: {path}")
+            logger.info(f"Directory does not exist, attempting to create: {path}")
             path.mkdir(parents=True, exist_ok=True)
+            # 作成後に存在を再確認
+            if not path.exists():
+                logger.error(f"Failed to create directory after mkdir: {path}")
+                raise FileError(f"ディレクトリ作成に失敗しました: {path}")
+            logger.info(f"Successfully created directory: {path}")
         # ディレクトリでない場合はエラー
         elif not path.is_dir():
+            logger.error(f"Path exists but is not a directory: {path}")
             raise FileError(f"指定されたパスはディレクトリではありません: {path}")
+        else:
+            logger.debug(f"Directory already exists: {path}")
 
         # 書き込み可能チェック (オプション)
         if check_writable:
+            logger.debug(f"Checking write permissions for: {path}")
             # 一時ファイルを作成してテスト
             try:
-                with tempfile.NamedTemporaryFile(prefix='write_test_', dir=str(path)) as tf:
-                    logger.debug(f"ディレクトリへの書き込みテスト成功: {path}")
+                test_file = path / f".write_test_{int(time.time()*1000)}" # よりユニークなファイル名
+                logger.debug(f"Attempting to write test file: {test_file}")
+                with open(test_file, 'w') as f:
+                    f.write("test")
+                logger.debug(f"Successfully wrote test file: {test_file}")
+                if test_file.exists():
+                    logger.debug(f"Attempting to delete test file: {test_file}")
+                    test_file.unlink()  # テストファイルを削除
+                    logger.debug(f"Successfully deleted test file: {test_file}")
+                else:
+                    logger.warning(f"Test file did not exist after writing: {test_file}")
+                logger.info(f"Write permission test successful for: {path}")
             except OSError as e:
-                logger.error(f"ディレクトリへの書き込みテストに失敗しました: {path} - {e}", exc_info=True)
+                logger.error(f"Write permission test failed for directory: {path} - {e}", exc_info=True)
                 raise FileError(f"ディレクトリに書き込み権限がありません: {path}") from e
+        else:
+            logger.debug(f"Write check skipped for: {path}")
 
+        logger.debug(f"Directory ensured successfully: {path}")
         return path
     except OSError as e:
         logger.error(f"ディレクトリの確認または作成中にエラーが発生しました: {dir_path} - {e}", exc_info=True)
@@ -1339,3 +1364,138 @@ def find_files(directory: Union[str, Path], pattern: str = "*") -> List[Path]:
     files = [f for f in files if f.is_file()]
     
     return files
+
+def get_available_datasets(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    使用可能なデータセット一覧とその基本情報を取得します。
+
+    Parameters
+    ----------
+    config : Dict[str, Any]
+        アプリケーション設定辞書
+
+    Returns
+    -------
+    List[Dict[str, Any]]
+        データセット情報のリスト。各要素は以下の情報を含む辞書:
+        - name: データセット名
+        - audio_dir: オーディオディレクトリパス
+        - label_dir: ラベルディレクトリパス
+        - file_count: 推定ファイル数（ファイルリストがある場合は正確、ない場合は概算）
+        - description: データセットの説明（設定に含まれている場合）
+
+    Raises
+    ------
+    ConfigError
+        config に datasets セクションが存在しない場合
+    """
+    logger.debug("利用可能なデータセット一覧を取得中")
+    datasets_config = config.get('datasets')
+    if not datasets_config or not isinstance(datasets_config, dict):
+        raise ConfigError("config.yaml に 'datasets' セクションが見つからないか、無効です。")
+
+    result = []
+    # プロジェクトルートを取得
+    project_root = get_project_root()
+    datasets_base_dir = Path(config.get('paths', {}).get('datasets_base', 'datasets'))
+    if not datasets_base_dir.is_absolute():
+        datasets_base_dir = project_root / datasets_base_dir
+
+    for dataset_name, dataset_info in datasets_config.items():
+        if not isinstance(dataset_info, dict):
+            logger.warning(f"データセット '{dataset_name}' の設定が辞書ではありません。スキップします。")
+            continue
+
+        # 基本情報を取得
+        dataset_entry = {
+            "name": dataset_name,
+            "description": dataset_info.get('description', f"Dataset: {dataset_name}"),
+            "label_format": dataset_info.get('label_format', "default"),
+            "audio_ext": dataset_info.get('audio_ext', '.wav'),
+            "label_ext": dataset_info.get('label_ext', '.csv')
+        }
+
+        # パス情報を取得
+        audio_dir_str = dataset_info.get('audio_dir')
+        label_dir_str = dataset_info.get('label_dir')
+        filelist_path_str = dataset_info.get('filelist')
+
+        if not audio_dir_str or not label_dir_str:
+            dataset_entry["error"] = f"音声/ラベルディレクトリが指定されていません"
+            dataset_entry["file_count"] = 0
+            result.append(dataset_entry)
+            continue
+
+        # パスを解決
+        audio_dir = Path(audio_dir_str)
+        label_dir = Path(label_dir_str)
+        if not audio_dir.is_absolute():
+            audio_dir = datasets_base_dir / audio_dir
+        if not label_dir.is_absolute():
+            label_dir = datasets_base_dir / label_dir
+
+        dataset_entry["audio_dir"] = str(audio_dir)
+        dataset_entry["label_dir"] = str(label_dir)
+
+        # ディレクトリ存在確認
+        if not audio_dir.is_dir():
+            dataset_entry["error"] = f"オーディオディレクトリが見つかりません: {audio_dir}"
+            dataset_entry["file_count"] = 0
+            result.append(dataset_entry)
+            continue
+        
+        if not label_dir.is_dir():
+            dataset_entry["error"] = f"ラベルディレクトリが見つかりません: {label_dir}"
+            dataset_entry["file_count"] = 0
+            result.append(dataset_entry)
+            continue
+
+        # ファイル数の推定
+        file_count = 0
+        if filelist_path_str:
+            # filelistが指定されている場合
+            filelist_path = Path(filelist_path_str)
+            if not filelist_path.is_absolute():
+                filelist_path = project_root / filelist_path
+
+            if filelist_path.is_file():
+                try:
+                    with open(filelist_path, 'r', encoding='utf-8') as f:
+                        lines = [line.strip() for line in f]
+                        file_count = len([line for line in lines if line])
+                except Exception as e:
+                    logger.warning(f"ファイルリスト {filelist_path} の読み込み中にエラー: {e}")
+                    file_count = -1  # エラーを示す
+            else:
+                dataset_entry["warning"] = f"ファイルリストが見つかりません: {filelist_path}"
+                file_count = -1  # 不明であることを示す
+        else:
+            # ラベルディレクトリからファイル数を推定
+            label_format = dataset_info.get('label_format')
+            try:
+                if label_format == 'melody1':
+                    file_count = len(list(label_dir.glob('*_MELODY1.csv')))
+                elif label_format == 'melody2':
+                    file_count = len(list(label_dir.glob('*_MELODY2.csv')))
+                elif label_format == 'mirex_melody':
+                    txt_count = len(list(label_dir.glob('*.txt')))
+                    if txt_count > 0:
+                        file_count = txt_count
+                    else:
+                        label_ext = dataset_info.get('label_ext', '.csv')
+                        file_count = len(list(label_dir.glob(f'*{label_ext}')))
+                else:
+                    # 一般的な拡張子でカウント
+                    default_label_exts = ['.csv', '.txt', '.lab', '.tsv', '.json']
+                    all_files = []
+                    for ext in default_label_exts:
+                        all_files.extend(label_dir.glob(f'*{ext}'))
+                    file_count = len(set(all_files))  # 重複を除去
+            except Exception as e:
+                logger.warning(f"データセット '{dataset_name}' のファイル数カウント中にエラー: {e}")
+                file_count = -1  # エラーを示す
+
+        dataset_entry["file_count"] = file_count
+        result.append(dataset_entry)
+
+    return result

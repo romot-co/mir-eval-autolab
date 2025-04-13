@@ -9,8 +9,8 @@ import aiosqlite # aiosqlite をインポート
 
 # 関連モジュールインポート (型ヒント用)
 from mcp.server.fastmcp import FastMCP
-from . import db_utils, utils
-from src.utils.misc_utils import generate_id, get_timestamp
+from . import db_utils
+from src.utils.misc_utils import generate_id, get_timestamp, format_timestamp # format_timestampを追加
 from src.utils.exception_utils import StateManagementError, log_exception, FileError, ConfigError
 from src.utils.json_utils import NumpyEncoder # NumpyEncoder をインポート
 from src.utils.path_utils import validate_path_within_allowed_dirs, get_workspace_dir # パス検証用に追加
@@ -61,8 +61,8 @@ async def start_session(config: Dict[str, Any], db_path: Path, base_algorithm: s
         return schemas.SessionInfoResponse(
             session_id=session_id,
             base_algorithm=base_algorithm,
-            created_at=utils.format_timestamp(current_time),
-            updated_at=utils.format_timestamp(current_time),
+            created_at=format_timestamp(current_time),
+            updated_at=format_timestamp(current_time),
             status="active",
             history=[],
             config=config,
@@ -128,8 +128,8 @@ async def get_session_info(config: Dict[str, Any], db_path: Path, session_id: st
 
             start_time = session_data.get('start_time')
             last_update = session_data.get('last_update')
-            parsed_data['created_at'] = utils.format_timestamp(start_time) if start_time else "N/A"
-            parsed_data['updated_at'] = utils.format_timestamp(last_update) if last_update else "N/A"
+            parsed_data['created_at'] = format_timestamp(start_time) if start_time else "N/A"
+            parsed_data['updated_at'] = format_timestamp(last_update) if last_update else "N/A"
 
             for key in ['history', 'config', 'cycle_state', 'current_metrics', 'best_metrics', 'baseline_metrics']:
                 json_str = session_data.get(key)
@@ -465,72 +465,72 @@ async def add_session_history(
 _EVENT_TYPE_TO_SCHEMA = {
     # Evaluation Tool Events
     "evaluation_started": schemas.HistoryEventBaseData, # Generic for now
-    "evaluation_complete": schemas.EvaluationCompleteData,
+    "evaluation_complete": schemas.HistoryEventBaseData, # Generic for now (EvaluationCompleteData not defined)
     "evaluation_failed": schemas.HistoryEventBaseData, # TODO: Define EvaluationFailedData
     # Grid Search Tool Events
     "grid_search_started": schemas.HistoryEventBaseData, # Generic for now
-    "grid_search_complete": schemas.GridSearchResultData, # Reuse? Or create specific history schema?
+    "grid_search_complete": schemas.HistoryEventBaseData, # Reuse? Or create specific history schema?
     "grid_search_failed": schemas.HistoryEventBaseData, # TODO: Define GridSearchFailedData
     # Code Tool Events
     "code_save_started": schemas.HistoryEventBaseData, # Generic for now
-    "code_save_complete": schemas.CodeSaveResultData, # Reuse?
-    "code_save_failed": schemas.CodeSaveFailedData,
+    "code_save_complete": schemas.HistoryEventBaseData, # Reuse?
+    "code_save_failed": schemas.HistoryEventBaseData,
     # LLM Tool Events (Parameter Suggestion)
-    "parameter_suggestion_started": schemas.ParameterSuggestionStartedData,
-    "parameter_suggestion_complete": schemas.ParameterSuggestionCompleteData,
-    "parameter_suggestion_failed": schemas.ParameterSuggestionFailedData,
+    "parameter_suggestion_started": schemas.HistoryEventBaseData,
+    "parameter_suggestion_complete": schemas.HistoryEventBaseData,
+    "parameter_suggestion_failed": schemas.HistoryEventBaseData,
     # LLM Tool Events (Code Improvement)
-    "improve_code_started": schemas.ImproveCodeStartedData,
-    "improve_code_complete": schemas.ImproveCodeCompleteData,
-    "improve_code_failed": schemas.ImproveCodeFailedData,
+    "improve_code_started": schemas.HistoryEventBaseData,
+    "improve_code_complete": schemas.HistoryEventBaseData,
+    "improve_code_failed": schemas.HistoryEventBaseData,
     # LLM Tool Events (Analysis)
-    "analyze_evaluation_started": schemas.AnalyzeEvaluationStartedData,
-    "analyze_evaluation_complete": schemas.AnalyzeEvaluationCompleteData,
-    "analyze_evaluation_failed": schemas.AnalyzeEvaluationFailedData,
+    "analyze_evaluation_started": schemas.HistoryEventBaseData,
+    "analyze_evaluation_complete": schemas.HistoryEventBaseData,
+    "analyze_evaluation_failed": schemas.HistoryEventBaseData,
     # LLM Tool Events (Strategy/Hypothesis)
-    "strategy_suggested": schemas.StrategySuggestedData,
-    "hypotheses_generated": schemas.HypothesesGeneratedData,
+    "strategy_suggested": schemas.HistoryEventBaseData,
+    "hypotheses_generated": schemas.HistoryEventBaseData,
     # Session Management Events
-    "session_started": schemas.SessionStartedData,
-    "session_resumed": schemas.SessionResumedData,
-    "session_paused": schemas.SessionPausedData,
-    "session_stopped": schemas.SessionStoppedData,
-    "session_completed": schemas.SessionCompletedData,
-    "session_timeout": schemas.SessionTimeoutData,
-    "session_error": schemas.SessionErrorData,
+    "session_started": schemas.HistoryEventBaseData,
+    "session_resumed": schemas.HistoryEventBaseData,
+    "session_paused": schemas.HistoryEventBaseData,
+    "session_stopped": schemas.HistoryEventBaseData,
+    "session_completed": schemas.HistoryEventBaseData,
+    "session_timeout": schemas.HistoryEventBaseData,
+    "session_error": schemas.HistoryEventBaseData,
     # Cycle Specific Events (from old improve loop logic, potentially reused by server)
-    "cycle_completed": schemas.CycleCompletedData,
-    "cycle_failed": schemas.CycleFailedData,
-    "cycle_error": schemas.CycleErrorData,
-    "stopped_due_to_stagnation": schemas.StoppedDueToStagnationData,
-    "stopped_by_strategy": schemas.StoppedByStrategyData,
-    "analysis_failed": schemas.AnalysisFailedData,
-    "suggestion_failed": schemas.SuggestionFailedData,
-    "code_improvement_failed": schemas.CodeImprovementFailedData,
+    "cycle_completed": schemas.HistoryEventBaseData,
+    "cycle_failed": schemas.HistoryEventBaseData,
+    "cycle_error": schemas.HistoryEventBaseData,
+    "stopped_due_to_stagnation": schemas.HistoryEventBaseData,
+    "stopped_by_strategy": schemas.HistoryEventBaseData,
+    "analysis_failed": schemas.HistoryEventBaseData,
+    "suggestion_failed": schemas.HistoryEventBaseData,
+    "code_improvement_failed": schemas.HistoryEventBaseData,
     # プロンプト生成関連のイベントタイプを追加
-    "improve_code_prompt_generation_started": schemas.ImproveCodePromptGenerationStartedData,
-    "improve_code_prompt_generation_complete": schemas.ImproveCodePromptGenerationCompleteData,
-    "improve_code_prompt_generation_failed": schemas.ImproveCodePromptGenerationFailedData,
+    "improve_code_prompt_generation_started": schemas.HistoryEventBaseData,
+    "improve_code_prompt_generation_complete": schemas.HistoryEventBaseData,
+    "improve_code_prompt_generation_failed": schemas.HistoryEventBaseData,
     
-    "parameter_suggestion_prompt_generation_started": schemas.ParameterSuggestionPromptGenerationStartedData,
-    "parameter_suggestion_prompt_generation_complete": schemas.ParameterSuggestionPromptGenerationCompleteData,
-    "parameter_suggestion_prompt_generation_failed": schemas.ParameterSuggestionPromptGenerationFailedData,
+    "parameter_suggestion_prompt_generation_started": schemas.HistoryEventBaseData,
+    "parameter_suggestion_prompt_generation_complete": schemas.HistoryEventBaseData,
+    "parameter_suggestion_prompt_generation_failed": schemas.HistoryEventBaseData,
     
-    "analyze_evaluation_prompt_generation_started": schemas.AnalyzeEvaluationPromptGenerationStartedData,
-    "analyze_evaluation_prompt_generation_complete": schemas.AnalyzeEvaluationPromptGenerationCompleteData,
-    "analyze_evaluation_prompt_generation_failed": schemas.AnalyzeEvaluationPromptGenerationFailedData,
+    "analyze_evaluation_prompt_generation_started": schemas.HistoryEventBaseData,
+    "analyze_evaluation_prompt_generation_complete": schemas.HistoryEventBaseData,
+    "analyze_evaluation_prompt_generation_failed": schemas.HistoryEventBaseData,
     
-    "strategy_suggestion_prompt_generation_started": schemas.StrategySuggestionPromptGenerationStartedData,
-    "strategy_suggestion_prompt_generation_complete": schemas.StrategySuggestionPromptGenerationCompleteData,
-    "strategy_suggestion_prompt_generation_failed": schemas.StrategySuggestionPromptGenerationFailedData,
+    "strategy_suggestion_prompt_generation_started": schemas.HistoryEventBaseData,
+    "strategy_suggestion_prompt_generation_complete": schemas.HistoryEventBaseData,
+    "strategy_suggestion_prompt_generation_failed": schemas.HistoryEventBaseData,
     
-    "hypotheses_generation_prompt_generation_started": schemas.HypothesesGenerationPromptGenerationStartedData,
-    "hypotheses_generation_prompt_generation_complete": schemas.HypothesesGenerationPromptGenerationCompleteData,
-    "hypotheses_generation_prompt_generation_failed": schemas.HypothesesGenerationPromptGenerationFailedData,
+    "hypotheses_generation_prompt_generation_started": schemas.HistoryEventBaseData,
+    "hypotheses_generation_prompt_generation_complete": schemas.HistoryEventBaseData,
+    "hypotheses_generation_prompt_generation_failed": schemas.HistoryEventBaseData,
     
-    "assess_improvement_prompt_generation_started": schemas.AssessImprovementPromptGenerationStartedData,
-    "assess_improvement_prompt_generation_complete": schemas.AssessImprovementPromptGenerationCompleteData,
-    "assess_improvement_prompt_generation_failed": schemas.AssessImprovementPromptGenerationFailedData,
+    "assess_improvement_prompt_generation_started": schemas.HistoryEventBaseData,
+    "assess_improvement_prompt_generation_complete": schemas.HistoryEventBaseData,
+    "assess_improvement_prompt_generation_failed": schemas.HistoryEventBaseData,
     # Add other mappings as needed
 }
 
@@ -692,14 +692,14 @@ def register_session_tools(mcp: FastMCP, config: Dict[str, Any], db_path: Path):
     logger.info("Registering session management tools...")
 
     # MCPツールとして登録するために、必要な引数 (config, db_path) を部分適用
-    mcp.tool("start_session", input_schema=schemas.StartSessionInput)(
+    mcp.tool("start_session")(
         lambda base_algorithm="Unknown": start_session(config, db_path, base_algorithm)
     )
-    mcp.tool("get_session_info", input_schema=schemas.GetSessionInfoInput)(
+    mcp.tool("get_session_info")(
         lambda session_id: get_session_info(config, db_path, session_id)
     )
     # add_session_history は内部利用のみを想定し、ツールとしては公開しない (Phase 2.4 参照)
-    # mcp.tool("add_session_history", input_schema=schemas.AddSessionHistoryInput)(
+    # mcp.tool("add_session_history")(
     #     lambda session_id, event_type, event_data, cycle_state_update=None:
     #         add_session_history(config, db_path, session_id, event_type, event_data, cycle_state_update)
     # )

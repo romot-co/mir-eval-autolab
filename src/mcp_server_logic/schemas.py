@@ -99,6 +99,15 @@ class GetCodeResultData(BaseModel):
      detector_name: Optional[str] = None
      file_path: Optional[str] = None
 
+class CodeResult(BaseModel):
+    """Result for code retrieval operations."""
+    detector_name: str
+    code: str
+    version: Optional[str] = None
+    file_path: Optional[str] = None
+    language: str = "python"
+    version_info: Dict[str, Any] = Field(default_factory=dict)
+
 # --- Base Schemas (JobInfo now comes after its result types and their dependencies) ---
 
 class JobStatus(str, Enum):
@@ -628,3 +637,43 @@ class AssessImprovementPromptGenerationFailedData(HistoryEventBaseData):
     error: str
     error_type: str
     context_used: Dict[str, Any]
+
+# --- LLMツール入力スキーマ ---
+
+class GetDetectorInfoInput(BaseModel):
+    """検出器情報取得ツールの入力スキーマ"""
+    session_id: str = Field(..., description="セッションID")
+    detector_id: Optional[str] = Field(None, description="検出器ID（指定しない場合は現在のセッションの検出器が使用されます）")
+
+
+class AnalyzeEvaluationInput(BaseModel):
+    """評価分析ツールの入力スキーマ"""
+    session_id: str = Field(..., description="セッションID")
+    evaluation_results: Dict[str, Any] = Field(..., description="評価結果データ")
+    detector_code: Optional[str] = Field(None, description="検出器コード（オプション）")
+    user_goal: Optional[str] = Field(None, description="ユーザーの目標または課題（オプション）")
+
+
+class GenerateHypothesesInput(BaseModel):
+    """仮説生成ツールの入力スキーマ"""
+    session_id: str = Field(..., description="セッションID")
+    num_hypotheses: int = Field(3, description="生成する仮説の数")
+    analysis_results: Optional[Dict[str, Any]] = Field(None, description="分析結果")
+    current_metrics: Optional[Dict[str, Any]] = Field(None, description="現在のメトリクス")
+
+
+class SuggestExplorationStrategyInput(BaseModel):
+    """戦略提案ツールの入力スキーマ"""
+    session_id: str = Field(..., description="セッションID")
+
+
+class AssessImprovementInput(BaseModel):
+    """改善効果評価ツールの入力スキーマ"""
+    session_id: str = Field(..., description="セッションID")
+    original_code: str = Field(..., description="元のコード")
+    improved_code: str = Field(..., description="改善されたコード")
+    evaluation_results_before: Dict[str, Any] = Field(..., description="改善前の評価結果")
+    evaluation_results_after: Dict[str, Any] = Field(..., description="改善後の評価結果")
+    hypothesis_tested: Optional[str] = Field(None, description="テストした仮説（オプション）")
+    user_goal: Optional[str] = Field(None, description="ユーザーの目標（オプション）")
+    previous_feedback: Optional[str] = Field(None, description="前回のフィードバック（オプション）")

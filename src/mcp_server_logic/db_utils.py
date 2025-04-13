@@ -44,11 +44,15 @@ db_lock = asyncio.Lock() # 非同期対応のDBアクセスロック
 # init_database を async def に変更
 async def init_database(config: dict):
     """データベースを初期化 (テーブル作成など) (非同期)"""
-    workspace_dir = Path(config.get('paths', {}).get('workspace', './mcp_workspace'))
-    db_dir = workspace_dir / "db"
+    # 絶対パスでDB_DIRを指定するように修正
+    db_dir = Path(config.get('paths', {}).get('db', '/Users/user/Documents/mir-eval-autolab/mcp_workspace/db'))
+    # 必ず絶対パスであることを確認
+    if not db_dir.is_absolute():
+        db_dir = Path.cwd() / db_dir
+    
+    logger.info(f"データベースを初期化中: {db_dir / DB_FILENAME}")
     db_dir.mkdir(parents=True, exist_ok=True)
     db_path = db_dir / DB_FILENAME
-    logger.info(f"データベースを初期化中: {db_path}")
     db = None # finally節のために先に宣言
     try:
         # aiosqlite を使用して非同期接続

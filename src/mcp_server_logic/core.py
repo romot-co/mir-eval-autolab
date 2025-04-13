@@ -12,7 +12,7 @@ from typing import Dict, Any, Optional, Callable, Coroutine, Tuple, AsyncGenerat
 # from concurrent.futures import ThreadPoolExecutor # 削除
 
 # 関連モジュールのインポート
-from . import db_utils, utils # utilsからインポート
+from . import db_utils # from . import db_utils, utils # utilsからインポート
 from src.utils.misc_utils import generate_id, get_timestamp # 変更後
 from src.utils.path_utils import get_project_root, load_environment_variables, get_workspace_dir, ensure_dir, get_db_dir, get_output_base_dir, get_improved_versions_dir, validate_path_within_allowed_dirs # validate_path_within_allowed_dirs を追加
 # job_manager から必要なものをインポート

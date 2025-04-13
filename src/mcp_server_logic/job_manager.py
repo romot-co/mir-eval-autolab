@@ -1,17 +1,19 @@
 import logging
 import json
 from pathlib import Path
-from typing import Dict, Any, Optional, Callable, Coroutine, List, Tuple
+from typing import Dict, Any, Optional, Callable, Coroutine, List, Tuple, Union
 import time
 import asyncio
 from asyncio import Queue # Queue を直接インポート
 from enum import Enum # Enum をインポート
 import traceback # traceback をインポート
 from pydantic import BaseModel # BaseModel をインポート
+import sqlite3
+import pickle
 
 # 関連モジュールインポート (型ヒント用)
 from mcp.server.fastmcp import FastMCP
-from . import db_utils, utils
+from . import db_utils
 # core から JsonNumpyEncoder をインポート
 # 注意: core が大きくなりすぎる場合、JsonNumpyEncoder は utils などに移動する方が良い可能性
 # from .core import active_jobs # core から移動
@@ -34,11 +36,11 @@ logger = logging.getLogger('mcp_server.job_manager')
 #     FAILED = "failed"
 
 # --- Job Data Class (schemas.py の JobInfo を使用) --- #
-Job = JobInfo # Use Pydantic schema
+# Job = JobInfo # Use Pydantic schema (別名をやめる)
 
 # --- Global Variables --- #
 job_queue: Queue[Tuple[str, Callable[..., Coroutine], tuple, dict]] = Queue()
-active_jobs: Dict[str, Job] = {} # {job_id: JobInfo}
+active_jobs: Dict[str, JobInfo] = {} # {job_id: JobInfo} (JobInfo を直接使う)
 
 # --- Helper function to parse DB row into Job dict (schemas.py を使うので不要になる可能性) --- #
 def _db_row_to_jobinfo(row: Dict[str, Any]) -> JobInfo:
@@ -276,15 +278,30 @@ async def start_job_workers(num_workers: int, config: Dict[str, Any], db_path: P
 async def start_async_job(
     config: Dict[str, Any],
     db_path: Path,
-    task_coroutine_func: Callable[..., Coroutine], # 実行するコルーチン関数
+    task_coroutine: Coroutine[Any, Any, Any], # 実際のコルーチンを受け取る
     tool_name: str,
     session_id: Optional[str] = None,
-    *args, **kwargs
-) -> Dict[str, str]: # 戻り値を JobStartResponse 形式の Dict に変更
-    """非同期ジョブを開始し、DBに登録してキューに入れる"""
-    job_id = generate_id("job")
-    current_time = get_timestamp()
+    **kwargs # e.g., detector_name, version
+) -> Dict[str, str]: # JobStartResponse 形式
+    """非同期ジョブを開始し、DBに登録する。"""
+    start_time = time.monotonic()
     
+    # --- Generate Job ID --- #
+    # job_id = f"job_{tool_name}_{get_timestamp()}" # 古い形式
+    job_id = generate_id() # ★★★ 引数なしに変更 ★★★
+    logger.info(f"Starting async job: {job_id} (Tool: {tool_name}, Session: {session_id}) with args: {kwargs}")
+    
+    # --- Job Record Preparation --- #
+    job_record = schemas.JobInfo(
+        job_id=job_id,
+        status=JobStatus.PENDING,
+        start_time=start_time,
+        worker_id=None,
+        session_id=session_id,
+        tool_name=tool_name,
+        **kwargs
+    )
+
     # DBパスの検証
     try:
         # ワークスペースディレクトリを取得
@@ -316,11 +333,8 @@ async def start_async_job(
             k: v for k, v in kwargs.items()
             if isinstance(v, (str, int, float, bool, list, dict, tuple)) or v is None
         }
-        # args (タプル) も同様に処理
-        serializable_pos_args = tuple(
-            arg for arg in args
-            if isinstance(arg, (str, int, float, bool, list, dict, tuple)) or arg is None
-        )
+        # args変数が定義されていないため、空のタプルを使用
+        serializable_pos_args = tuple()
         task_args_for_db = {"args": serializable_pos_args, "kwargs": serializable_args}
         task_args_json = json.dumps(task_args_for_db, cls=NumpyEncoder)
     except Exception as e:
@@ -332,7 +346,7 @@ async def start_async_job(
         await db_utils.db_execute_commit_async(
             db_path,
             "INSERT INTO jobs (job_id, session_id, tool_name, status, created_at, task_args) VALUES (?, ?, ?, ?, ?, ?)",
-            (job_id, session_id, tool_name, JobStatus.PENDING.value, current_time, task_args_json)
+            (job_id, session_id, tool_name, JobStatus.PENDING.value, start_time, task_args_json)
         )
     except Exception as e:
         logger.error(f"Failed to register job {job_id} in DB: {e}", exc_info=True)
@@ -341,8 +355,8 @@ async def start_async_job(
         return {"job_id": job_id, "status": "error", "message": f"Failed to register job in DB: {e}"}
 
     # 2. ジョブキューに追加
-    # ここで渡す *args, **kwargs はシリアライズ前のオリジナルのもの
-    await job_queue.put((job_id, task_coroutine_func, args, kwargs))
+    # 未定義の args 変数を使わず、空のタプルを渡す
+    await job_queue.put((job_id, task_coroutine, tuple(), kwargs))
     logger.info(f"Job {job_id} (Tool: {tool_name}, Session: {session_id}) queued.")
 
     # 3. JobStartResponse 形式の辞書を返す
@@ -412,7 +426,191 @@ async def get_job_status(db_path: Path, job_id: str) -> JobInfo:
              error_details=ErrorDetails(message=f"Error retrieving job status: {e}", type=type(e).__name__)
          )
 
-# cleanup_old_jobs は変更なし
+# --- New: Function to list all jobs --- #
+async def list_jobs(
+    db_path: Path,
+    session_id: Optional[str] = None,
+    status: Optional[Union[str, List[str]]] = None,
+    limit: int = 50
+) -> List[schemas.JobInfo]:
+    """指定された条件でジョブを取得します
+    
+    Args:
+        db_path: データベースファイルのパス
+        session_id: セッションIDでフィルタリング（オプション）
+        status: JobStatusまたはそのリストでフィルタリング（オプション）
+        limit: 最大取得件数
+        
+    Returns:
+        JobInfoオブジェクトのリスト
+    """
+    _validate_db_path(db_path)
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        query = "SELECT * FROM jobs"
+        params = []
+        conditions = []
+        
+        if session_id:
+            conditions.append("session_id = ?")
+            params.append(session_id)
+        
+        if status:
+            if isinstance(status, str):
+                # 単一のステータス文字列の場合
+                conditions.append("status = ?")
+                params.append(status)
+            else:
+                # ステータスのリストの場合
+                placeholders = ", ".join(["?" for _ in status])
+                conditions.append(f"status IN ({placeholders})")
+                params.extend(status)
+        
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        
+        query += " ORDER BY create_time DESC LIMIT ?"
+        params.append(limit)
+        
+        cursor.execute(query, params)
+        
+        jobs = []
+        for row in cursor.fetchall():
+            job_data = dict(row)
+            
+            # バイナリデータを復元
+            if job_data["args"]:
+                job_data["args"] = pickle.loads(job_data["args"])
+            
+            # JobInfoオブジェクトを作成
+            job_info = schemas.JobInfo(
+                job_id=job_data["job_id"],
+                tool_name=job_data["tool_name"],
+                status=job_data["status"],
+                queue_time=job_data.get("queue_time"),
+                start_time=job_data.get("start_time"),
+                end_time=job_data.get("end_time"),
+                worker_id=job_data.get("worker_id"),
+                session_id=job_data.get("session_id"),
+                args=job_data.get("args")
+            )
+            jobs.append(job_info)
+        
+        return jobs
+    except Exception as e:
+        logger.error(f"Failed to list jobs: {e}", exc_info=True)
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+# --- 新規: アクティブなワーカー情報を取得する関数 --- #
+async def get_worker_status(stalled_threshold_seconds: int = 3600) -> Dict[str, Any]:
+    """ジョブワーカーの状態情報を取得します
+    
+    Args:
+        stalled_threshold_seconds: この秒数以上実行されているジョブを停滞中と見なす
+        
+    Returns:
+        ワーカー状態の情報を含む辞書
+    """
+    try:
+        current_time = time.time()
+        status_info = {
+            "active_workers": len(JOB_WORKERS),
+            "queue_size": JOB_QUEUE.qsize(),
+            "running_jobs": [],
+            "potentially_stalled_jobs": []
+        }
+        
+        # 実行中のジョブとその情報を収集
+        for worker_id, worker_info in JOB_WORKERS.items():
+            if worker_info["current_job"]:
+                job_id = worker_info["current_job"]
+                job_start_time = worker_info.get("job_start_time", 0)
+                running_time = current_time - job_start_time if job_start_time else 0
+                
+                job_info = {
+                    "job_id": job_id,
+                    "worker_id": worker_id,
+                    "running_time_seconds": int(running_time),
+                    "tool_name": worker_info.get("tool_name", "unknown")
+                }
+                
+                # 実行中のジョブのリストに追加
+                status_info["running_jobs"].append(job_info)
+                
+                # 停滞している可能性のあるジョブをチェック
+                if running_time > stalled_threshold_seconds:
+                    status_info["potentially_stalled_jobs"].append(job_info)
+        
+        return status_info
+    except Exception as e:
+        logger.error(f"Failed to get worker status: {e}", exc_info=True)
+        raise
+
+# --- Job cleanup function --- #
+async def cleanup_old_jobs(config: Dict[str, Any]) -> None:
+    """古いジョブレコードをクリーンアップします"""
+    cleanup_config = config.get('cleanup', {})
+    jobs_cleanup_config = cleanup_config.get('jobs', {})
+    
+    if not jobs_cleanup_config.get('enabled', False):
+        logger.info("ジョブのクリーンアップは無効です。")
+        return
+    
+    # DB パスを取得
+    db_path = Path(config.get('paths', {}).get('db', 'mcp.db'))
+    if not db_path.is_absolute():
+        # 相対パスの場合、workspace_dir からの相対パスとみなす
+        try:
+            workspace_dir = get_workspace_dir(config)
+            db_path = workspace_dir / db_path
+        except (ConfigError, FileError) as e:
+            logger.error(f"ジョブクリーンアップ: workspace_dir の取得に失敗しました: {e}")
+            return
+    
+    if not db_path.exists():
+        logger.error(f"ジョブクリーンアップ: DB ファイルが存在しません: {db_path}")
+        return
+    
+    retention_days = jobs_cleanup_config.get('retention_days', 7)
+    if retention_days <= 0:
+        logger.warning("ジョブクリーンアップの retention_days が正の値ではありません。クリーンアップをスキップします。")
+        return
+    
+    cutoff_time = time.time() - (retention_days * 24 * 60 * 60)  # 秒単位での保持期間
+    
+    logger.info(f"古いジョブのクリーンアップを実行します。{retention_days}日以上前のジョブを削除します。")
+    
+    try:
+        # 古いジョブの数を取得
+        count_sql = """
+            SELECT COUNT(*) FROM jobs 
+            WHERE created_at < ? AND status != ?
+        """
+        row = await db_utils.db_fetch_one_async(db_path, count_sql, (cutoff_time, JobStatus.RUNNING.value))
+        if row:
+            count = row[0]
+            logger.info(f"削除対象の古いジョブ: {count}件")
+            
+            if count > 0:
+                # 古いジョブを削除
+                delete_sql = """
+                    DELETE FROM jobs 
+                    WHERE created_at < ? AND status != ?
+                """
+                await db_utils.db_execute_commit_async(db_path, delete_sql, (cutoff_time, JobStatus.RUNNING.value))
+                logger.info(f"古いジョブを削除しました: {count}件")
+        else:
+            logger.warning("ジョブ数の取得に失敗しました。")
+    
+    except Exception as e:
+        logger.error(f"ジョブクリーンアップ中にエラーが発生しました: {e}", exc_info=True)
 
 # --- Tool Registration --- #
 def register_job_tools(mcp: FastMCP, config: Dict[str, Any], db_path: Path):
@@ -424,8 +622,112 @@ def register_job_tools(mcp: FastMCP, config: Dict[str, Any], db_path: Path):
     mcp.tool("get_job_status", input_schema=schemas.GetJobStatusInput)(
         lambda job_id: get_job_status(db_path, job_id)
     )
+    
+    # --- 新規: list_jobs 関数を登録 --- #
+    @mcp.tool("list_jobs")
+    async def list_jobs_tool(session_id: Optional[str] = None, limit: int = 50, status: Optional[Union[str, List[str]]] = None) -> List[Dict[str, Any]]:
+        """ジョブの一覧を取得します。特定のセッションIDまたはステータスが指定された場合はフィルタリングします。
+        
+        Args:
+            session_id: フィルタリングするセッションID（オプション）
+            limit: 最大取得件数
+            status: フィルタリングするステータス（オプション）
+                   文字列の場合: "PENDING", "QUEUED", "RUNNING", "COMPLETED", "FAILED", "UNKNOWN" のいずれか
+                   リストの場合: 上記ステータスの組み合わせ
+        """
+        jobs = await list_jobs(db_path, session_id, limit, status)
+        # JobInfo オブジェクトをdict()ではなくmodel_dump()で辞書に変換して返す
+        return [job.model_dump() for job in jobs]
+    
+    # --- 新規: 実行中のジョブのみ取得するツールを追加 --- #
+    @mcp.tool("get_running_jobs")
+    async def get_running_jobs_tool(session_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """実行中のジョブの一覧を取得します。
+        
+        Args:
+            session_id: フィルタリングするセッションID（オプション）
+            limit: 最大取得件数
+        """
+        jobs = await list_jobs(db_path, session_id, limit, status="RUNNING")
+        return [job.model_dump() for job in jobs]
+        
+    # --- 新規: ワーカー状態取得ツールを登録 --- #
+    @mcp.tool("get_worker_status")
+    async def get_worker_status_tool(stalled_threshold_seconds: int = 3600) -> Dict[str, Any]:
+        """ジョブワーカーの状態と情報を取得します。"""
+        return await get_worker_status(stalled_threshold_seconds)
+    
     logger.info("Job management tools registered.")
 
 # --- Import Guard --- #
 if __name__ == "__main__":
     print("This module is intended for import by the main MCP server script.") 
+
+def register_tools():
+    """ジョブ管理関連のツールを登録します。"""
+    
+    # 既存のコード...
+    
+    @register_tool
+    async def list_jobs_tool(session_id: Optional[str] = None, status: Optional[Union[str, List[str]]] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """登録されているジョブの一覧を取得します。
+        
+        Args:
+            session_id: 特定のセッションIDに限定する場合に指定
+            status: ジョブステータスでフィルタリング (PENDING, QUEUED, RUNNING, COMPLETED, FAILED, UNKNOWN)
+            limit: 取得する最大件数
+            
+        Returns:
+            ジョブ情報のリスト
+        """
+        try:
+            jobs = await list_jobs(db_path, session_id=session_id, status=status, limit=limit)
+            return [job.model_dump() for job in jobs]
+        except Exception as e:
+            logger.error(f"Error in list_jobs_tool: {e}")
+            return []
+
+    @register_tool
+    async def get_running_jobs(session_id: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+        """実行中のジョブを取得します
+        
+        Args:
+            session_id: セッションIDでフィルタリング（オプション）
+            limit: 最大取得件数
+            
+        Returns:
+            実行中のJobInfoオブジェクトのリスト
+        """
+        try:
+            jobs = await list_jobs(db_path, session_id=session_id, status="RUNNING", limit=limit)
+            return [job.model_dump() for job in jobs]
+        except Exception as e:
+            logger.error(f"Error in get_running_jobs: {e}")
+            return []
+
+    @register_tool
+    async def get_worker_status_tool(stalled_threshold_seconds: int = 3600) -> Dict[str, Any]:
+        """ジョブワーカーの状態情報を取得します。
+        
+        Args:
+            stalled_threshold_seconds: この秒数以上実行されているジョブを停滞中と見なす
+            
+        Returns:
+            ワーカーの状態情報（アクティブなワーカー数、キューサイズ、実行中ジョブ、停滞中ジョブなど）
+        """
+        try:
+            return await get_worker_status(stalled_threshold_seconds)
+        except Exception as e:
+            logger.error(f"Error in get_worker_status_tool: {e}")
+            return {"error": str(e)}
+    
+    # 既存のツール登録...
+    
+    return {
+        "add_job": add_job_tool,
+        "cancel_job": cancel_job_tool,
+        "get_job": get_job_tool,
+        "list_jobs": list_jobs_tool,
+        "get_running_jobs": get_running_jobs,
+        "get_worker_status": get_worker_status_tool,
+    } 

@@ -8,13 +8,7 @@
 /uploads/
 # /mcp_workspace/ # Or /.mcp_server_data/ if renamed later
 /.mcp_server_data/
-
-# Old output directories (to be removed eventually)
-# /evaluation_results/
-# /grid_search_results/
-# /visualizations/
-# /scientific_output/
-# /results/
+/mcp_workspace/
 
 # ========================================
 # ======== Database, Logs & Temp ========

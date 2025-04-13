@@ -22,126 +22,100 @@ from src.utils.path_utils import (
     get_workspace_dir # get_workspace_dir をインポートに追加
 )
 from src.utils.exception_utils import FileError, ConfigError, MirexError
-from .. import schemas # schemas モジュール自体をインポート
+from . import schemas # schemas モジュール自体をインポート
+from .schemas import CodeResult  # CodeResultクラスを明示的にインポート
 
 logger = logging.getLogger('mcp_server.code_tools')
 
-# --- Helper Function --- #
+# --- Helper Functions --- #
+
+def get_code_version_info(code: str, file_path: Path) -> Dict[str, Any]:
+    """コードからバージョン情報を抽出する
+    
+    Args:
+        code: コード文字列
+        file_path: コードファイルのパス
+        
+    Returns:
+        バージョン情報を含む辞書
+    """
+    version_info = {
+        "filename": file_path.name,
+        "path": str(file_path),
+        "size_bytes": len(code)
+    }
+    
+    # ファイル名からバージョンを推測
+    filename = file_path.stem
+    version_match = re.search(r'_([v\d].+)$', filename)
+    if version_match:
+        version_info["version_from_filename"] = version_match.group(1)
+    
+    # 最終更新日時
+    try:
+        mtime = file_path.stat().st_mtime
+        version_info["last_modified"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
+    except Exception:
+        pass
+        
+    # コード内のバージョン情報を検索
+    version_pattern = re.compile(r'^\s*(VERSION|__version__)\s*=\s*[\'"]([^\'"]+)[\'"]', re.MULTILINE)
+    version_match = version_pattern.search(code)
+    if version_match:
+        version_info["version_from_code"] = version_match.group(2)
+    
+    # ハッシュ生成
+    version_info["version_hash"] = f"v{hash(code) % 100000:05d}"
+    
+    return version_info
 
 def get_detector_path(
-    detectors_dir: Path, # Passed in
-    improved_versions_dir: Path, # Passed in
     detector_name: str,
+    config: Dict[str, Any],
     version: Optional[str] = None,
-    # session_id: Optional[str] = None # Removed, not used
+    use_original: bool = False
 ) -> Path:
-    """
-    検出器コードのパスを取得します。
-    バージョン指定があれば improved_versions から探し、なければ最新版、それもなければ src から探します。
-    指定バージョンが見つからない場合はエラー。最新版が見つからない場合はベースコードにフォールバック。
-
+    """検出器のパスを取得する
+    
     Args:
-        detectors_dir: ベースとなる検出器ソースディレクトリのパス
-        improved_versions_dir: 改善版が保存されるディレクトリのパス
         detector_name: 検出器名
-        version: 要求バージョン (例: 'v1') または None (最新版)
-
+        config: 設定オブジェクト
+        version: バージョン情報（オプション）
+        use_original: 元のバージョンを使用するかどうか
+        
     Returns:
-        検出器ファイルの絶対パス
-
-    Raises:
-        FileNotFoundError: ファイルが見つからない場合
-        ValueError: 引数が不正な場合
+        検出器ファイルのパス
     """
-    if not is_safe_path_component(detector_name):
-        raise ValueError(f"Invalid detector name format: {detector_name}")
-    if version and not is_safe_path_component(version):
-        raise ValueError(f"Invalid version format: {version}")
-
-    src_detectors_dir = detectors_dir
-    improved_dir = improved_versions_dir
-
-    # Detector name might be class name or filename. Infer filename.
-    if detector_name.endswith('.py'):
-        filename_base = detector_name[:-3]
-    else:
-        # Convert CamelCase to snake_case (simple conversion)
-        s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', detector_name)
-        filename_base = re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
-
-    filename = f"{filename_base}.py"
-    base_file = src_detectors_dir / filename
-    logger.debug(f"Searching for detector '{detector_name}', base file: {base_file}")
-
-    if version:
-        # Specific version requested
-        # Improved versions are typically stored directly under improved_versions_dir
-        # Filename format: {base_filename}_{version}.py
-        versioned_filename = f"{filename_base}_{version}.py"
-        versioned_file = improved_dir / versioned_filename
-        if versioned_file.is_file(): # Check if it's a file
-            logger.debug(f"Found specified version: {versioned_file}")
-            return versioned_file
+    try:
+        detectors_dir = get_detectors_src_dir(config)
+        improved_versions_dir = get_improved_versions_dir(config)
+        
+        if not is_safe_path_component(detector_name):
+            raise ValueError(f"検出器名が不正です: {detector_name}")
+            
+        # 検出器ファイル名を生成
+        if detector_name.endswith('.py'):
+            filename = detector_name
         else:
-            # If specific version is requested but not found, it's an error
-            logger.error(f"Specified version '{version}' for detector '{detector_name}' not found at {versioned_file}")
-            raise FileNotFoundError(f"Specified version '{version}' for detector '{detector_name}' not found.")
-    else:
-        # Latest version requested (version is None or empty)
-        latest_version_file: Optional[Path] = None
-        all_versions: List[Tuple[str, Path]] = [] # Store tuples (tag, path)
-
-        if improved_dir.is_dir(): # Check if directory exists
-            # Collect all improved versions for this detector
-            # Format: {base_filename}_<tag>.py
-            version_pattern = re.compile(rf"^{re.escape(filename_base)}_(.+)\.py$")
-            for f in improved_dir.iterdir(): # Search directly in improved_dir
-                 if f.is_file():
-                     match = version_pattern.match(f.name)
-                     if match:
-                          tag = match.group(1)
-                          # Basic tag validation (optional but good)
-                          if is_safe_path_component(tag):
-                               all_versions.append((tag, f)) # Store (tag, path)
-                          else:
-                               logger.warning(f"Skipping file with potentially unsafe version tag: {f.name}")
-
-        if all_versions:
-            # Sort versions to find the latest (using previous logic)
-            def sort_key(version_tuple: Tuple[str, Path]):
-                tag = version_tuple[0]
-                # Try YYYYMMDD_HHMMSS
-                match_ts = re.match(r"(\d{8})_(\d{6})", tag)
-                if match_ts:
-                    try:
-                        ts_val = time.mktime(time.strptime(f"{match_ts.group(1)}{match_ts.group(2)}", "%Y%m%d%H%M%S"))
-                        return (2, ts_val, tag)
-                    except ValueError:
-                        pass
-                # Try v<unix_ts>
-                match_vts = re.match(r"v(\d+)", tag)
-                if match_vts:
-                    try:
-                        return (1, int(match_vts.group(1)), tag)
-                    except ValueError:
-                         pass
-                # Fallback: lexicographical sort
-                return (0, 0, tag)
-
-            all_versions.sort(key=sort_key, reverse=True) # Sort descending
-            latest_version_tag, latest_version_file = all_versions[0]
-            logger.debug(f"Found latest improved version (tag: {latest_version_tag}): {latest_version_file}")
-            return latest_version_file
-
-        # No improved versions found, fall back to base code
-        if base_file.is_file():
-            logger.debug(f"No improved versions found for '{detector_name}'. Using base detector code: {base_file}")
-            return base_file
-        else:
-            # Base code also doesn't exist
-            logger.error(f"Detector code not found for '{detector_name}' (neither improved nor base version). Searched in {src_detectors_dir} and {improved_dir}")
-            raise FileNotFoundError(f"Detector '{detector_name}' not found.")
-
+            # CamelCase を snake_case に変換
+            s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', detector_name)
+            filename = re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower() + '.py'
+            
+        # バージョン指定がある場合
+        if version and not use_original:
+            if not is_safe_path_component(version):
+                raise ValueError(f"バージョン指定が不正です: {version}")
+                
+            base_name = filename[:-3]  # .py を除去
+            versioned_filename = f"{base_name}_{version}.py"
+            return improved_versions_dir / versioned_filename
+            
+        # 通常のパス
+        return detectors_dir / filename
+        
+    except Exception as e:
+        logger.error(f"検出器パスの取得に失敗しました: {e}", exc_info=True)
+        raise
 
 # --- Synchronous Task Functions (run in executor) --- #
 
@@ -355,88 +329,65 @@ def _run_save_code(
 
 # --- Asynchronous Task Wrapper Functions --- #
 
-async def _run_get_code_async(
-    job_id: str,
-    # add_history_async_func: Callable[..., Awaitable[None]], # ★ 削除
-    detectors_dir: Path,
-    improved_versions_dir: Path,
-    allowed_base_dirs: List[Path],
-    detector_name: str,
-    version: Optional[str] = None,
-    session_id: Optional[str] = None
-) -> str: # ★ 戻り値を直接コード文字列に
-    """コード取得ジョブ (非同期ラッパー)。履歴記録は削除。"""
-    start_time = time.monotonic()
-    logger.info(f"[Job {job_id}] Starting get_code for '{detector_name}' (Version: {version or 'latest'})... Session: {session_id}")
-    error_msg: Optional[str] = None
-    error_details: Optional[Dict[str, Any]] = None
-
-    # --- 履歴記録削除 ---
-    # await add_history_async_func(
-    #     session_id=session_id,
-    #     event_type="code_load.started",
-    #     event_data=schemas.CodeLoadStartedData(
-    #         job_id=job_id,
-    #         detector_name=detector_name,
-    #         version=version
-    #     ).model_dump()
-    # )
-
+async def _run_get_code_async(job_id: str, config: Dict[str, Any], detector_name: str, version: Optional[str] = None) -> CodeResult:
+    """検出器のコードを取得する非同期タスク"""
     try:
-        loop = asyncio.get_running_loop()
-        # partial を使って同期関数に必要な引数を渡す
-        sync_task = partial(
-            _run_get_code,
-            detectors_dir=detectors_dir,
-            improved_versions_dir=improved_versions_dir,
-            allowed_base_dirs=allowed_base_dirs,
+        logger.info(f"[Job {job_id}] GET_CODE: Starting to fetch code for detector '{detector_name}', version={version}")
+        
+        # 検証用: ジョブステータスを明示的にログ
+        logger.info(f"[Job {job_id}] GET_CODE: Job status check - this job is running")
+        
+        # コード取得開始
+        detector_path = get_detector_path(detector_name, config, version, use_original=True)
+        
+        logger.info(f"[Job {job_id}] GET_CODE: Found detector path: {detector_path}")
+        
+        if not detector_path.exists():
+            error_msg = f"Detector file not found: {detector_path}"
+            logger.error(f"[Job {job_id}] GET_CODE: {error_msg}")
+            raise FileNotFoundError(error_msg)
+            
+        # ファイル読み込み開始
+        logger.info(f"[Job {job_id}] GET_CODE: Reading detector file content")
+        try:
+            with open(detector_path, 'r', encoding='utf-8') as f:
+                code = f.read()
+                logger.info(f"[Job {job_id}] GET_CODE: Successfully read detector file. Content length: {len(code)} chars")
+        except Exception as read_err:
+            logger.error(f"[Job {job_id}] GET_CODE: Error reading detector file: {read_err}", exc_info=True)
+            raise FileError(f"Failed to read detector file: {read_err}") from read_err
+            
+        # バージョン情報取得
+        version_info = {}
+        try:
+            version_info = get_code_version_info(code, detector_path)
+            logger.info(f"[Job {job_id}] GET_CODE: Got version info: {version_info}")
+        except Exception as ver_err:
+            logger.warning(f"[Job {job_id}] GET_CODE: Failed to get code version info: {ver_err}")
+            # バージョン情報取得失敗はエラーにせず継続
+            
+        # 結果の構築
+        result = CodeResult(
             detector_name=detector_name,
-            version=version
+            code=code,
+            version=version_info.get('version_hash', version),
+            file_path=str(detector_path),
+            language="python",
+            version_info=version_info
         )
-        # 同期関数を実行
-        code_content = await loop.run_in_executor(None, sync_task)
-
-        logger.info(f"[Job {job_id}] Code get successful for '{detector_name}'. Duration: {time.monotonic() - start_time:.2f}s")
-
-        # --- 履歴記録削除 ---
-        # await add_history_async_func(
-        #     session_id=session_id,
-        #     event_type="code_load.completed",
-        #     event_data=schemas.CodeLoadCompleteData(
-        #         job_id=job_id,
-        #         detector_name=detector_name,
-        #         version=version, # TODO: get_detector_path が実際のバージョンを返すようにすべき
-        #         duration=time.monotonic() - start_time,
-        #         # file_path も get_detector_path から取得できると良い
-        #     ).model_dump()
-        # )
-        return code_content # コード文字列を直接返す
-
-    except (ValueError, FileNotFoundError, ConfigError, FileError) as e:
-        error_msg = f"Validation or File Error: {str(e)}"
-        error_details = {"error_type": type(e).__name__, "message": str(e)}
-        logger.warning(f"[Job {job_id}] Code get failed for '{detector_name}': {error_msg}")
+        
+        logger.info(f"[Job {job_id}] GET_CODE: Successfully completed for '{detector_name}'")
+        return result
+        
+    except FileNotFoundError as e:
+        logger.error(f"[Job {job_id}] GET_CODE: File not found: {e}", exc_info=True)
+        raise  # 再送出
+    except FileError as e:
+        logger.error(f"[Job {job_id}] GET_CODE: File error: {e}", exc_info=True)
+        raise  # 再送出
     except Exception as e:
-        error_msg = f"Unexpected Error: {str(e)}"
-        error_details = {"error_type": type(e).__name__, "message": str(e), "traceback": traceback.format_exc()}
-        logger.error(f"[Job {job_id}] Unexpected error getting code for '{detector_name}': {error_msg}", exc_info=True)
-
-    # --- 履歴記録削除 ---
-    # fail_data = schemas.CodeLoadFailedData(
-    #     job_id=job_id,
-    #     detector_name=detector_name,
-    #     version=version,
-    #     error_message=error_msg,
-    #     error_details=error_details,
-    #     duration=time.monotonic() - start_time
-    # )
-    # await add_history_async_func(
-    #     session_id=session_id,
-    #     event_type="code_load.failed",
-    #     event_data=fail_data.model_dump()
-    # )
-    # エラー時は例外を再発生させる (job_worker で捕捉)
-    raise FileError(error_msg or "Failed to get code")
+        logger.error(f"[Job {job_id}] GET_CODE: Unexpected error: {e}", exc_info=True)
+        raise FileError(f"Failed to retrieve code: {e}") from e
 
 async def _run_save_code_async(
     job_id: str,
@@ -555,16 +506,56 @@ def register_code_tools(
     logger.info("コード管理ツールを登録中...")
 
     # --- 設定からパスを取得 --- #
+    detectors_dir = None
+    improved_versions_dir = None
+    workspace_dir = None
     try:
+        logger.debug("Attempting to get detectors source directory...")
         detectors_dir = get_detectors_src_dir(config)
-        improved_versions_dir = get_improved_versions_dir(config)
-        workspace_dir = get_workspace_dir(config)
+        logger.info(f"Detector base dir obtained: {detectors_dir}")
+
+        # ★ 修正点: improved_versions の設定を安全に取得
+        logger.debug("Safely getting improved_versions directory path config...")
+        paths_config = config.get('paths', {})
+        improved_versions_path_config = paths_config.get('improved_versions')
+
+        # もし設定値が絶対パスのように見える場合、または安全でない場合はデフォルト名を使う
+        safe_subdir_name = 'improved_versions' # デフォルト
+        if isinstance(improved_versions_path_config, str) and is_safe_path_component(improved_versions_path_config):
+             safe_subdir_name = improved_versions_path_config
+        elif improved_versions_path_config is not None:
+             logger.warning(f"Config value for paths.improved_versions ('{improved_versions_path_config}') seems unsafe or absolute. Using default name '{safe_subdir_name}'.")
+
+        # get_improved_versions_dir に渡すための一時的な config を作成 (元の config は変更しない)
+        temp_config_for_improved = config.copy()
+        if 'paths' not in temp_config_for_improved: temp_config_for_improved['paths'] = {}
+        temp_config_for_improved['paths']['improved_versions'] = safe_subdir_name # 安全な名前を設定
+
+        logger.debug(f"Attempting to get improved versions directory using safe name '{safe_subdir_name}'...")
+        improved_versions_dir = get_improved_versions_dir(temp_config_for_improved) # 修正したconfigで呼び出す
+        logger.info(f"Improved versions dir obtained: {improved_versions_dir}")
+
+        logger.debug("Attempting to get workspace directory...")
+        workspace_dir = get_workspace_dir(config) # これは元の config を使う
+        logger.info(f"Workspace dir obtained: {workspace_dir}")
+
         allowed_base_dirs = [detectors_dir, improved_versions_dir, workspace_dir]
-        logger.info(f"Detector base dir: {detectors_dir}")
-        logger.info(f"Improved versions dir: {improved_versions_dir}")
+        logger.debug(f"Allowed base directories: {allowed_base_dirs}")
+        
+        # improved_versions ディレクトリの存在と書き込み権限をここで再確認
+        logger.info(f"Explicitly ensuring improved_versions directory: {improved_versions_dir}")
+        ensure_dir(improved_versions_dir, check_writable=True)
+        logger.info(f"Successfully ensured improved_versions directory: {improved_versions_dir}")
+        
     except (ConfigError, FileError) as e:
-        logger.critical(f"コードツール登録失敗: 設定されたパスが無効です: {e}")
+        logger.critical(f"コードツール登録失敗: 設定されたパスが無効です。Error: {e}")
+        logger.critical(f"Paths at time of error: detectors_dir={detectors_dir}, improved_versions_dir={improved_versions_dir}, workspace_dir={workspace_dir}")
+        logger.critical(traceback.format_exc()) # スタックトレースをログに出力
         raise RuntimeError(f"Failed to register code tools due to invalid paths: {e}") from e
+    except Exception as e:
+        logger.critical(f"コードツール登録中に予期せぬエラーが発生しました: {e}")
+        logger.critical(traceback.format_exc())
+        raise RuntimeError(f"Unexpected error during code tool registration: {e}") from e
 
     # --- Helper to start job --- #
     async def _start_code_job(
@@ -573,26 +564,28 @@ def register_code_tools(
         session_id: Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]: # ★ JobStartResponse 形式
+        # ファクトリを実行して実際のコルーチンを取得
+        actual_task_coroutine = task_coroutine_factory(
+            job_id="placeholder", # Will be replaced by actual job_id in job_manager
+            # add_history_async_func=add_history_async_func, # 削除
+            **kwargs # Pass other specific args like detector_name, version
+        )
+        
+        # mcp_server.py の lambda に合わせて呼び出し
+        # task_coroutine_func は最初の位置引数として渡す
+        # config と db_path は lambda が内部でグローバル変数から取得するため不要
         job_start_info = await start_async_job_func(
-            config=config,
-            db_path=db_path,
-            task_coroutine_func=task_coroutine_factory(
-                # Pass necessary args to the factory
-                job_id="placeholder", # Will be replaced by actual job_id
-                # add_history_async_func=add_history_async_func, # 削除
-                **kwargs # Pass other specific args
-            ),
-            tool_name=tool_name,
-            session_id=session_id,
-            # Pass original kwargs to be stored in DB/used by worker?
+            actual_task_coroutine, # コルーチンを最初の位置引数として渡す
+            tool_name,
+            session_id, # キーワード引数ではなく位置引数として渡す
+            # **kwargs は lambda 経由で job_manager.start_async_job に渡される
             **kwargs # Pass kwargs like detector_name, version etc.
         )
-        # Ensure job_id is updated in the coroutine factory if needed? No, worker gets it.
         return job_start_info
 
     # --- MCP Tool Definitions --- #
 
-    @mcp.tool("get_code", input_schema=schemas.GetCodeInput)
+    @mcp.tool("get_code")
     async def get_code_tool(
         detector_name: str,
         version: Optional[str] = None,
@@ -603,16 +596,14 @@ def register_code_tools(
         task_coro_factory = partial(
             _run_get_code_async,
             # add_history_async_func=add_history_async_func, # 削除
-            detectors_dir=detectors_dir,
-            improved_versions_dir=improved_versions_dir,
-            allowed_base_dirs=allowed_base_dirs,
+            config=config,
             detector_name=detector_name,
             version=version,
             session_id=session_id
         )
         return await _start_code_job(task_coro_factory, "get_code", session_id, detector_name=detector_name, version=version)
 
-    @mcp.tool("save_code", input_schema=schemas.SaveCodeInput)
+    @mcp.tool("save_code")
     async def save_code_tool(
         detector_name: str,
         code: str,
@@ -637,6 +628,79 @@ def register_code_tools(
             changes_summary=changes_summary
         )
         return await _start_code_job(task_coro_factory, "save_code", session_id, detector_name=detector_name)
+
+    # --- 利用可能な検出器を取得するヘルパー関数 --- #
+    def _get_available_detectors(search_dirs: List[Path]) -> Dict[str, List[Dict[str, str]]]:
+        """指定されたディレクトリから利用可能な検出器の一覧を取得します。"""
+        base_detectors = []
+        improved_detectors = []
+        
+        # 基本検出器ディレクトリを検索
+        for dir_path in search_dirs:
+            if not dir_path.exists() or not dir_path.is_dir():
+                logger.warning(f"検出器ディレクトリが存在しません: {dir_path}")
+                continue
+                
+            # Pythonファイルを探す（__init__.pyを除く）
+            python_files = [f for f in dir_path.glob("*.py") if f.name != "__init__.py"]
+            
+            for file_path in python_files:
+                # 基本ディレクトリの場合
+                if dir_path == detectors_dir:
+                    detector_name = file_path.stem  # 拡張子なしのファイル名
+                    base_detectors.append({
+                        "name": detector_name,
+                        "file_path": str(file_path)
+                    })
+                # 改良バージョンディレクトリの場合
+                elif dir_path == improved_versions_dir:
+                    # 名前とバージョンを分離（例: base_detector_v1.py -> base_detector, v1）
+                    file_stem = file_path.stem
+                    # バージョンがある場合（_区切り）
+                    match = re.match(r"(.+)_(.+)$", file_stem)
+                    if match:
+                        detector_name = match.group(1)
+                        version_tag = match.group(2)
+                        improved_detectors.append({
+                            "name": detector_name,
+                            "version": version_tag,
+                            "file_path": str(file_path)
+                        })
+        
+        return {
+            "base_detectors": base_detectors,
+            "improved_detectors": improved_detectors
+        }
+
+    # --- 検出器一覧を取得するツール --- #
+    @mcp.tool("list_detectors")
+    async def list_detectors_tool(include_improved: bool = True) -> Dict[str, Any]:
+        """利用可能な検出器の一覧を取得します。
+        
+        Args:
+            include_improved: 改良バージョンも含める場合はTrue
+            
+        Returns:
+            利用可能な検出器のリスト
+        """
+        logger.info(f"MCP Tool: list_detectors called (include_improved={include_improved})")
+        
+        search_dirs = [detectors_dir]
+        if include_improved:
+            search_dirs.append(improved_versions_dir)
+            
+        try:
+            detectors_list = _get_available_detectors(search_dirs)
+            return {
+                "status": "success",
+                "detectors": detectors_list
+            }
+        except Exception as e:
+            logger.error(f"検出器一覧の取得に失敗しました: {e}", exc_info=True)
+            return {
+                "status": "error",
+                "message": f"検出器一覧の取得に失敗しました: {e}"
+            }
 
     logger.info("コード管理ツール登録完了。")
 
