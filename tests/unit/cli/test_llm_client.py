@@ -9,7 +9,7 @@ import sys
 import json
 from pathlib import Path
 from typing import Optional
-from unittest.mock import AsyncMock, MagicMock # patch は不要
+from unittest.mock import AsyncMock, MagicMock  # patch は不要
 
 # このスクリプトの親ディレクトリをPYTHONPATHに追加
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -18,23 +18,35 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # --- テスト対象モジュールのインポート ---
 # 必要なモジュールを直接インポート (テスト環境での存在を前提とする)
 try:
-    from src.cli.llm_client import initialize_llm_client, LLMClientError, AnthropicClient
-    from anthropic import AsyncAnthropic, AnthropicError # 実際のクラスをインポート
+    from src.cli.llm_client import (
+        initialize_llm_client,
+        LLMClientError,
+        AnthropicClient,
+    )
+    from anthropic import AsyncAnthropic, AnthropicError  # 実際のクラスをインポート
 except ImportError as e:
-    pytest.skip(f"Skipping LLM client tests due to import error: {e}", allow_module_level=True)
+    pytest.skip(
+        f"Skipping LLM client tests due to import error: {e}", allow_module_level=True
+    )
 
 
 # --- テスト用のモックレスポンスクラス ---
 class MockResponse:
     def __init__(self, text_content):
         self._content = [MockContent(text_content)]
+
     @property
-    def content(self): return self._content
+    def content(self):
+        return self._content
+
 
 class MockContent:
-    def __init__(self, text_content): self._text = text_content
+    def __init__(self, text_content):
+        self._text = text_content
+
     @property
-    def text(self): return self._text
+    def text(self):
+        return self._text
 
 
 # @pytest.mark.skipif(SKIP_TESTS, reason="必要なモジュールが見つかりません") # pytest.skip で代替
@@ -51,7 +63,7 @@ class TestLLMClient:
     def test_initialize_llm_client_with_key(self, mocker):
         """APIキーを指定してクライアントが初期化されることをテスト"""
         # llm_client モジュール内の AsyncAnthropic をモック
-        mock_async_anthropic_cls = mocker.patch('src.cli.llm_client.AsyncAnthropic')
+        mock_async_anthropic_cls = mocker.patch("src.cli.llm_client.AsyncAnthropic")
         api_key = "test_api_key_arg"
         client = initialize_llm_client(api_key=api_key)
 
@@ -63,15 +75,15 @@ class TestLLMClient:
 
     @pytest.fixture
     def mock_anthropic_create(self, mocker):
-         """AsyncAnthropic クラスとそのインスタンスの messages.create をモックする"""
-         # AsyncAnthropic クラス自体をモック
-         mock_async_anthropic_cls = mocker.patch('src.cli.llm_client.AsyncAnthropic')
-         # AsyncAnthropic クラスが呼ばれたときに返すインスタンスモックを取得
-         mock_async_client_instance = mock_async_anthropic_cls.return_value
-         # インスタンスモックの messages.create 属性に AsyncMock を設定
-         mock_create = AsyncMock(return_value=MockResponse("Default Mock Response"))
-         mock_async_client_instance.messages.create = mock_create
-         return mock_create # この AsyncMock を返す
+        """AsyncAnthropic クラスとそのインスタンスの messages.create をモックする"""
+        # AsyncAnthropic クラス自体をモック
+        mock_async_anthropic_cls = mocker.patch("src.cli.llm_client.AsyncAnthropic")
+        # AsyncAnthropic クラスが呼ばれたときに返すインスタンスモックを取得
+        mock_async_client_instance = mock_async_anthropic_cls.return_value
+        # インスタンスモックの messages.create 属性に AsyncMock を設定
+        mock_create = AsyncMock(return_value=MockResponse("Default Mock Response"))
+        mock_async_client_instance.messages.create = mock_create
+        return mock_create  # この AsyncMock を返す
 
     @pytest.mark.asyncio
     async def test_llm_client_generate_basic(self, mock_anthropic_create):
@@ -119,19 +131,24 @@ class TestLLMClient:
         client = initialize_llm_client(api_key="dummy_key")
         text = "This text does not contain any code blocks."
         with caplog.at_level(logging.WARNING):
-             code = await client.extract_code_from_text(text)
+            code = await client.extract_code_from_text(text)
         assert code is None
         assert "Could not extract code" in caplog.text
+
     # --- End of extract_code tests ---
 
     @pytest.mark.asyncio
-    async def test_llm_client_generate_json_request_success(self, mock_anthropic_create):
+    async def test_llm_client_generate_json_request_success(
+        self, mock_anthropic_create
+    ):
         mock_response_text = '{\n  "key": "value",\n  "number": 123\n}'
         mock_anthropic_create.return_value = MockResponse(mock_response_text)
         client = initialize_llm_client(api_key="dummy_key")
         response = await client.generate("Generate JSON", request_json=True)
 
-        expected_json = json.dumps({"key": "value", "number": 123}, ensure_ascii=False, indent=2)
+        expected_json = json.dumps(
+            {"key": "value", "number": 123}, ensure_ascii=False, indent=2
+        )
         assert response == expected_json
 
         mock_anthropic_create.assert_awaited_once()
@@ -141,7 +158,9 @@ class TestLLMClient:
 
     # TL-03: JSON要求時にパース失敗した場合
     @pytest.mark.asyncio
-    async def test_llm_client_generate_json_request_parse_fail(self, mock_anthropic_create, caplog):
+    async def test_llm_client_generate_json_request_parse_fail(
+        self, mock_anthropic_create, caplog
+    ):
         invalid_json_text = "This is not JSON, but ```json {invalid json ```"
         mock_anthropic_create.return_value = MockResponse(invalid_json_text)
         client = initialize_llm_client(api_key="dummy_key")
@@ -178,7 +197,9 @@ class TestLLMClient:
         timeout_error = asyncio.TimeoutError("API call timed out")
         mock_anthropic_create.side_effect = timeout_error
         client = initialize_llm_client(api_key="dummy_key")
-        client.timeout = 1 # タイムアウト値は generate 内の exception handling で使われる
+        client.timeout = (
+            1  # タイムアウト値は generate 内の exception handling で使われる
+        )
 
         with pytest.raises(LLMClientError) as exc_info:
             await client.generate("Test prompt for timeout")
@@ -200,4 +221,4 @@ class TestLLMClient:
 
         assert "Unexpected error when calling Anthropic API" in str(exc_info.value)
         assert exc_info.value.error_type == "UnexpectedError"
-        assert exc_info.value.original_error is unexpected_error 
+        assert exc_info.value.original_error is unexpected_error
