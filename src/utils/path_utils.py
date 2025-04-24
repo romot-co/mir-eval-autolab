@@ -1718,3 +1718,57 @@ def get_available_datasets(config: Dict[str, Any]) -> List[Dict[str, Any]]:
         result.append(dataset_entry)
 
     return result
+
+
+def find_audio_ref_pairs(
+    audio_dir: Path,
+    ref_dir: Path,
+    audio_ext: str = ".wav",
+    ref_ext: str = ".csv",
+) -> List[Tuple[Path, Path]]:
+    """指定されたディレクトリ内で、ファイル名が一致するオーディオファイルと参照ファイルのペアを探します。
+
+    Args:
+        audio_dir (Path): オーディオファイルが含まれるディレクトリ。
+        ref_dir (Path): 参照ファイルが含まれるディレクトリ。
+        audio_ext (str, optional): オーディオファイルの拡張子。デフォルトは ".wav"。
+        ref_ext (str, optional): 参照ファイルの拡張子。デフォルトは ".csv"。
+
+    Returns:
+        List[Tuple[Path, Path]]: 見つかった (オーディオファイルパス, 参照ファイルパス) のタプルのリスト。
+    """
+    logger = logging.getLogger(__name__)
+    pairs = []
+
+    # 拡張子がドットで始まるように正規化
+    if not audio_ext.startswith("."):
+        audio_ext = "." + audio_ext
+    if not ref_ext.startswith("."):
+        ref_ext = "." + ref_ext
+
+    logger.info(f"Searching for audio files (*{audio_ext}) in {audio_dir}")
+    logger.info(f"Searching for reference files (*{ref_ext}) in {ref_dir}")
+
+    # オーディオディレクトリ内のファイルを検索
+    for audio_file in audio_dir.glob(f"*{audio_ext}"):
+        if audio_file.is_file():
+            file_stem = audio_file.stem
+            # 対応する参照ファイルを構築
+            ref_file = ref_dir / f"{file_stem}{ref_ext}"
+
+            if ref_file.is_file():
+                pairs.append((audio_file.resolve(), ref_file.resolve()))
+                logger.debug(f"Found pair: {audio_file.name} <-> {ref_file.name}")
+            else:
+                logger.debug(
+                    f"Reference file not found for {audio_file.name}: {ref_file}"
+                )
+
+    if not pairs:
+        logger.warning(
+            f"No matching audio/reference pairs found for extensions "
+            f"'{audio_ext}'/'{ref_ext}' in directories: "
+            f"{audio_dir} / {ref_dir}"
+        )
+
+    return pairs

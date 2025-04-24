@@ -1070,6 +1070,7 @@ def create_summary(results: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
 def save_evaluation_result(result: Dict[str, Any], output_path: str) -> None:
     """Save evaluation result to a JSON file."""
     try:
+        print(f"DEBUG: Attempting to save individual result JSON to: {output_path}")
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(result, f, cls=NumpyEncoder, indent=2)
         logger.debug(f"Evaluation result saved to {output_path}")
@@ -1223,7 +1224,7 @@ def evaluate_detector(
         # 4. 検出結果の正規化
         try:
             normalized_detection_result: DetectionResult = normalize_detection_result(
-                detection_result_raw, sr=sr, detector_name=detector_name
+                detection_result_raw, sr=sr
             )
             if not isinstance(normalized_detection_result, DetectionResult):
                 raise TypeError(
@@ -1248,9 +1249,9 @@ def evaluate_detector(
                 detected_intervals=normalized_detection_result.intervals,
                 detected_pitches=normalized_detection_result.note_pitches,
                 reference_intervals=reference_data["intervals"],
-                reference_pitches=reference_data["pitches"],
+                reference_pitches=reference_data["note_pitches"],
                 evaluator_config=evaluator_config,
-                detector_result=normalized_detection_result.to_dict(),  # 参照データを含まない検出結果辞書を渡す
+                detector_result=normalized_detection_result.to_dict(),
                 logger=logger,
             )
         except Exception as e:
@@ -1274,6 +1275,9 @@ def evaluate_detector(
             json_filename = f"{eval_id}_{detector_name}_result.json"
             json_path = output_dir / json_filename
             try:
+                print(
+                    f"DEBUG: Attempting to save individual result JSON to: {json_path}"
+                )
                 save_evaluation_result(result_base, json_path)
                 result_base["json_file"] = str(
                     json_path.relative_to(output_dir.parent)
@@ -1294,7 +1298,7 @@ def evaluate_detector(
                 # ここでは reference_data (辞書) をそのまま渡す
                 ref_for_plot = {
                     "intervals": reference_data["intervals"],
-                    "note_pitches": reference_data["pitches"],
+                    "note_pitches": reference_data["note_pitches"],
                     # 必要に応じて他のキーも追加
                 }
 

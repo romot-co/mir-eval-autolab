@@ -1,0 +1,20 @@
+# KROMARDetectorのグリッドサーチ設定
+detector_name: KROMARDetector
+description: KROMARDetectorのパラメータ最適化
+
+parameters:
+  alpha_vr_radius:
+    description: "Alphaリプス複体構築時の半径パラメータ"
+    values: [0.05, 0.06, 0.07, 0.08, 0.09]
+
+  morlet_xi0:
+    description: "Morletウェーブレットの周波数パラメータ"
+    values: [4.5, 5.0, 5.33, 5.5, 6.0]
+
+  group_avg_t_window:
+    description: "時間グループ化ウィンドウサイズ"
+    values: [0.03, 0.04, 0.05, 0.06, 0.07]
+
+  kalman_q:
+    description: "カルマンフィルターのプロセスノイズパラメータ"
+    values: [0.005, 0.01, 0.015, 0.02]

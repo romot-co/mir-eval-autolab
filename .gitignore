@@ -6,6 +6,7 @@
 # ========================================
 /output/
 /uploads/
+/user_output/
 # /mcp_workspace/ # Or /.mcp_server_data/ if renamed later
 /.mcp_server_data/
 /mcp_workspace/
@@ -248,4 +249,4 @@ Package Control.user-ca-bundle
 *.orig
 *.rej
 
-# End of https://www.toptal.com/developers/gitignore/api/python,macos,linux,windows,visualstudiocode,pycharm+all,sublimetext 
+# End of https://www.toptal.com/developers/gitignore/api/python,macos,linux,windows,visualstudiocode,pycharm+all,sublimetext

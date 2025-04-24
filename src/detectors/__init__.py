@@ -460,6 +460,12 @@ for detector_file in detector_files:
     except Exception as e:
         logger.warning(f"検出器の初期ロードに失敗しました: {detector_file.name}: {e}")
 
+# KROMARDetectorを明示的にインポート
+try:
+    from src.detectors.kromar_detector import KROMARDetector
+except ImportError:
+    logger.warning("KROMARDetectorのインポートに失敗しました")
+
 # ノート検出器 (mir_evalのnote-based評価) と、
 # フレームベースのピッチ検出器 (mir_evalのframe-based評価) を統一的に扱うため、
 # 以下のキーを返すことを推奨します：
@@ -488,4 +494,5 @@ __all__ = [
     # 必要に応じて、明示的にエクスポートしたい「静的な」検出器クラス
     "CriteriaDetector",
     "PZSTDDetector",
+    "KROMARDetector",  # KROMARDetectorを追加
 ]

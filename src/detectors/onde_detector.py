@@ -81,8 +81,6 @@ class ONDEDetector(BaseDetector):
         cqt_fmax: Optional[float] = None,
         # 単一パラメータThetaとその他の追加パラメータ
         Theta: float = 1.0,
-        enable_stochastic_resonance: bool = False,
-        enable_gamma_distribution: bool = False,
         frame_length: int = 1024,
         f_min: float = 65.4,
         f_max: float = 8000.0,

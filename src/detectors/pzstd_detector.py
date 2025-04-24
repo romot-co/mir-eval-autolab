@@ -2004,7 +2004,15 @@ class PZSTDDetector(BaseDetector):
 
         try:
             logger.debug("Calculating HCF maps (Numba)...")
-            C_map, _, _, _, Phi_comb_map, O_vec = _calculate_hcf_maps_numba(
+            (
+                C_map,
+                AmpSum_map,  # または _
+                Phi_C_map,  # または _
+                Phi_A_map,  # または _
+                Phi_comb_map,
+                O_vec,
+                AvgHarmonicSPOD_map,  # 7番目の値を受け取る
+            ) = _calculate_hcf_maps_numba(
                 spod_map,
                 A_lin,
                 f0_candidates_hz_np,

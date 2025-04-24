@@ -111,3 +111,17 @@ indent-style = "space"
 
 [tool.ruff.lint.isort]
 known-first-party = ["mirex_auto_improver", "src"]
+
+[tool.uv]
+package = true
+editable = true
+
+# GUDHIのようなパッケージはビルド時に問題が発生する可能性があるため、
+# ビルド分離を無効化するパッケージを設定
+no-build-isolation-package = []
+
+# 依存関係のメタデータを事前に提供（オプション）
+# [[tool.uv.dependency-metadata]]
+# name = "gudhi"
+# version = "3.8.0"
+# requires-dist = []

@@ -5,6 +5,7 @@
 複数のパラメータ組み合わせを試し、最も高いスコアを出す組み合わせを特定します。
 """
 
+import csv
 import datetime
 import itertools
 import json
@@ -434,3 +435,305 @@ def run_grid_search(
         # 予期せぬエラーでも戻り値は返す
 
     return output_data  # best_resultだけでなく、全結果を含む辞書を返す
+
+
+import multiprocessing as mp
+
+from src.evaluation.evaluation_runner import evaluate_detector
+
+
+def evaluate_detector_wrapper_grid(task_args_dict):
+    """グリッド検索のための evaluate_detector のラッパー関数"""
+    try:
+        # マルチプロセス実行の場合はロガーを取り除く
+        if "logger" in task_args_dict:
+            # マルチプロセスではロガーは共有できないので削除
+            del task_args_dict["logger"]
+        return evaluate_detector(**task_args_dict)
+    except Exception as e:
+        # エラーをキャッチして構造化された結果を返す
+        error_message = f"評価中にエラーが発生しました: {str(e)}"
+        return {
+            "status": "error",
+            "error_message": error_message,
+            "metrics": {},
+            "valid": False,
+        }
+
+
+def run_grid_search_standalone(
+    detector_name: str,
+    grid_config: Dict[str, Any],
+    file_pairs: List[Tuple[Path, Path]],
+    output_dir: Path,
+    num_procs: int,
+    best_metric_key: str = "note.f_measure",
+    logger: Optional[logging.Logger] = None,
+    save_plots: bool = False,
+) -> Dict[str, Any]:
+    """スタンドアロンでグリッド検索を実行します。MCPサーバーを必要としません。
+
+    Args:
+        detector_name: 検出器の名前
+        grid_config: グリッドサーチの設定辞書
+        file_pairs: オーディオと参照ファイルのペアのリスト [(audio_path, ref_path), ...]
+        output_dir: 出力ディレクトリ
+        num_procs: 並列処理に使用するプロセス数
+        best_metric_key: 最適化する指標（例: "note.f_measure"）
+        logger: ロガーインスタンス
+        save_plots: 評価プロットを保存するかどうか
+
+    Returns:
+        グリッド検索の結果を含む辞書
+    """
+    if logger is None:
+        logger = get_logger("grid_search_standalone")
+
+    logger.info(f"検出器 '{detector_name}' のスタンドアロングリッド検索を開始します")
+    logger.info(f"出力ディレクトリ: {output_dir}")
+    logger.info(f"最適化する指標: {best_metric_key}")
+    logger.info(f"ファイルペア数: {len(file_pairs)}")
+    logger.info(f"使用プロセス数: {num_procs}")
+
+    # --- 1. パラメータの準備 ---
+    param_names = list(grid_config.get("parameters", {}).keys())
+    param_values_lists = list(grid_config.get("parameters", {}).values())
+
+    # ネストされた構造から 'values' を抽出（存在する場合）
+    actual_param_values = []
+    for p_config in param_values_lists:
+        if isinstance(p_config, dict) and "values" in p_config:
+            actual_param_values.append(p_config["values"])
+        elif isinstance(p_config, list):  # 値が直接リストとして指定されている場合
+            actual_param_values.append(p_config)
+        else:
+            logger.error(
+                f"無効なパラメータ設定が見つかりました: {p_config}。'values' を含む辞書またはリストが必要です。"
+            )
+            raise ValueError(
+                f"パラメータ {param_names[len(actual_param_values)]} の設定が無効です"
+            )
+
+    if not param_names or not actual_param_values:
+        logger.error("グリッド設定に有効なパラメータがありません。")
+        return {"error": "グリッド設定に有効なパラメータがありません。"}
+
+    param_combinations = list(itertools.product(*actual_param_values))
+    total_combinations = len(param_combinations)
+    logger.info(f"評価するパラメータの組み合わせ数: {total_combinations}")
+
+    # --- 2. 出力ファイルの準備 ---
+    results_csv_path = output_dir / "grid_results_summary.csv"
+    best_params_path = output_dir / "best_params.json"
+    all_fieldnames = set(
+        ["params_json", "avg_score", "num_files_success", "num_files_total"]
+    )
+
+    # 動的にメトリック用のフィールド名を決定
+    example_metric_keys = set()
+    try:
+        cat, met = best_metric_key.split(".")
+        example_metric_keys.add(f"avg_{cat}_{met}")
+        example_metric_keys.add(f"std_{cat}_{met}")
+    except:
+        pass  # デフォルトのフィールド名を使用
+
+    all_fieldnames.update(example_metric_keys)
+    # パラメータ名をヘッダーに追加
+    for pname in param_names:
+        all_fieldnames.add(f"param_{pname}")
+
+    # セットを整列されたリストに変換し、CSVヘッダーの順序を一貫させる
+    fieldnames = sorted(list(all_fieldnames))
+
+    # --- 3. トラッキングの初期化 ---
+    best_score = -float("inf")
+    best_params_dict = None
+    grid_point_results = []  # 各グリッドポイントの要約結果を保存
+
+    # --- 4. グリッド検索の実行 ---
+    with open(results_csv_path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for i, current_param_values in enumerate(
+            tqdm(param_combinations, desc="グリッド検索の進行状況")
+        ):
+            current_params = dict(zip(param_names, current_param_values))
+            point_id = f"point_{i+1}"
+            logger.info(
+                f"--- 評価中 {point_id}/{total_combinations}: {current_params} ---"
+            )
+
+            point_output_dir = output_dir / point_id
+            point_output_dir.mkdir(exist_ok=True)
+
+            # --- 4a. このグリッドポイントのタスクを準備 ---
+            tasks_for_point = []
+            for audio_path, ref_path in file_pairs:
+                eval_id = audio_path.stem  # ファイル評価のユニークID
+                task_args = {
+                    "detector_name": detector_name,
+                    "detector_params": current_params,
+                    "audio_file": str(audio_path),
+                    "ref_file": str(ref_path),
+                    "output_dir": point_output_dir,  # このポイントのファイル結果用のサブディレクトリ
+                    "eval_id": eval_id,
+                    "evaluator_config": {},  # 必要に応じて評価設定を追加
+                    "save_results_json": True,  # 個別ファイルのJSONを保存
+                    "save_plots": save_plots,  # ファイルごとのプロット制御
+                    "plot_format": "png",  # 例: プロット形式
+                    "plot_config": None,  # 例: プロット設定
+                }
+                tasks_for_point.append(task_args)
+
+            # --- 4b. このグリッドポイントの評価を実行 ---
+            point_file_results = []
+            start_point_time = time.time()
+            try:
+                if num_procs > 1 and len(tasks_for_point) > 1:
+                    with mp.Pool(processes=num_procs) as pool:
+                        with tqdm(
+                            total=len(tasks_for_point),
+                            desc=f"ポイント {i+1}",
+                            leave=False,
+                        ) as pbar_point:
+                            for res in pool.imap_unordered(
+                                evaluate_detector_wrapper_grid, tasks_for_point
+                            ):
+                                point_file_results.append(res)
+                                pbar_point.update(1)
+                else:
+                    for task_args in tqdm(
+                        tasks_for_point, desc=f"ポイント {i+1}", leave=False
+                    ):
+                        point_file_results.append(
+                            evaluate_detector_wrapper_grid(task_args)
+                        )
+            except Exception as pool_err:
+                logger.error(
+                    f"ポイント {i+1} の評価プール実行中にエラーが発生しました: {pool_err}",
+                    exc_info=True,
+                )
+                # このポイントを失敗としてマーク
+                point_file_results = [
+                    {
+                        "status": "error",
+                        "error_message": f"プール実行に失敗: {pool_err}",
+                        "metrics": {},
+                    }
+                ] * len(tasks_for_point)
+
+            point_duration = time.time() - start_point_time
+            logger.info(f"ポイント {i+1} の評価に {point_duration:.2f}秒かかりました。")
+
+            # --- 4c. このグリッドポイントの結果を集計 ---
+            scores_for_point = []
+            num_success = 0
+            for res in point_file_results:
+                if res.get("status") != "error" and "metrics" in res:
+                    try:
+                        # best_metric_key ('category.metric') に基づいてメトリクス辞書をナビゲート
+                        category, metric_name = best_metric_key.split(".")
+                        score = res["metrics"].get(category, {}).get(metric_name)
+                        if score is not None and np.isfinite(score):
+                            scores_for_point.append(float(score))
+                            num_success += 1
+                        else:
+                            logger.debug(
+                                f"ポイント {i+1}、ファイル: {res.get('audio_file')} の結果にメトリクス '{best_metric_key}' が見つからないか無効です"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"結果のメトリクス '{best_metric_key}' へのアクセス中にエラーが発生しました: {e}"
+                        )
+                else:
+                    logger.warning(
+                        f"ポイント {i+1} のファイル評価に失敗しました: {res.get('error_message', '不明なエラー')}"
+                    )
+
+            avg_score = np.mean(scores_for_point) if scores_for_point else 0.0
+            std_score = np.std(scores_for_point) if scores_for_point else 0.0
+            logger.info(
+                f"ポイント {i+1} - 平均スコア ({best_metric_key}): {avg_score:.4f} ± {std_score:.4f} ({num_success}/{len(tasks_for_point)} ファイル成功)"
+            )
+
+            # --- 4d. このグリッドポイントの要約行を書き込み ---
+            row_data = {
+                "params_json": json.dumps(current_params),
+                "avg_score": avg_score,
+                "num_files_success": num_success,
+                "num_files_total": len(tasks_for_point),
+                # 必要に応じて特定のメトリクスの平均/標準偏差を追加
+                f"avg_{best_metric_key.replace('.', '_')}": avg_score,
+                f"std_{best_metric_key.replace('.', '_')}": std_score,
+            }
+            # パラメータを行に追加
+            for pname, pval in current_params.items():
+                row_data[f"param_{pname}"] = pval
+
+            # 有効なフィールド名のみを書き込む
+            filtered_row_data = {k: v for k, v in row_data.items() if k in fieldnames}
+            writer.writerow(filtered_row_data)
+            csvfile.flush()  # 結果を増分的に確認できるようにバッファをフラッシュ
+
+            # --- 4e. 最良の結果を更新 ---
+            if avg_score > best_score:
+                best_score = avg_score
+                best_params_dict = current_params
+                logger.info(
+                    f"*** 新しい最高スコアが見つかりました: {best_score:.4f}, パラメータ: {best_params_dict} ***"
+                )
+                # 最良のパラメータをすぐに保存
+                try:
+                    with open(best_params_path, "w", encoding="utf-8") as f_best:
+                        json.dump(
+                            {
+                                "best_params": best_params_dict,
+                                "best_score": best_score,
+                                "metric": best_metric_key,
+                            },
+                            f_best,
+                            cls=NumpyEncoder,
+                            indent=2,
+                        )
+                except Exception as e_save:
+                    logger.error(
+                        f"{best_params_path} への最良パラメータの保存に失敗しました: {e_save}"
+                    )
+
+            # 最終的な戻り値のための要約を保存
+            grid_point_results.append(
+                {
+                    "params": current_params,
+                    "avg_score": avg_score,
+                    "std_score": std_score,
+                    "num_success": num_success,
+                    "num_total": len(tasks_for_point),
+                }
+            )
+
+    # --- 5. 完了と戻り値 ---
+    logger.info("グリッド検索が完了しました。")
+    if best_params_dict:
+        logger.info(f"全体の最高スコア ({best_metric_key}): {best_score:.4f}")
+        logger.info(f"最良のパラメータ: {best_params_dict}")
+        logger.info(f"要約CSVが保存されました: {results_csv_path}")
+        logger.info(f"最良のパラメータJSONが保存されました: {best_params_path}")
+    else:
+        logger.warning("グリッド検索中に有効な結果が見つかりませんでした。")
+
+    return {
+        "best_result": (
+            {
+                "params": best_params_dict,
+                "best_score": best_score,
+                "metric": best_metric_key,
+            }
+            if best_params_dict
+            else None
+        ),
+        "all_point_summaries": grid_point_results,
+        "results_csv_path": str(results_csv_path),
+        "best_params_path": str(best_params_path) if best_params_dict else None,
+    }

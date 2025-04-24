@@ -13,7 +13,7 @@ import numpy as np
 import scipy.fftpack as fftpack
 import scipy.signal as signal
 
-from .base_detector import BaseDetector
+from src.detectors.base_detector import BaseDetector
 
 
 class ECHOEDetector(BaseDetector):

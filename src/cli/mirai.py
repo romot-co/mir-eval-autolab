@@ -3,7 +3,9 @@
 """MIR Auto Improver (mirai) Command Line Interface."""
 
 import asyncio
+import csv
 import difflib
+import itertools
 import json
 import logging
 import os
@@ -11,8 +13,11 @@ import re
 import sys
 import time
 import traceback
+from datetime import datetime
+from enum import Enum
+from importlib.metadata import version
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import typer
 import yaml
@@ -20,7 +25,34 @@ import yaml
 # --- MCP Client Imports ---
 from mcp import McpError
 from mcp.client.session import ClientSession
+from tqdm import tqdm  # Add tqdm import
 from typing_extensions import Annotated
+
+
+# --- Helper Function for Multiprocessing ---
+def evaluate_detector_wrapper(task_args_dict):
+    """キーワード引数の辞書を受け取り、evaluate_detector を呼び出すラッパー"""
+    # evaluate_detector をインポート
+    # 注意: このインポートが循環参照にならないか確認が必要
+    try:
+        from src.evaluation.evaluation_runner import evaluate_detector
+
+        return evaluate_detector(**task_args_dict)
+    except ImportError as e:
+        # インポートエラー時の処理 (ログ出力など)
+        logger = logging.getLogger(__name__)  # ラッパー内でもロガー取得
+        logger.error(f"Worker: Failed to import evaluate_detector: {e}", exc_info=True)
+        # エラーを示す値を返すか、例外を再発生させる
+        return {"error": "ImportError in worker", "details": str(e)}
+    except Exception as e:
+        # 実行時エラーの処理
+        logger = logging.getLogger(__name__)  # ラッパー内でもロガー取得
+        logger.error(f"Worker: Error executing evaluate_detector: {e}", exc_info=True)
+        return {
+            "error": "RuntimeError in worker",
+            "details": str(e),
+            "task_args": task_args_dict,
+        }
 
 
 # ToolErrorはMCPパッケージに存在しないので自前で定義
@@ -216,9 +248,7 @@ def poll_job_status(
             raise  # 予期せぬエラーは再発生させる
 
 
-app = typer.Typer(
-    help="MIR Auto Improver (mirai) CLI - Evaluate and improve MIR algorithms."
-)
+app = typer.Typer(help="MIR Evaluation and Improvement Tool.")
 
 # --- Shared Options ---
 ServerURL = Annotated[
@@ -240,11 +270,13 @@ LogLevel = Annotated[
     typer.Option("--log-level", help="Set the logging level.", case_sensitive=False),
 ]
 
-# --- Evaluate Command ---
-eval_app = typer.Typer(
-    help="Evaluate MIR detectors either standalone or via MCP server."
-)
+# --- Main Commands ---
+eval_app = typer.Typer(help="Evaluate detector performance.")
 app.add_typer(eval_app, name="evaluate")
+
+# --- Grid Search Command ---
+grid_app = typer.Typer(help="Run grid search to optimize detector parameters.")
+app.add_typer(grid_app, name="grid")
 
 
 @eval_app.callback()
@@ -279,60 +311,250 @@ def evaluate(
     detector_name: Annotated[
         str, typer.Option("--detector", help="Name of the detector to evaluate.")
     ],
-    # Standalone options (only used if --server is NOT provided)
+    # --- Mode Selection --- #
+    # Standalone Single File Options
     audio_path: Annotated[
         Optional[Path],
-        typer.Option("--audio", help="Path to the audio file (for standalone mode)."),
+        typer.Option(
+            "--audio",
+            help="Path to a single audio file (for standalone single file mode).",
+        ),
     ] = None,
     ref_path: Annotated[
         Optional[Path],
         typer.Option(
-            "--ref", help="Path to the reference annotation file (for standalone mode)."
+            "--ref",
+            help="Path to the corresponding reference annotation file (for standalone single file mode).",
         ),
     ] = None,
+    # Standalone Directory Options
+    audio_dir: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--audio-dir",
+            help="Path to the directory containing audio files (for standalone directory mode).",
+        ),
+    ] = None,
+    ref_dir: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--ref-dir",
+            help="Path to the directory containing reference files (for standalone directory mode).",
+        ),
+    ] = None,
+    ref_ext: Annotated[  # Added reference extension option
+        str,
+        typer.Option(
+            "--ref-ext",
+            help="Extension of reference files (e.g., .csv, .lab) (for standalone directory mode).",
+        ),
+    ] = ".csv",  # Default to .csv
+    # Server options
+    server_url: ServerURL = None,
+    dataset_name: Annotated[
+        Optional[str],
+        typer.Option(
+            "--dataset",
+            help="Name of the dataset defined in config.yaml (for server mode or standalone dataset mode).",
+        ),
+    ] = None,
+    # --- Common Options --- #
     params_json: Annotated[
         Optional[str],
         typer.Option(
             "--params",
-            help="JSON string of parameters for the detector (for standalone mode).",
+            help="JSON string of parameters for the detector (for standalone modes).",
         ),
     ] = None,
     save_plot: Annotated[
         bool,
         typer.Option(
-            "--save-plot", help="Save evaluation plots (for standalone mode)."
+            "--save-plot", help="Save evaluation plots (for standalone modes)."
         ),
     ] = False,
-    # Server options (required if --server is provided)
-    server_url: ServerURL = None,
-    dataset_name: Annotated[
-        Optional[str],
-        typer.Option(
-            "--dataset", help="Name of the dataset (required for server mode)."
-        ),
-    ] = None,
-    version: Annotated[
+    version: Annotated[  # Keep version for server mode
         Optional[str],
         typer.Option(
             "--version", help="Specific version of the detector (for server mode)."
         ),
     ] = None,
-    # Shared
     output_dir: OutputDir = None,
+    num_procs: Annotated[  # Added num_procs for directory mode
+        Optional[int],
+        typer.Option(
+            "--num-procs",
+            "-p",
+            help="Number of processes for parallel evaluation (for standalone directory mode).",
+        ),
+    ] = None,  # Default to None (use evaluation_runner default)
 ):
-    """Evaluates a detector either standalone or via the MCP server."""
+    """Evaluates a detector either standalone (single file or directory) or via the MCP server."""
+    print("DEBUG: evaluate function started")  # 追加
     load_global_config()  # Load config at the start of the command
     logger = logging.getLogger(__name__)
 
+    # --- Determine execution mode ---
+    mode = None
     if server_url:
-        # --- Server Mode ---
+        mode = "server"
         logger.info(
             f"Running evaluation in SERVER mode for detector '{detector_name}'."
         )
         if not dataset_name:
             logger.error("Error: --dataset is required for server mode.")
             raise typer.Exit(code=1)
+        # Ensure standalone options are not used with server mode
+        if audio_path or ref_path or audio_dir or ref_dir:
+            logger.warning(
+                "Standalone options (--audio, --ref, --audio-dir, --ref-dir) are ignored in server mode."
+            )
 
+    elif audio_dir and ref_dir:
+        mode = "standalone_dir"
+        logger.info(
+            f"Running evaluation in STANDALONE DIRECTORY mode for detector '{detector_name}'."
+        )
+        if audio_path or ref_path:
+            logger.warning(
+                "Single file options (--audio, --ref) are ignored when --audio-dir and --ref-dir are specified."
+            )
+        if dataset_name:
+            logger.warning(
+                "--dataset is ignored when --audio-dir and --ref-dir are specified for standalone mode."
+            )
+        if not audio_dir.is_dir():
+            logger.error(
+                f"Audio directory not found or is not a directory: {audio_dir}"
+            )
+            raise typer.Exit(code=1)
+        if not ref_dir.is_dir():
+            logger.error(
+                f"Reference directory not found or is not a directory: {ref_dir}"
+            )
+            raise typer.Exit(code=1)
+        # Ensure ref_ext starts with a dot if it doesn't already
+        if not ref_ext.startswith("."):
+            ref_ext = "." + ref_ext
+            logger.info(f"Prepended dot to ref_ext. Now using: {ref_ext}")
+
+    elif audio_path and ref_path:
+        mode = "standalone_file"
+        logger.info(
+            f"Running evaluation in STANDALONE SINGLE FILE mode for detector '{detector_name}'."
+        )
+        if dataset_name:
+            logger.warning(
+                "--dataset is ignored when --audio and --ref are specified for standalone mode."
+            )
+        if not audio_path.is_file():
+            logger.error(f"Audio file not found: {audio_path}")
+            raise typer.Exit(code=1)
+        if not ref_path.is_file():
+            logger.error(f"Reference file not found: {ref_path}")
+            raise typer.Exit(code=1)
+
+    # Removed standalone dataset mode for now to simplify
+    # elif dataset_name:
+    #     mode = "standalone_dataset"
+    #     logger.info(f"Running evaluation in STANDALONE DATASET mode for detector '{detector_name}' using dataset '{dataset_name}'.")
+
+    else:
+        logger.error(
+            "Error: Insufficient arguments. Please specify either:\n"
+            "  - --server and --dataset (for server mode)\n"
+            "  - --audio-dir and --ref-dir (for standalone directory mode)\n"
+            "  - --audio and --ref (for standalone single file mode)"
+            # "  - --dataset (for standalone dataset mode)" # Removed for simplification
+        )
+        raise typer.Exit(code=1)
+
+    # --- Parameter Parsing (Common for Standalone Modes) ---
+    detector_params = {}
+    if params_json:
+        try:
+            detector_params = json.loads(params_json)
+            logger.info(f"Using detector parameters: {detector_params}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Error: Invalid JSON string provided for --params: {e}")
+            raise typer.Exit(code=1)
+
+    # --- Output Directory Setup (Common for Standalone Modes) ---
+    final_output_dir = output_dir
+    if mode.startswith("standalone") and not final_output_dir:
+        # Default output dir if not specified
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if mode == "standalone_file":
+            eval_name = f"{audio_path.stem}_{detector_name}"
+        elif mode == "standalone_dir":
+            eval_name = f"{audio_dir.name}_{detector_name}"
+        # elif mode == "standalone_dataset":
+        #     eval_name = f"{dataset_name}_{detector_name}"
+        else:
+            eval_name = f"eval_{detector_name}"
+        final_output_dir = Path(
+            f"./user_output/{eval_name}_{timestamp}"
+        )  # Changed evaluation_results to user_output
+        logger.info(
+            f"Output directory not specified, using default: {final_output_dir}"
+        )
+
+    print(
+        f"DEBUG: Before directory check, final_output_dir is: {final_output_dir}"
+    )  # 追加
+    if final_output_dir:
+        try:
+            if not final_output_dir.exists():
+                logger.debug(
+                    f"Attempting to create output directory: {final_output_dir}"
+                )
+                final_output_dir.mkdir(parents=True, exist_ok=True)
+                if final_output_dir.exists():
+                    logger.info(
+                        f"Successfully created output directory: {final_output_dir}"
+                    )
+                else:
+                    # mkdir が例外を出さずに失敗するレアケース？
+                    logger.critical(
+                        f"Output directory creation failed silently: {final_output_dir}"
+                    )
+                    final_output_dir = None  # 保存しないように None に設定
+            elif not final_output_dir.is_dir():
+                # 存在するがディレクトリではない場合
+                logger.error(
+                    f"Output path exists but is not a directory: {final_output_dir}"
+                )
+                final_output_dir = None  # 保存しないように None に設定
+            else:
+                logger.debug(f"Output directory already exists: {final_output_dir}")
+            print(
+                f"DEBUG: After directory check, final_output_dir is: {final_output_dir}"
+            )  # 追加
+
+            # ディレクトリが存在し、かつディレクトリである場合のみ書き込みチェック (重要)
+            if final_output_dir and not os.access(str(final_output_dir), os.W_OK):
+                logger.error(f"Output directory is not writable: {final_output_dir}")
+                final_output_dir = None  # 保存しないように None に設定
+
+        except OSError as e:
+            logger.critical(
+                f"Failed to create or access output directory {final_output_dir}: {e}",
+                exc_info=True,
+            )
+            final_output_dir = None  # Set to None to prevent saving attempts
+        except Exception as e:
+            logger.critical(
+                f"Unexpected error during output directory setup {final_output_dir}: {e}",
+                exc_info=True,
+            )
+            final_output_dir = None
+
+    # --- Execute based on mode ---
+    if mode == "server":
+        # --- Server Mode Execution ---
+        logger.info(
+            f"Running evaluation in SERVER mode for detector '{detector_name}'."
+        )
+        # (Existing server mode logic remains here)
         client = get_mcp_client(server_url)
 
         # ツール入力の準備
@@ -417,83 +639,51 @@ def evaluate(
                 typer.echo(f"An unexpected error occurred: {e}", err=True)
             raise typer.Exit(code=1)
 
-    else:
-        # --- Standalone Mode ---
-        logger.info(
-            f"Running evaluation in STANDALONE mode for detector '{detector_name}'."
-        )
-        # ★ 引数チェック: standaloneでは audio と ref が必須
-        if not audio_path or not ref_path:
-            logger.error(
-                "Error: --audio and --ref are required for standalone mode (when --server is not provided)."
-            )
-            raise typer.Exit(code=1)
-
+    elif mode == "standalone_file":
+        # --- Standalone Single File Execution ---
         logger.info(f"Running standalone evaluation for detector '{detector_name}'.")
         logger.info(f"Audio: '{audio_path}', Reference: '{ref_path}'")
 
-        # ファイル存在チェック
-        if not audio_path.is_file():
-            logger.error(f"Audio file not found: {audio_path}")
-            raise typer.Exit(code=1)
-        if not ref_path.is_file():
-            logger.error(f"Reference file not found: {ref_path}")
-            raise typer.Exit(code=1)
-
-        # パラメータのパース
-        detector_params = {}
-        if params_json:
-            try:
-                detector_params = json.loads(params_json)
-                logger.info(f"Using detector parameters: {detector_params}")
-            except json.JSONDecodeError as e:
-                logger.error(f"Error: Invalid JSON string provided for --params: {e}")
-                raise typer.Exit(code=1)
-
-        # 出力ディレクトリの準備
-        eval_id = f"{audio_path.stem}_{detector_name}"
-        output_path = None
-        if output_dir:
-            try:
-                output_dir.mkdir(parents=True, exist_ok=True)
-                output_path = output_dir
-                logger.info(f"Output directory: {output_dir}")
-            except OSError as e:
-                logger.error(f"Failed to create output directory {output_dir}: {e}")
-                output_path = None
-
-        # config.yaml から評価設定などを取得 (evaluate_detector内部で参照される想定)
+        # config.yaml から評価設定などを取得
         evaluator_config = CONFIG.get("evaluation", {}).get("mir_eval_options", {})
         plot_config = CONFIG.get("visualization", {}).get("plot_options", {})
         plot_format = CONFIG.get("visualization", {}).get("default_plot_format", "png")
 
         try:
-            logger.info("Starting evaluation...")
+            logger.info("Starting single file evaluation...")
+            # Call evaluate_detector directly
             result = evaluate_detector(
                 detector_name=detector_name,
                 detector_params=detector_params,
                 audio_file=str(audio_path),
                 ref_file=str(ref_path),
-                output_dir=output_path,
-                eval_id=eval_id,
+                output_dir=final_output_dir,  # Pass the determined output dir
+                eval_id=audio_path.stem,  # Use audio file stem as eval_id
                 evaluator_config=evaluator_config,
                 save_plots=save_plot,
                 plot_format=plot_format,
                 plot_config=plot_config,
-                save_results_json=bool(output_path),
+                save_results_json=bool(
+                    final_output_dir
+                ),  # Save JSON if output dir exists
+                logger=logger,
             )
             logger.info("Evaluation finished.")
 
             # 結果の表示
             print_metrics(result)
 
-            if output_path and "results_json_path" in result:
-                logger.info(f"Results saved to: {result['results_json_path']}")
-            if save_plot and output_path and "plot_path" in result:
-                logger.info(f"Plot saved to: {result['plot_path']}")
-            elif save_plot and output_path and "error" not in result:
+            if final_output_dir and result.get("json_file"):
+                logger.info(
+                    f"Results saved to: {final_output_dir / result['json_file']}"
+                )
+            if save_plot and final_output_dir and result.get("plot_file"):
+                logger.info(f"Plot saved to: {final_output_dir / result['plot_file']}")
+            elif (
+                save_plot and final_output_dir and result.get("status") != "error"
+            ):  # Check status
                 logger.warning(
-                    "Plot saving was requested but plot path not found in results."
+                    "Plot saving was requested but plot path not found in results or evaluation failed."
                 )
 
         except Exception as e:
@@ -505,45 +695,338 @@ def evaluate(
             print(f"Traceback:\n{tb_str}", file=sys.stderr)
             raise typer.Exit(code=1)
 
+    elif mode == "standalone_dir":
+        # --- Standalone Directory Execution ---
+        logger.info(f"Audio Dir: {audio_dir}, Ref Dir: {ref_dir}, Ref Ext: {ref_ext}")
+
+        # 1. Find file pairs
+        try:
+            from src.utils.path_utils import find_audio_ref_pairs
+
+            file_pairs = find_audio_ref_pairs(
+                audio_dir, ref_dir, audio_ext=".wav", ref_ext=ref_ext
+            )
+            print(f"DEBUG: Found {len(file_pairs)} file pairs.")  # 追加
+            if not file_pairs:
+                logger.error(
+                    f"No matching audio/reference file pairs found in {audio_dir} and {ref_dir} with ref_ext '{ref_ext}'."
+                )
+                raise typer.Exit(code=1)
+            logger.info(f"Found {len(file_pairs)} file pairs for evaluation.")
+        except ImportError:
+            logger.error(
+                "Could not import find_audio_ref_pairs from src.utils.path_utils. Make sure the function exists."
+            )
+            raise typer.Exit(code=1)
+        except Exception as e:
+            logger.error(f"Error finding file pairs: {e}", exc_info=True)
+            raise typer.Exit(code=1)
+
+        # 2. Prepare for evaluation (similar to run_evaluation in evaluation_runner)
+        # config.yaml から評価設定などを取得
+        evaluator_config = CONFIG.get("evaluation", {}).get("mir_eval_options", {})
+        plot_config = CONFIG.get("visualization", {}).get("plot_options", {})
+        plot_format = CONFIG.get("visualization", {}).get("default_plot_format", "png")
+
+        tasks = []
+        for audio_p, ref_p in file_pairs:
+            eval_id = audio_p.stem
+            # Create a sub-directory for each file's results if an output dir is set
+            file_output_dir = final_output_dir / eval_id if final_output_dir else None
+            # Ensure the subdirectory exists before adding the task
+            if file_output_dir:
+                try:
+                    file_output_dir.mkdir(parents=True, exist_ok=True)
+                    logger.debug(f"Ensured subdirectory exists: {file_output_dir}")
+                except OSError as e:
+                    logger.error(
+                        f"Failed to create subdirectory {file_output_dir}: {e}. Skipping saving for this file."
+                    )
+                    file_output_dir = None  # Prevent saving if subdir creation fails
+
+            task_args = {
+                "detector_name": detector_name,
+                "detector_params": detector_params,
+                "audio_file": str(audio_p),
+                "ref_file": str(ref_p),
+                "output_dir": file_output_dir,  # Pass subdirectory path (might be None)
+                "eval_id": eval_id,
+                "evaluator_config": evaluator_config,
+                "save_plots": save_plot,
+                "plot_format": plot_format,
+                "plot_config": plot_config,
+                "save_results_json": bool(
+                    file_output_dir
+                ),  # Save only if subdir exists
+                "logger": logger,  # Pass logger
+            }
+            tasks.append(task_args)
+
+        # 3. Run evaluation (potentially in parallel)
+        results: List[Dict[str, Any]] = []
+        effective_num_procs = (
+            num_procs
+            if num_procs is not None
+            else CONFIG.get("evaluation", {}).get("default_num_procs", 1)
+        )  # Get default num_procs
+        if effective_num_procs is None:  # Handle case where config doesn't have default
+            effective_num_procs = 1
+        elif effective_num_procs <= 0:
+            effective_num_procs = multiprocessing.cpu_count()  # Use all cores if <= 0
+            logger.info(f"Using all available CPU cores: {effective_num_procs}")
+
+        start_eval_time = time.time()
+        try:
+            if effective_num_procs > 1 and len(tasks) > 1:
+                logger.info(
+                    f"Running directory evaluation in parallel with {effective_num_procs} processes..."
+                )
+                # Import Pool inside the block where it's used
+                import multiprocessing
+
+                with multiprocessing.Pool(processes=effective_num_procs) as pool:
+                    # Use evaluate_detector directly as the worker function
+                    with tqdm(total=len(tasks), desc="Evaluating Directory") as pbar:
+                        # imap_unordered is generally good for progress updates
+                        for result in pool.imap_unordered(
+                            evaluate_detector_wrapper, tasks  # Use the wrapper function
+                        ):
+                            results.append(result)
+                            pbar.update(1)
+            else:
+                logger.info("Running directory evaluation sequentially...")
+                for task_args in tqdm(tasks, desc="Evaluating Directory"):
+                    results.append(evaluate_detector(**task_args))
+
+        except KeyboardInterrupt:
+            logger.warning("Evaluation process interrupted by user.")
+            raise typer.Exit(code=130)  # Exit code for Ctrl+C
+        except Exception as e:
+            logger.error(
+                f"An error occurred during parallel evaluation: {e}", exc_info=True
+            )
+            raise typer.Exit(code=1)  # Exit with error
+
+        eval_duration = time.time() - start_eval_time
+        logger.info(f"Finished evaluating {len(tasks)} files in {eval_duration:.2f}s.")
+
+        # 4. Aggregate and display results
+        if not results:
+            logger.warning("No evaluation results were generated.")
+            # No summary can be created
+        else:
+            try:
+                from src.evaluation.evaluation_io import (
+                    save_evaluation_result,  # For saving summary json
+                )
+                from src.evaluation.evaluation_io import (
+                    create_summary_dataframe,
+                    print_summary_statistics,
+                )
+                from src.evaluation.evaluation_runner import (
+                    _calculate_evaluation_summary,
+                )
+
+                # Calculate summary stats using the helper from evaluation_runner
+                summary_stats = _calculate_evaluation_summary(
+                    results, logger=logger
+                )  # Pass logger
+                summary_stats["evaluation_config"] = evaluator_config  # Add config used
+                summary_stats["detector_name"] = detector_name  # Add detector name
+                summary_stats["num_files_evaluated"] = len(
+                    [r for r in results if r.get("status") != "error"]
+                )  # Count non-error results
+                summary_stats["num_files_processed"] = len(
+                    tasks
+                )  # Total tasks attempted
+                summary_stats["timestamp"] = datetime.now().isoformat()
+                summary_stats["total_duration_seconds"] = eval_duration
+
+                # Save summary JSON if output dir exists
+                if final_output_dir:
+                    summary_json_path = final_output_dir / "summary_evaluation.json"
+                    try:
+                        print(
+                            f"DEBUG: Attempting to save summary JSON to: {summary_json_path}"
+                        )  # Add print statement
+                        save_evaluation_result(summary_stats, str(summary_json_path))
+                        logger.info(
+                            f"Overall evaluation summary saved to {summary_json_path}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to save summary JSON to {summary_json_path}: {e}"
+                        )
+
+                # Create and save summary CSV if output dir exists and pandas is available
+                if final_output_dir:
+                    try:
+                        summary_df = create_summary_dataframe(
+                            results
+                        )  # Use io function
+                        if not summary_df.empty:
+                            summary_csv_path = (
+                                final_output_dir / "summary_evaluation.csv"
+                            )
+                            summary_df.to_csv(summary_csv_path, index=False)
+                            logger.info(
+                                f"Detailed summary table saved to {summary_csv_path}"
+                            )
+                            # Print summary to console
+                            print("\n--- Evaluation Summary ---")
+                            print_summary_statistics(
+                                summary_df, logger_arg=logger
+                            )  # Pass logger
+                            print("------------------------")
+                        else:
+                            logger.warning(
+                                "Summary DataFrame is empty, skipping CSV save and print."
+                            )
+                    except ImportError:
+                        logger.warning(
+                            "Pandas not installed. Cannot save or print summary table."
+                        )
+                    except Exception as df_err:
+                        logger.error(
+                            f"Failed to create or save summary dataframe: {df_err}",
+                            exc_info=True,
+                        )
+                else:
+                    # If no output dir, still try to print summary if possible
+                    try:
+                        summary_df = create_summary_dataframe(results)
+                        if not summary_df.empty:
+                            print("\n--- Evaluation Summary (not saved) ---")
+                            print_summary_statistics(summary_df, logger_arg=logger)
+                            print("------------------------------------")
+                        else:
+                            logger.warning(
+                                "Summary DataFrame is empty, cannot print statistics."
+                            )
+                    except ImportError:
+                        logger.warning(
+                            "Pandas not installed. Cannot print summary statistics."
+                        )
+                    except Exception as df_err:
+                        logger.error(
+                            f"Failed to create summary dataframe for printing: {df_err}",
+                            exc_info=True,
+                        )
+
+            except ImportError as imp_err:
+                logger.error(
+                    f"Failed to import necessary modules for summary calculation: {imp_err}"
+                )
+                logger.error(
+                    "Please ensure evaluation_runner and evaluation_io modules are available."
+                )
+            except Exception as agg_err:
+                logger.error(
+                    f"Error aggregating or displaying results: {agg_err}", exc_info=True
+                )
+                # Continue without summary if aggregation fails
+
+    # elif mode == "standalone_dataset":
+    #     # --- Standalone Dataset Execution ---
+    #     # This would be similar to standalone_dir but loading file pairs
+    #     # using get_dataset_paths from evaluation_runner.
+    #     # For simplicity, this is removed for now.
+    #     logger.error("Standalone dataset mode is not yet fully implemented in this CLI function.")
+    #     raise typer.Exit(code=1)
+
+    else:
+        # This case should not be reached due to initial mode check
+        logger.error("Invalid execution mode determined.")
+        raise typer.Exit(code=1)
+
 
 # --- Grid Search Command ---
-grid_app = typer.Typer(help="Run grid search for detector parameters via MCP server.")
-app.add_typer(grid_app, name="grid-search")
-
-
-@grid_app.callback()
-def grid_main(ctx: typer.Context, log_level: Optional[str] = "INFO"):
-    log_level_int = getattr(logging, log_level.upper(), logging.INFO)
-    logging.basicConfig(
-        level=log_level_int,
-        format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
-    )
-    logging.info(f"Root logger level set to {log_level.upper()} via basicConfig.")
-    # load_global_config() # Moved to command functions
-
-
 @grid_app.command("run", help="Run grid search.")
 def grid_search(
-    server_url: Annotated[
-        str,
-        typer.Option(
-            "--server", "-s", help="URL of the MCP server (required for grid search)."
-        ),
+    # --- Arguments --- #
+    detector_name: Annotated[
+        str, typer.Option("--detector", help="Name of the detector to evaluate.")
     ],
+    # Grid search specific options
     config_path: Annotated[
         Path,
         typer.Option(
             "--config", "-c", help="Path to the grid search configuration YAML file."
         ),
     ],
+    # --- Mode Selection --- #
+    # Standalone Single File Options
+    audio_path: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--audio",
+            help="Path to a single audio file (for standalone single file mode).",
+        ),
+    ] = None,
+    ref_path: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--ref",
+            help="Path to the corresponding reference annotation file (for standalone single file mode).",
+        ),
+    ] = None,
+    # Standalone Directory Options
+    audio_dir: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--audio-dir",
+            help="Path to the directory containing audio files (for standalone directory mode).",
+        ),
+    ] = None,
+    ref_dir: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--ref-dir",
+            help="Path to the directory containing reference files (for standalone directory mode).",
+        ),
+    ] = None,
+    ref_ext: Annotated[
+        str,
+        typer.Option(
+            "--ref-ext",
+            help="Extension of reference files (e.g., .csv, .lab) (for standalone directory mode).",
+        ),
+    ] = ".csv",
+    # Server options (optional)
+    server_url: Annotated[
+        Optional[str],
+        typer.Option(
+            "--server", "-s", help="URL of the MCP server (optional, for server mode)."
+        ),
+    ] = None,
+    dataset_name: Annotated[
+        Optional[str],
+        typer.Option(
+            "--dataset",
+            help="Name of the dataset defined in config.yaml (for server mode).",
+        ),
+    ] = None,
+    # Common options
+    save_plot: Annotated[
+        bool,
+        typer.Option(
+            "--save-plot",
+            help="Save evaluation plots for each grid point (for standalone modes).",
+        ),
+    ] = False,
     output_dir: OutputDir = None,
+    num_procs: Annotated[
+        Optional[int],
+        typer.Option(
+            "--num-procs",
+            "-p",
+            help="Number of processes for parallel execution (for standalone mode).",
+        ),
+    ] = None,
 ):
-    """Runs grid search using the MCP server."""
+    """Run grid search either via server or locally."""
     load_global_config()  # Load config at the start of the command
     logger = logging.getLogger(__name__)
-    logger.info(
-        f"Running grid search via server {server_url} using config '{config_path}'."
-    )
 
     # 設定ファイル存在チェックと読み込み
     if not config_path.is_file():
@@ -555,9 +1038,6 @@ def grid_search(
             if not grid_config:
                 logger.error(f"Grid search config file is empty: {config_path}")
                 raise typer.Exit(code=1)
-            # YAMLの内容をツール入力用に文字列にするか、辞書のまま送るか (サーバーAPIによる)
-            # ここでは辞書のまま送る想定
-            # grid_config_str = yaml.dump(grid_config) # 文字列にする場合
     except yaml.YAMLError as e:
         logger.error(f"Error parsing grid search config YAML file {config_path}: {e}")
         raise typer.Exit(code=1)
@@ -565,85 +1045,260 @@ def grid_search(
         logger.error(f"Error reading grid search config file {config_path}: {e}")
         raise typer.Exit(code=1)
 
-    client = get_mcp_client(server_url)
+    # サーバーモードかローカルモードかを決定
+    server_mode = server_url is not None
 
-    # ツール入力の準備
-    tool_input = {
-        "grid_config": grid_config,  # 辞書として送信
-        # 'output_base_dir': str(output_dir) if output_dir else None, # サーバー側で解釈・検証
-        # 'num_procs': None, # 必要なら追加
-        # 'skip_existing': False # 必要なら追加
-    }
+    if server_mode:
+        # サーバーモード - 既存のコードをそのまま使用
+        # ユーザーはサーバーURIとデータセット名を指定する必要がある
+        logger.info(
+            f"Running grid search via server {server_url} using config '{config_path}'."
+        )
 
-    logger.info("Calling 'run_grid_search' tool on server...")
-    logger.debug(
-        f"Tool input (config part omitted for brevity): {{'grid_config': ..., 'output_base_dir': {tool_input.get('output_base_dir')}}}"
-    )
+        # クライアントの初期化
+        client = MCPClient(server_url)
 
-    try:
-        # MCPツール呼び出し
-        job_start_result = client.run_tool("run_grid_search", tool_input)
-        job_id = job_start_result.get("job_id")
-        if not job_id:
-            logger.error("Failed to start grid search job: No job_id received.")
-            logger.error(f"Server response: {job_start_result}")
+        # もしデータセット名が指定されていれば、それをグリッド設定に含める
+        if dataset_name:
+            grid_config["dataset"] = dataset_name
+
+        # 実行内容を説明
+        typer.echo(
+            f"Executing grid search for detector '{grid_config.get('detector', 'unknown')}'"
+        )
+        typer.echo(f"Dataset: {grid_config.get('dataset', 'Not specified')}")
+
+        # 設定内容を表示（冗長だが、ユーザー確認のため）
+        if "parameters" in grid_config:
+            typer.echo("\nGrid Parameters:")
+            for param_name, param_values in grid_config.get("parameters", {}).items():
+                if isinstance(param_values, dict) and "values" in param_values:
+                    typer.echo(f"  {param_name}: {param_values['values']}")
+                else:
+                    typer.echo(f"  {param_name}: {param_values}")
+
+        # グリッドサーチ実行
+        if typer.confirm(
+            "Do you want to continue with this grid search?", default=True
+        ):
+            try:
+                tool_response = client.run_tool(
+                    "run_grid_search", {"grid_config": grid_config}
+                )
+                job_id = tool_response.get("job_id")
+
+                if not job_id:
+                    logger.error("No job_id received from server.")
+                    typer.echo(
+                        "Error: Failed to start grid search job. No job ID received.",
+                        err=True,
+                    )
+                    raise typer.Exit(code=1)
+
+                logger.info(f"Grid search job {job_id} started...")
+                typer.echo(f"Grid search job started with ID: {job_id}")
+
+                # ジョブのステータス表示用のプログレスバー
+                with typer.progressbar(length=100, label="Grid Search") as progress:
+                    progress.update(10)  # 開始を表示
+
+                    # ジョブ完了を待機
+                    job_info = poll_job_status(
+                        client, job_id, poll_interval=5, timeout=3600
+                    )  # 1時間タイムアウト
+
+                    if job_info.get("status") == "completed":
+                        progress.update(100)
+                        logger.info(f"Grid search job {job_id} completed.")
+                        typer.echo(f"Grid search job {job_id} completed successfully.")
+                    else:
+                        progress.update(50)  # 途中で失敗
+                        logger.error(
+                            f"Grid search job {job_id} failed: {job_info.get('status')}"
+                        )
+                        typer.echo(
+                            f"Grid search job {job_id} failed: {job_info.get('status')}",
+                            err=True,
+                        )
+                        raise typer.Exit(code=1)
+
+                # 結果の処理
+                result = job_info.get("result", {})
+                typer.echo(
+                    "\nJob Result Summary: "
+                    + result.get("summary", "No summary available")
+                )
+
+                if "best_params" in result and result["best_params"]:
+                    typer.echo("\nBest Parameters:")
+                    for k, v in result["best_params"].items():
+                        typer.echo(f"  {k}: {v}")
+                    typer.echo(f"\nBest Score: {result.get('best_score', 'N/A')}")
+
+                if "best_params_path" in result:
+                    logger.info(
+                        f"Best parameters saved to (on server): {result['best_params_path']}"
+                    )
+                    typer.echo(
+                        f"Best parameters saved to (on server): {result['best_params_path']}"
+                    )
+
+                if "results_csv_path" in result:
+                    logger.info(
+                        f"Detailed results saved to (on server): {result['results_csv_path']}"
+                    )
+                    typer.echo(
+                        f"Detailed results saved to (on server): {result['results_csv_path']}"
+                    )
+
+                if "output_dir" in result:
+                    logger.info(
+                        f"All grid search outputs saved to (on server): {result['output_dir']}"
+                    )
+                    typer.echo(
+                        f"All grid search outputs saved to (on server): {result['output_dir']}"
+                    )
+
+            except Exception as e:
+                logger.error(f"Error during grid search: {e}", exc_info=True)
+                typer.echo(f"Error during grid search: {e}", err=True)
+                raise typer.Exit(code=1)
+        else:
+            typer.echo("Grid search cancelled.")
+    else:
+        # スタンドアロンモード
+        logger.info(f"Running grid search locally using config '{config_path}'.")
+
+        # 1. スタンドアロンモードの引数検証
+        if not detector_name:
+            logger.error("Error: --detector is required for standalone grid search.")
             raise typer.Exit(code=1)
-        logger.info(f"Grid search job started successfully. Job ID: {job_id}")
+        if not audio_dir or not ref_dir:
+            logger.error(
+                "Error: --audio-dir and --ref-dir are required for standalone grid search."
+            )
+            raise typer.Exit(code=1)
+        if not audio_dir.is_dir():
+            logger.error(f"Audio directory not found: {audio_dir}")
+            raise typer.Exit(code=1)
+        if not ref_dir.is_dir():
+            logger.error(f"Reference directory not found: {ref_dir}")
+            raise typer.Exit(code=1)
+        if audio_path or ref_path:
+            logger.warning(
+                "--audio and --ref are ignored in standalone grid search directory mode."
+            )
+        if dataset_name:
+            logger.warning("--dataset is ignored in standalone grid search mode.")
 
-        # ジョブ完了待機 (タイムアウトは長めに設定, 例: 2時間)
-        final_job_info = poll_job_status(client, job_id, timeout=7200)
-
-        # 結果処理
-        if final_job_info.get("status") == "completed":
-            logger.info(f"Grid search job {job_id} completed.")
-            results = final_job_info.get("result", {})
-            # TODO: グリッドサーチ結果のサマリー表示 (例: 最良パラメータ、パスなど)
+        # 2. 出力ディレクトリの決定
+        if output_dir is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            grid_output_dir = Path(
+                f"./user_output/grid_search_{detector_name}_{timestamp}"
+            )
             logger.info(
-                f"Job Result Summary: {results.get('summary', 'No summary available.')}"
+                f"Output directory not specified, using default: {grid_output_dir}"
             )
-            if "best_params_path" in results:
-                logger.info(
-                    f"Best parameters saved to (on server): {results['best_params_path']}"
-                )
-            if "results_csv_path" in results:
-                logger.info(
-                    f"Detailed results CSV saved to (on server): {results['results_csv_path']}"
-                )
         else:
-            logger.error(f"Grid search job {job_id} failed.")
-            error_msg = final_job_info.get("error_details", {}).get(
-                "message", "Unknown error"
+            grid_output_dir = Path(output_dir)
+
+        try:
+            grid_output_dir.mkdir(parents=True, exist_ok=True)
+            if not os.access(str(grid_output_dir), os.W_OK):
+                raise OSError(f"Output directory is not writable: {grid_output_dir}")
+        except OSError as e:
+            logger.error(
+                f"Failed to create or access output directory {grid_output_dir}: {e}"
             )
-            logger.error(f"Failure reason: {error_msg}")
             raise typer.Exit(code=1)
 
-    except (
-        ToolError,
-        McpError,
-        TimeoutError,
-        RuntimeError,
-        yaml.YAMLError,
-        Exception,
-    ) as e:
-        logger.error(f"An error occurred during grid search: {e}", exc_info=True)
-        if isinstance(e, yaml.YAMLError):
-            typer.echo(
-                f"Error: Invalid YAML in config file {config_path}. {e}", err=True
+        # 3. スタンドアロングリッド検索関数のインポートと実行
+        try:
+            # 別モジュールからスタンドアローン実行関数をインポート
+            from src.evaluation.grid_search.core import run_grid_search_standalone
+            from src.utils.path_utils import find_audio_ref_pairs
+
+            # ファイルペアの検索
+            file_pairs = find_audio_ref_pairs(audio_dir, ref_dir, ref_ext=ref_ext)
+            if not file_pairs:
+                logger.error(
+                    f"No matching audio/reference files found in {audio_dir} / {ref_dir} with ref_ext='{ref_ext}'."
+                )
+                raise typer.Exit(code=1)
+
+            # プロセス数の決定
+            effective_num_procs = (
+                num_procs
+                if num_procs is not None
+                else CONFIG.get("evaluation", {}).get("default_num_procs", 1)
             )
-        # 他のエラータイプは evaluate と同様
-        elif isinstance(e, ToolError):
-            typer.echo(
-                f"Error: Server could not execute the grid search tool. {e}", err=True
+            if effective_num_procs <= 0:
+                import multiprocessing
+
+                effective_num_procs = multiprocessing.cpu_count()
+
+            logger.info(f"Executing grid search with {effective_num_procs} processes.")
+
+            # 最適化するメトリックの定義（後で設定可能にできる）
+            best_metric_key = "note.f_measure"  # 例: 後で設定可能にする
+
+            # グリッド検索の実行
+            start_grid_time = time.time()
+            grid_results = run_grid_search_standalone(
+                detector_name=detector_name,
+                grid_config=grid_config,
+                file_pairs=file_pairs,
+                output_dir=grid_output_dir,
+                num_procs=effective_num_procs,
+                best_metric_key=best_metric_key,
+                logger=logger,
+                save_plots=save_plot,
             )
-        elif isinstance(e, McpError):
-            typer.echo(f"Error: Communication failed with the server. {e}", err=True)
-        elif isinstance(e, TimeoutError):
-            typer.echo(f"Error: Grid search job timed out. {e}", err=True)
-        elif isinstance(e, RuntimeError):
-            typer.echo(f"Error: Server error during job status check. {e}", err=True)
-        else:
-            typer.echo(f"An unexpected error occurred: {e}", err=True)
-        raise typer.Exit(code=1)
+            grid_duration = time.time() - start_grid_time
+            logger.info(
+                f"Standalone grid search completed in {grid_duration:.2f} seconds."
+            )
+
+            # 4. 結果の表示
+            if grid_results and grid_results.get("best_result"):
+                best_res = grid_results["best_result"]
+                typer.echo("\n--- Grid Search Results ---")
+                typer.echo(
+                    f"Best Score ({best_metric_key}): {best_res['best_score']:.4f}"
+                )
+                typer.echo(
+                    f"Best Parameters: {json.dumps(best_res['params'], indent=2)}"
+                )
+                typer.echo(
+                    f"Results CSV saved to: {grid_results.get('results_csv_path')}"
+                )
+                typer.echo(
+                    f"Best Parameters JSON saved to: {grid_results.get('best_params_path')}"
+                )
+                typer.echo("---------------------------\n")
+            else:
+                typer.echo("\n--- Grid Search Completed ---")
+                typer.echo("No best result found or an error occurred.")
+                if grid_results.get("results_csv_path"):
+                    typer.echo(
+                        f"Detailed results may be available in: {grid_results.get('results_csv_path')}"
+                    )
+                typer.echo("---------------------------\n")
+
+        except ImportError as e:
+            logger.error(
+                f"Failed to import necessary modules for standalone grid search: {e}",
+                exc_info=True,
+            )
+            typer.echo("Error: Core grid search implementation not found.", err=True)
+            raise typer.Exit(code=1)
+        except Exception as e:
+            logger.error(
+                f"An error occurred during standalone grid search: {e}", exc_info=True
+            )
+            typer.echo(f"Error during grid search: {e}", err=True)
+            raise typer.Exit(code=1)
 
 
 # --- Improve Command ---
@@ -2176,4 +2831,5 @@ def print_session_summary(session_data: Dict[str, Any]):
     logger.info("-----------------------------------------")
 
 
-# ... (if __name__ == "__main__": の部分は mirai.py では不要)
+# Typer アプリケーションを実行
+app()

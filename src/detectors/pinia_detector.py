@@ -15,7 +15,7 @@ import scipy
 from scipy import signal
 from scipy.ndimage import gaussian_filter1d
 
-from .base_detector import BaseDetector
+from src.detectors.base_detector import BaseDetector
 
 
 class PinnaDetector(BaseDetector):
