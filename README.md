@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/romot-co-mir-eval-autolab-badge.png)](https://mseep.ai/app/romot-co-mir-eval-autolab)
+
 # MIR アルゴリズム評価・自動改善プラットフォーム
 
 このリポジトリ自体の作成にVibeコーディングが可能かも含めた実験環境であり、実用を考慮したものではないことに注意してください。
