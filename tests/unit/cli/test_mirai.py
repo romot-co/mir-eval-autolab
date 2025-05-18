@@ -645,6 +645,69 @@ class TestGridSearchCommand:
         assert e.value.exit_code == 1
         assert "Grid search job completed with unknown status" in caplog.text
 
+    def test_grid_search_cli_server_success(self, runner, mock_mcp_client, mocker):
+        """CLI 経由でサーバーモードのグリッドサーチが成功するかテスト"""
+        grid_config_data = {"detector_name": MOCK_DETECTOR_NAME, "dataset": MOCK_DATASET_NAME}
+        mocker.patch("yaml.safe_load", return_value=grid_config_data)
+        mocker.patch("src.cli.mirai.poll_job_status", return_value={"status": JobStatus.COMPLETED.value, "result": {"summary": "ok"}})
+
+        result = runner.invoke(
+            app,
+            [
+                "grid-search",
+                "run",
+                "--detector",
+                MOCK_DETECTOR_NAME,
+                "--server",
+                MOCK_SERVER_URL,
+                "--dataset",
+                MOCK_DATASET_NAME,
+                "--config",
+                MOCK_CONFIG_FILE,
+            ],
+        )
+
+        assert result.exit_code == 0
+        mock_mcp_client.run_tool.assert_called_once_with("run_grid_search", {"grid_config": grid_config_data})
+
+    def test_grid_search_standalone_missing_dirs(self, mock_mcp_client, mocker, caplog):
+        """スタンドアロンモードでディレクトリが存在しない場合にエラーとなるか"""
+        caplog.set_level(logging.ERROR)
+        mocker.patch("pathlib.Path.is_file", return_value=True)
+        mocker.patch("pathlib.Path.is_dir", return_value=False)
+
+        with pytest.raises(typer.Exit) as e:
+            grid_search(
+                detector_name=MOCK_DETECTOR_NAME,
+                config_path=Path(MOCK_CONFIG_FILE),
+                audio_dir=Path("a"),
+                ref_dir=Path("b"),
+            )
+
+        assert e.value.exit_code == 1
+        assert "Audio directory not found" in caplog.text or "Reference directory not found" in caplog.text
+
+    def test_grid_search_standalone_success(self, mock_mcp_client, mocker, caplog):
+        """スタンドアロンモードで正常に実行されるかテスト"""
+        caplog.set_level(logging.INFO)
+        grid_config_data = {"detector_name": MOCK_DETECTOR_NAME}
+        mocker.patch("yaml.safe_load", return_value=grid_config_data)
+        mocker.patch("pathlib.Path.is_file", return_value=True)
+        mocker.patch("pathlib.Path.is_dir", return_value=True)
+        mocker.patch("pathlib.Path.mkdir")
+        mocker.patch("src.cli.mirai.find_audio_ref_pairs", return_value=[("a.wav", "b.csv")])
+        run_mock = mocker.patch("src.cli.mirai.run_grid_search_standalone", return_value={"best_result": {"best_score": 0.9, "params": {}}})
+
+        grid_search(
+            detector_name=MOCK_DETECTOR_NAME,
+            config_path=Path(MOCK_CONFIG_FILE),
+            audio_dir=Path("a"),
+            ref_dir=Path("b"),
+            server_url=None,
+        )
+
+        run_mock.assert_called_once()
+
 
 # 設定とデフォルト値のテスト
 class TestConfigurationHandling:
@@ -959,6 +1022,43 @@ class TestImproveCommand:
         captured = capsys.readouterr()
         assert "Session ended with status: completed" in captured.out
         assert "Reason: Finished successfully" in captured.out
+
+    async def test_improve_start_session_failure(
+        self, mock_mcp_client, mock_determine_next_action, mock_config, caplog
+    ):
+        """start_session が session_id を返さない場合のエラーハンドリング"""
+        caplog.set_level(logging.ERROR)
+        mock_mcp_client.start_session.return_value = {"status": "active"}
+
+        with pytest.raises(typer.Exit) as e:
+            await improve(
+                server_url=MOCK_SERVER_URL,
+                detector_name=MOCK_DETECTOR_NAME,
+                dataset_name=MOCK_DATASET_NAME,
+                max_cycles=1,
+            )
+
+        assert e.value.exit_code == 1
+        assert "Failed to start session" in caplog.text
+
+    async def test_improve_resume_failure(
+        self, mock_mcp_client, mock_determine_next_action, mock_config, caplog
+    ):
+        """既存セッションの取得に失敗した場合のテスト"""
+        caplog.set_level(logging.ERROR)
+        mock_mcp_client.get_session_info.side_effect = Exception("boom")
+
+        with pytest.raises(typer.Exit) as e:
+            await improve(
+                server_url=MOCK_SERVER_URL,
+                detector_name=MOCK_DETECTOR_NAME,
+                dataset_name=MOCK_DATASET_NAME,
+                session_id="bad_id",
+                max_cycles=1,
+            )
+
+        assert e.value.exit_code == 1
+        assert "Failed to resume session" in caplog.text
 
     async def test_improve_error_timeout_error(
         self,
