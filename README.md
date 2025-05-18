@@ -296,6 +296,26 @@ pre-commit run --all-files
 pre-commit run black --all-files
 ```
 
+### 7.3. テスト実行とカバレッジ
+
+テストは `pytest` を使用しており、開発依存関係に含まれています。まずは `[dev]`
+オプション付きでインストールしてください。
+
+```bash
+uv pip install -e .[dev]
+```
+
+インストール後、単に `pytest` を実行すると `pyproject.toml` の設定に従ってカバ
+レッジ計測付きでテストが走ります。
+
+```bash
+pytest
+```
+
+デフォルトでは `src/` と `mcp_server_logic/` 配下のコードが対象となり、ターミナル
+には不足行も表示されます。カバレッジの閾値やレポート形式は
+`[tool.pytest.ini_options]` セクションで変更できます（例: `--cov-fail-under`）。
+
 ## 8. Dockerでの実行
 `Dockerfile` を使用してコンテナイメージをビルド・実行できます。
 ```bash
