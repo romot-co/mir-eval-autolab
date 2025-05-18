@@ -1,3 +1,4 @@
+import argparse
 import logging
 import os
 import sys
@@ -12,7 +13,7 @@ logging.basicConfig(
 )
 
 
-def main():
+def main(debug_file_check: bool = False):
     logging.info("合成データ生成を開始します...")
     # 出力ディレクトリを確認・作成
     synthesizer.ensure_output_dirs()
@@ -36,28 +37,29 @@ def main():
     # synthesizer.generate_portamento() # Remove original portamento
     synthesizer.generate_pitch_bend(filename_base="14_pitch_bend")  # Rename 14b to 14
 
-    # --- Start Debugging: Check if 14_pitch_bend files exist immediately after generation call ---
-    audio_check_path = os.path.join("data", "synthesized", "audio", "14_pitch_bend.wav")
-    label_check_path = os.path.join(
-        "data", "synthesized", "labels", "14_pitch_bend.csv"
-    )
-    if os.path.exists(audio_check_path):
-        logging.info(
-            f"DEBUG CHECK in generate_all: 14_pitch_bend.wav EXISTS at {audio_check_path}"
+    if debug_file_check:
+        audio_check_path = os.path.join(
+            "data", "synthesized", "audio", "14_pitch_bend.wav"
         )
-    else:
-        logging.error(
-            f"DEBUG CHECK in generate_all: 14_pitch_bend.wav DOES NOT EXIST at {audio_check_path}"
+        label_check_path = os.path.join(
+            "data", "synthesized", "labels", "14_pitch_bend.csv"
         )
-    if os.path.exists(label_check_path):
-        logging.info(
-            f"DEBUG CHECK in generate_all: 14_pitch_bend.csv EXISTS at {label_check_path}"
-        )
-    else:
-        logging.error(
-            f"DEBUG CHECK in generate_all: 14_pitch_bend.csv DOES NOT EXIST at {label_check_path}"
-        )
-    # --- End Debugging ---
+        if os.path.exists(audio_check_path):
+            logging.info(
+                f"DEBUG CHECK in generate_all: 14_pitch_bend.wav EXISTS at {audio_check_path}"
+            )
+        else:
+            logging.error(
+                f"DEBUG CHECK in generate_all: 14_pitch_bend.wav DOES NOT EXIST at {audio_check_path}"
+            )
+        if os.path.exists(label_check_path):
+            logging.info(
+                f"DEBUG CHECK in generate_all: 14_pitch_bend.csv EXISTS at {label_check_path}"
+            )
+        else:
+            logging.error(
+                f"DEBUG CHECK in generate_all: 14_pitch_bend.csv DOES NOT EXIST at {label_check_path}"
+            )
 
     synthesizer.generate_slow_attack()
     synthesizer.generate_staccato()
@@ -73,4 +75,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--debug-file-check",
+        action="store_true",
+        help="Enable DEBUG CHECK logs after pitch bend generation",
+    )
+    args = parser.parse_args()
+    main(debug_file_check=args.debug_file_check)
