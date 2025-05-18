@@ -137,7 +137,7 @@ class PinnaDetector(BaseDetector):
             "offsets": offsets,
             "intervals": intervals,
             "pitches": pitches,
-            "detector_time": time.time() - start_time,
+            "detection_time": time.time() - start_time,
             "name": self.__class__.__name__,
         }
 

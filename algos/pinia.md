@@ -188,7 +188,7 @@ Pinna 検出器の大まかな処理フローは以下のとおりである。
       'offsets': np.ndarray,      # オフセット時刻(秒)
       'intervals': np.ndarray,    # shape (N_notes, 2) の [開始, 終了] 時刻
       'pitches': np.ndarray,      # shape (N_notes,) の各ノートピッチ(Hz)
-      'detector_time': float,     # 処理時間(秒)
+      'detection_time': float,    # 処理時間(秒)
       'name': str                 # 検出器名 (PinnaDetector)
   }
   ```
